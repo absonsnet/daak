@@ -60,12 +60,12 @@
       </div>
 
       <div class="space-y-4 max-h-[60vh] overflow-y-auto text-sm">
-        <p>🚀 Welcome to {APP_NAME} v0.7.32!</p>
+        <p>🚀 Welcome to {APP_NAME} v0.7.33!</p>
 
-        <p>v0.7.32 fixes Windows toast notifications showing the raw app ID instead of the app name and logo:</p>
+        <p>v0.7.33 adds Empty Spam to the Spam folder's right-click menu in the sidebar:</p>
 
         <ul class="list-disc pl-6 space-y-1">
-          <li>🔔 Toasts fixed on Windows — new-mail notifications now show "Daak" with the Daak logo instead of "net.absons.daak" with a generic icon</li>
+          <li>🗑️ Right-click any account's Spam folder and choose Empty Spam — same confirmation and result as the Empty Spam button in the message list</li>
         </ul>
 
         <p>🏷 See the full change log here:</p>

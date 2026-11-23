@@ -1,5 +1,10 @@
 # CHANGELOG
 
+**v0.7.33 - 23-11-2026**
+---
+
+- Added Empty Spam to the Spam folder's right-click menu in the sidebar: right-clicking an account's Spam folder now offers Empty Spam, with the same confirmation dialog, toasts and list reload as the Empty Spam button in the message list. The entry shows only on Spam folders (account folders only — the unified Spam folder has no context menu)
+
 **v0.7.32 - 23-11-2026**
 ---
 
