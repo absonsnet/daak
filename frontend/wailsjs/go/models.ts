@@ -3697,6 +3697,8 @@ export namespace sendqueue {
 	    id: string;
 	    accountId: string;
 	    draftId: string;
+	    kind: string;
+	    reactionMessageId?: string;
 	    subject: string;
 	    recipient: string;
 	    fromAddress: string;
@@ -3723,6 +3725,8 @@ export namespace sendqueue {
 	        this.id = source["id"];
 	        this.accountId = source["accountId"];
 	        this.draftId = source["draftId"];
+	        this.kind = source["kind"];
+	        this.reactionMessageId = source["reactionMessageId"];
 	        this.subject = source["subject"];
 	        this.recipient = source["recipient"];
 	        this.fromAddress = source["fromAddress"];

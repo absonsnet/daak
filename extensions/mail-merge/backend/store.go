@@ -20,6 +20,10 @@ import (
 // v2 (Phase 2): the persisted outbox queue — one row per queued
 // message holding the final rendered RFC822 bytes — plus the
 // per-run queue-paused flag and the queued_count tally on runs.
+// v3 (v0.7.34): sent and cancelled queue rows are deleted on
+// success/cancel instead of lingering as history — the run log
+// (mailmerge_run_rows) is the record. One-time cleanup of rows
+// left by older versions.
 var migrations = []extensions.Migration{
 	{
 		Version: 1,
@@ -77,6 +81,12 @@ CREATE INDEX IF NOT EXISTS idx_mailmerge_queue_due ON mailmerge_queue_items (sta
 CREATE INDEX IF NOT EXISTS idx_mailmerge_queue_run ON mailmerge_queue_items (run_id);
 ALTER TABLE mailmerge_runs ADD COLUMN queue_paused INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE mailmerge_runs ADD COLUMN queued_count INTEGER NOT NULL DEFAULT 0;
+`,
+	},
+	{
+		Version: 3,
+		SQL: `
+DELETE FROM mailmerge_queue_items WHERE status IN ('sent', 'cancelled');
 `,
 	},
 }
@@ -547,13 +557,17 @@ func queueColumnsQualified() string {
 	return strings.Join(cols, ", ")
 }
 
-// CountSentSince counts queue items sent at or after `since` — the
-// hourly budget check.
+// CountSentSince counts run-log rows marked sent at or after `since` —
+// the hourly budget check. It reads the run log, not the queue:
+// sent queue rows are deleted on success, and the run log is the
+// record. (Direct sends also write RowSent rows, so they count toward
+// the budget too — more conservative than before, when only queued
+// sends counted.)
 func (s *Store) CountSentSince(since time.Time) (int, error) {
 	var n int
 	err := s.DB().QueryRow(`
-		SELECT COUNT(*) FROM mailmerge_queue_items
-		WHERE status = 'sent' AND sent_at >= ?
+		SELECT COUNT(*) FROM mailmerge_run_rows
+		WHERE status = 'sent' AND timestamp >= ?
 	`, since.UTC().Format(time.RFC3339Nano)).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("mail-merge: count sent since: %w", err)
@@ -561,14 +575,14 @@ func (s *Store) CountSentSince(since time.Time) (int, error) {
 	return n, nil
 }
 
-// OldestSentSince returns the earliest sent_at at or after `since`
-// (the moment the hourly budget frees up again). False when nothing
-// was sent in the window.
+// OldestSentSince returns the earliest sent timestamp at or after
+// `since` (the moment the hourly budget frees up again), from the
+// run log. False when nothing was sent in the window.
 func (s *Store) OldestSentSince(since time.Time) (time.Time, bool, error) {
 	var raw sql.NullString
 	err := s.DB().QueryRow(`
-		SELECT MIN(sent_at) FROM mailmerge_queue_items
-		WHERE status = 'sent' AND sent_at >= ?
+		SELECT MIN(timestamp) FROM mailmerge_run_rows
+		WHERE status = 'sent' AND timestamp >= ?
 	`, since.UTC().Format(time.RFC3339Nano)).Scan(&raw)
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("mail-merge: oldest sent since: %w", err)
@@ -637,7 +651,9 @@ func (s *Store) ClaimItem(id string, now time.Time) (bool, error) {
 	return n == 1, nil
 }
 
-// MarkItemSent marks a claimed item sent.
+// MarkItemSent marks a claimed item sent. It is only the fallback
+// when deleting the row fails (a sent mail must never be re-queued):
+// the normal path deletes the row — see DeleteQueueItem.
 func (s *Store) MarkItemSent(id string, sentAt time.Time) error {
 	_, err := s.DB().Exec(`
 		UPDATE mailmerge_queue_items
@@ -648,6 +664,41 @@ func (s *Store) MarkItemSent(id string, sentAt time.Time) error {
 		return fmt.Errorf("mail-merge: mark queue item sent: %w", err)
 	}
 	return nil
+}
+
+// DeleteQueueItem deletes one queued/sending item — the normal
+// outcome of a successful send or a cancel. Returns false when the
+// item is already sent/failed (or gone).
+func (s *Store) DeleteQueueItem(id string) (bool, error) {
+	res, err := s.DB().Exec(`
+		DELETE FROM mailmerge_queue_items
+		WHERE id = ? AND status IN ('queued', 'sending')
+	`, id)
+	if err != nil {
+		return false, fmt.Errorf("mail-merge: delete queue item: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mail-merge: delete queue item rows: %w", err)
+	}
+	return n == 1, nil
+}
+
+// DeleteRunQueueItems deletes every queued/sending item of a run.
+// Returns the deleted count.
+func (s *Store) DeleteRunQueueItems(runID string) (int, error) {
+	res, err := s.DB().Exec(`
+		DELETE FROM mailmerge_queue_items
+		WHERE run_id = ? AND status IN ('queued', 'sending')
+	`, runID)
+	if err != nil {
+		return 0, fmt.Errorf("mail-merge: delete run queue items: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("mail-merge: delete run queue items rows: %w", err)
+	}
+	return int(n), nil
 }
 
 // UpdateItemAttempt records a failed send attempt: attempts, status
@@ -703,40 +754,6 @@ func (s *Store) PushDueItemsNextAttempt(now time.Time, at time.Time, runID strin
 		return fmt.Errorf("mail-merge: push due items: %w", err)
 	}
 	return nil
-}
-
-// CancelQueueItem cancels one queued/sending item. Returns false when
-// the item is already sent/failed/cancelled.
-func (s *Store) CancelQueueItem(id string) (bool, error) {
-	res, err := s.DB().Exec(`
-		UPDATE mailmerge_queue_items SET status = 'cancelled', claimed_at = NULL
-		WHERE id = ? AND status IN ('queued', 'sending')
-	`, id)
-	if err != nil {
-		return false, fmt.Errorf("mail-merge: cancel queue item: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("mail-merge: cancel queue item rows: %w", err)
-	}
-	return n == 1, nil
-}
-
-// CancelRunQueueItems cancels every queued/sending item of a run.
-// Returns the cancelled count.
-func (s *Store) CancelRunQueueItems(runID string) (int, error) {
-	res, err := s.DB().Exec(`
-		UPDATE mailmerge_queue_items SET status = 'cancelled', claimed_at = NULL
-		WHERE run_id = ? AND status IN ('queued', 'sending')
-	`, runID)
-	if err != nil {
-		return 0, fmt.Errorf("mail-merge: cancel run queue items: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("mail-merge: cancel run queue items rows: %w", err)
-	}
-	return int(n), nil
 }
 
 // RetryFailedRunItems returns a run's failed items to the queue

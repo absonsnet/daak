@@ -137,10 +137,9 @@ func TestQueueLaterRunEnqueueSendUnsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, item := range items {
-		if item.Status != QueueStatusSent || item.SentAt == nil {
-			t.Fatalf("item after dispatch %+v", item)
-		}
+	// Sent rows are deleted on success — the run log is the record.
+	if len(items) != 0 {
+		t.Fatalf("queue after dispatch %+v, want empty", items)
 	}
 }
 
@@ -166,18 +165,14 @@ func TestQueuePerHourCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The two sent rows are deleted; only the one still queued
+	// remains, its next attempt pushed to when the budget frees
+	// (oldest + 1h).
 	var remaining *QueuedItem
-	sent := 0
-	for i := range items {
-		if items[i].Status == QueueStatusQueued {
-			remaining = &items[i]
-		} else {
-			sent++
-		}
-	}
-	if sent != 2 || remaining == nil {
+	if len(items) != 1 || items[0].Status != QueueStatusQueued {
 		t.Fatalf("items %+v", items)
 	}
+	remaining = &items[0]
 	if !remaining.NextAttemptAt.Equal(fakeNow.Add(time.Hour)) {
 		t.Fatalf("pushed next attempt %v want %v", remaining.NextAttemptAt, fakeNow.Add(time.Hour))
 	}
@@ -268,7 +263,7 @@ func TestQueuePauseResumeCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Cancel a run: its queued items are cancelled, never sent, and
+	// Cancel a run: its queued items are deleted, never sent, and
 	// the run log records them skipped.
 	runID3 := startLaterRun(t, env, testBridgeRows()[:2])
 	if err := env.bridge.MailMerge_CancelQueuedRun(runID3); err != nil {
@@ -279,8 +274,8 @@ func TestQueuePauseResumeCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, item := range items {
-		if item.RunID == runID3 && item.Status != QueueStatusCancelled {
-			t.Fatalf("item %+v", item)
+		if item.RunID == runID3 {
+			t.Fatalf("cancelled item still in queue %+v", item)
 		}
 	}
 	run, err := env.bridge.MailMerge_GetRun(runID3)
@@ -310,7 +305,9 @@ func TestQueuePauseResumeCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Cancelled < 3 { // 2 from runID3 + 1 just now
+	// Cancelled rows are deleted, so the stats never count them:
+	// only runID4's one surviving item is left in the queue.
+	if stats.Total != 1 || stats.Queued != 1 || stats.Cancelled != 0 {
 		t.Fatalf("stats %+v", stats)
 	}
 	// Unknown ids error.

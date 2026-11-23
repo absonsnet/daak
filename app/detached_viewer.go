@@ -28,6 +28,7 @@ import (
 	"github.com/absonsnet/daak/internal/pgp"
 	"github.com/absonsnet/daak/internal/platform"
 	"github.com/absonsnet/daak/internal/reaction"
+	"github.com/absonsnet/daak/internal/sendqueue"
 	"github.com/absonsnet/daak/internal/settings"
 	"github.com/absonsnet/daak/internal/smime"
 	"github.com/absonsnet/daak/internal/smtp"
@@ -92,6 +93,10 @@ type ViewerApp struct {
 	draftStore          *draft.Store
 	credStore           *credentials.Store
 	certStore           *certificate.Store
+
+	// Outbox queue (reactions only — the viewer never composes, and
+	// never runs the dispatch worker; the main process owns it).
+	sendQueue *sendQueueService
 
 	// S/MIME and PGP support (on-view decryption/verification)
 	smimeStore     *smime.Store
@@ -233,6 +238,17 @@ func (v *ViewerApp) Startup(ctx context.Context) {
 	v.syncEngine.SetSMIMEVerifier(v.smimeVerifier)
 	v.syncEngine.SetPGPVerifier(v.pgpVerifier)
 	v.syncEngine.SetReactionStore(v.reactionStore)
+
+	// Reactions queue through the shared Outbox like the main window;
+	// this process never dispatches (no worker) and never shows the
+	// Undo toast itself — the main window owns both, via IPC.
+	v.sendQueue = &sendQueueService{
+		store:      sendqueue.NewStore(db),
+		settings:   v.settingsStore,
+		ops:        &v.composeOps,
+		draftStore: v.draftStore,
+		ctx:        v.ctx,
+	}
 
 	if err := v.connectIPC(ctx); err != nil {
 		log.Error().Err(err).Msg("Failed to connect to IPC server")
@@ -1104,11 +1120,20 @@ func (v *ViewerApp) RemoveOwnReaction(messageID string) error {
 	if _, err := v.reactionStore.RemoveReaction(messageID, emails); err != nil {
 		return fmt.Errorf("failed to remove reaction: %w", err)
 	}
+	// A reaction still queued (inside the undo window) is cancelled
+	// as well, so it does not go out anyway and reappear on the next
+	// Sent sync. A dispatched reaction stays local-only.
+	if v.sendQueue != nil {
+		if n, err := v.sendQueue.store.DeletePendingReaction(messageID); err == nil && n > 0 {
+			v.sendQueue.emitEvent("sendqueue:updated", nil)
+		}
+	}
 	return nil
 }
 
-// SendReaction sends an emoji reaction as a reaction email to the original
-// sender only, via the shared SMTP path (mirrors App.sendReaction).
+// SendReaction queues an emoji reaction as a reaction email to the
+// original sender only, for background send after the undo window
+// (mirrors App.sendReaction).
 func (v *ViewerApp) SendReaction(messageID string, emoji string) error {
 	return v.sendReaction(v.ctx, messageID, emoji)
 }
@@ -1198,6 +1223,7 @@ func (v *ViewerApp) sendReaction(ctx context.Context, messageID, emoji string) e
 		To:             addressStrings(parseAddressList(msg.ToList)),
 		Cc:             addressStrings(parseAddressList(msg.CcList)),
 		Bcc:            addressStrings(parseAddressList(msg.BccList)),
+		Date:           msg.Date,
 		SMIMEEncrypted: msg.SMIMEEncrypted,
 		PGPEncrypted:   msg.PGPEncrypted,
 	}
@@ -1205,27 +1231,42 @@ func (v *ViewerApp) sendReaction(ctx context.Context, messageID, emoji string) e
 		return err
 	}
 
+	// The quoted original needs the full body: fetch it first when it
+	// has not been fetched yet, rather than sending a body-less quote.
+	// Limits run first, so a disallowed reaction fails fast without
+	// a fetch.
+	if strings.TrimSpace(msg.BodyText) == "" && strings.TrimSpace(msg.BodyHTML) == "" {
+		fetched, err := v.FetchMessageBody(messageID)
+		if err != nil {
+			return fmt.Errorf("failed to fetch original body for the reaction quote: %w", err)
+		}
+		msg = fetched
+	}
+
 	raw, reactionMessageID, err := reaction.BuildMessage(reaction.BuildOptions{
-		Emoji:       emoji,
-		SenderName:  from.Name,
-		SenderEmail: from.Address,
-		Original:    orig,
-		References:  threadReferences(msg),
+		Emoji:            emoji,
+		SenderName:       from.Name,
+		SenderEmail:      from.Address,
+		Original:         orig,
+		References:       threadReferences(msg),
+		OriginalBodyText: msg.BodyText,
+		OriginalBodyHTML: msg.BodyHTML,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to build reaction message: %w", err)
 	}
 
+	// Queue through the shared Outbox (mirrors App.sendReaction):
+	// the main process's worker sends at dispatch. This process
+	// never dispatches and never shows the Undo toast itself — the
+	// main window owns both, so notify it over IPC.
 	to := smtp.Address{Name: msg.FromName, Address: strings.TrimSpace(msg.FromEmail)}
-	if err := v.composeOps.sendRawMessage(ctx, msg.AccountID, from.Address, []string{to.Address}, raw); err != nil {
-		return fmt.Errorf("failed to send reaction: %w", err)
+	res, err := v.sendQueue.QueueReaction(msg.AccountID, from, []string{to.Address}, raw,
+		reaction.ReactionSubject(orig.Subject), to.Address, msg.ID)
+	if err != nil {
+		return fmt.Errorf("failed to queue reaction: %w", err)
 	}
-
-	if acc, accErr := v.accountStore.Get(msg.AccountID); accErr == nil && acc != nil && !providerAutoSavesSentMail(acc.IMAPHost) {
-		if err := v.composeOps.saveToSentFolder(ctx, msg.AccountID, acc, raw); err != nil {
-			log.Warn().Err(err).Str("accountID", msg.AccountID).Msg("Failed to save reaction to Sent folder")
-		}
-	}
+	v.notifyReactionQueued(msg.AccountID, reaction.ReactionSubject(orig.Subject), to.Address, res)
 
 	rec := &reaction.Reaction{
 		MessageID:       msg.ID,
@@ -1237,11 +1278,33 @@ func (v *ViewerApp) sendReaction(ctx context.Context, messageID, emoji string) e
 		SourceMessageID: reactionMessageID,
 	}
 	if err := v.reactionStore.Record(rec); err != nil {
-		return fmt.Errorf("reaction sent but failed to record: %w", err)
+		_, _ = v.sendQueue.store.Delete(res.QueueID)
+		return fmt.Errorf("reaction queued but failed to record: %w", err)
 	}
 
-	log.Info().Str("messageID", messageID).Str("emoji", emoji).Str("from", from.Address).Str("to", to.Address).Msg("Reaction sent")
+	log.Info().Str("messageID", messageID).Str("emoji", emoji).Str("from", from.Address).Str("to", to.Address).Str("queueID", res.QueueID).Msg("Reaction queued")
 	return nil
+}
+
+// notifyReactionQueued tells the main window a reaction was queued,
+// so it can show the countdown toast with Undo. Mirrors the
+// detached composer's notifyMessageQueued.
+func (v *ViewerApp) notifyReactionQueued(accountID, subject, recipient string, res QueueSendResult) {
+	if v.ipcClient == nil {
+		return
+	}
+	ipcMsg, err := ipc.NewMessage(ipc.TypeMessageQueued, ipc.MessageQueuedPayload{
+		QueueID:      res.QueueID,
+		AccountID:    accountID,
+		DraftID:      "",
+		Subject:      subject,
+		Recipient:    recipient,
+		DelaySeconds: res.DelaySeconds,
+	})
+	if err != nil {
+		return
+	}
+	_ = v.ipcClient.Send(ipcMsg)
 }
 
 // ownEmailsForAccount returns the user's own addresses for an account

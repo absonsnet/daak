@@ -1568,4 +1568,21 @@ var migrations = []Migration{
 			);
 		`,
 	},
+	{
+		Version: 52,
+		SQL: `
+			-- Reactions via the Outbox + Outbox cleanup (v0.7.34):
+			-- the send_queue gains a kind (message | reaction) and,
+			-- for reactions, the pre-built RFC 822 bytes plus the
+			-- internal id of the reacted-to message (Undo removes
+			-- the local reaction record). Sent and cancelled rows
+			-- are deleted on success / undo instead of kept as
+			-- history, so drop the rows already accumulated under
+			-- the old behaviour — the Sent folder is the record.
+			ALTER TABLE send_queue ADD COLUMN kind TEXT NOT NULL DEFAULT 'message';
+			ALTER TABLE send_queue ADD COLUMN raw_message BLOB;
+			ALTER TABLE send_queue ADD COLUMN reaction_message_id TEXT NOT NULL DEFAULT '';
+			DELETE FROM send_queue WHERE status IN ('sent', 'cancelled');
+		`,
+	},
 }

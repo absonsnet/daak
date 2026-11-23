@@ -140,8 +140,9 @@ func TestQueueSendThenDispatch(t *testing.T) {
 	if len(h.sent) != 1 || !strings.Contains(string(h.sent[0]), "hello") {
 		t.Fatalf("sent = %d messages, want 1 containing the subject", len(h.sent))
 	}
-	if got := h.mustItem(t, res.QueueID); got.Status != sendqueue.StatusSent {
-		t.Fatalf("status after dispatch = %q, want sent", got.Status)
+	// Sent rows are deleted, not kept: the Outbox holds no history.
+	if got, err := h.svc.store.Get(res.QueueID); err != nil || got != nil {
+		t.Fatalf("Get after dispatch = %+v, %v, want nil, nil (row deleted)", got, err)
 	}
 
 	// A second tick sends nothing more (no double-send).
@@ -164,8 +165,9 @@ func TestUndoSendCancelsAndDispatchSkips(t *testing.T) {
 	if undone.DraftID != "draft-1" || undone.AccountID != "acc-1" {
 		t.Fatalf("UndoSend = %+v, want draft-1 / acc-1", undone)
 	}
-	if got := h.mustItem(t, res.QueueID); got.Status != sendqueue.StatusCancelled {
-		t.Fatalf("status after undo = %q, want cancelled", got.Status)
+	// Undone rows are deleted, not kept as cancelled history.
+	if got, err := h.svc.store.Get(res.QueueID); err != nil || got != nil {
+		t.Fatalf("Get after undo = %+v, %v, want nil, nil (row deleted)", got, err)
 	}
 
 	// Past the window: the cancelled item never sends.
@@ -190,8 +192,9 @@ func TestUndoSendAfterDispatchFails(t *testing.T) {
 	if _, err := h.svc.dispatchDue(h.now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.svc.UndoSend(res.QueueID); err == nil || !strings.Contains(err.Error(), "already sent") {
-		t.Fatalf("UndoSend after dispatch = %v, want an 'already sent' error", err)
+	// The row is deleted on success, so there is nothing left to undo.
+	if _, err := h.svc.UndoSend(res.QueueID); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("UndoSend after dispatch = %v, want a 'not found' error", err)
 	}
 }
 
@@ -301,5 +304,112 @@ func TestQueueSendValidation(t *testing.T) {
 	}
 	if stats.Total != 0 {
 		t.Fatalf("stats after failed queues = %+v, want empty", stats)
+	}
+}
+
+func TestQueueReactionThenDispatch(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	raw := []byte("From: me@example.com\r\nTo: alice@example.com\r\n\r\nreaction bytes")
+	res, err := h.svc.QueueReaction("acc-1",
+		smtp.Address{Name: "Me", Address: "me@example.com"},
+		[]string{"alice@example.com"}, raw, "Re: hello", "alice@example.com", "msg-1")
+	if err != nil {
+		t.Fatalf("QueueReaction: %v", err)
+	}
+	if res.DelaySeconds != settings.DefaultUndoSendDelay {
+		t.Fatalf("DelaySeconds = %d, want %d", res.DelaySeconds, settings.DefaultUndoSendDelay)
+	}
+	if res.DraftID != "" {
+		t.Fatalf("DraftID = %q, want empty (a reaction has no draft)", res.DraftID)
+	}
+	item := h.mustItem(t, res.QueueID)
+	if item.Kind != sendqueue.KindReaction {
+		t.Fatalf("kind = %q, want reaction", item.Kind)
+	}
+	if item.ReactionMessageID != "msg-1" {
+		t.Fatalf("reactionMessageId = %q, want msg-1", item.ReactionMessageID)
+	}
+	if item.Status != sendqueue.StatusPending {
+		t.Fatalf("status = %q, want pending", item.Status)
+	}
+
+	// Inside the undo window: nothing sends.
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 0 {
+		t.Fatalf("dispatchDue(in window) = %d, %v, want 0, nil", n, err)
+	}
+	if len(h.sent) != 0 {
+		t.Fatalf("sent %d messages inside the undo window, want 0", len(h.sent))
+	}
+
+	// Past the window: the worker sends the pre-built bytes raw, once.
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue(after window) = %d, %v, want 1, nil", n, err)
+	}
+	if len(h.sent) != 1 || string(h.sent[0]) != string(raw) {
+		t.Fatalf("sent = %d messages, want 1 with the exact queued bytes", len(h.sent))
+	}
+	if got, err := h.svc.store.Get(res.QueueID); err != nil || got != nil {
+		t.Fatalf("Get after dispatch = %+v, %v, want nil, nil (row deleted)", got, err)
+	}
+}
+
+func TestQueueReactionUndoRunsOnUndoHook(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	var undone []sendqueue.Item
+	h.svc.onUndo = func(item sendqueue.Item) { undone = append(undone, item) }
+
+	res, err := h.svc.QueueReaction("acc-1",
+		smtp.Address{Name: "Me", Address: "me@example.com"},
+		[]string{"alice@example.com"}, []byte("raw"), "Re: hello", "alice@example.com", "msg-1")
+	if err != nil {
+		t.Fatalf("QueueReaction: %v", err)
+	}
+	if _, err := h.svc.UndoSend(res.QueueID); err != nil {
+		t.Fatalf("UndoSend: %v", err)
+	}
+	if len(undone) != 1 || undone[0].Kind != sendqueue.KindReaction || undone[0].ReactionMessageID != "msg-1" {
+		t.Fatalf("onUndo called with %+v, want one reaction item for msg-1", undone)
+	}
+	if got, err := h.svc.store.Get(res.QueueID); err != nil || got != nil {
+		t.Fatalf("Get after undo = %+v, %v, want nil, nil (row deleted)", got, err)
+	}
+	if len(h.sent) != 0 {
+		t.Fatalf("sent %d messages after undo, want 0", len(h.sent))
+	}
+}
+
+func TestQueueReactionFailedDispatchRetries(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	h.sendErr = fmt.Errorf("failed to connect to SMTP server: connection refused")
+	res, err := h.svc.QueueReaction("acc-1",
+		smtp.Address{Name: "Me", Address: "me@example.com"},
+		[]string{"alice@example.com"}, []byte("raw"), "Re: hello", "alice@example.com", "msg-1")
+	if err != nil {
+		t.Fatalf("QueueReaction: %v", err)
+	}
+
+	// A transient failure retries with backoff; the row stays (with
+	// Retry) and nothing is sent.
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 0 {
+		t.Fatalf("dispatchDue(failing) = %d, %v, want 0, nil", n, err)
+	}
+	item := h.mustItem(t, res.QueueID)
+	if item.Status != sendqueue.StatusPending || item.Attempts != 1 {
+		t.Fatalf("after transient failure: %+v, want pending / 1 attempt", item)
+	}
+	if len(h.sent) != 0 {
+		t.Fatalf("sent %d messages, want 0", len(h.sent))
+	}
+
+	// After the backoff, with the server back: sends, then deletes.
+	h.now = h.now.Add(time.Minute)
+	h.sendErr = nil
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue(after backoff) = %d, %v, want 1, nil", n, err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(h.sent))
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"net/mail"
 	"strings"
 	"testing"
+	"time"
 
 	gomessage "github.com/emersion/go-message"
 )
@@ -136,8 +137,8 @@ func TestBuildMessageStructure(t *testing.T) {
 	if plain.contentType != "text/plain" {
 		t.Errorf("alternative[0] = %q, want text/plain", plain.contentType)
 	}
-	if !strings.Contains(plain.body, "👍 — Me reacted to your message") {
-		t.Errorf("plain body = %q, want the one-liner", plain.body)
+	if !strings.Contains(plain.body, "👍 Me reacted to your message:") {
+		t.Errorf("plain body = %q, want the banner", plain.body)
 	}
 	if gmail.contentType != GmailReactionContentType {
 		t.Errorf("alternative[1] = %q, want %q (Gmail part between plain and html)", gmail.contentType, GmailReactionContentType)
@@ -148,8 +149,8 @@ func TestBuildMessageStructure(t *testing.T) {
 	if html.contentType != "text/html" {
 		t.Errorf("alternative[2] = %q, want text/html", html.contentType)
 	}
-	if !strings.Contains(html.body, "👍 — Me reacted to your message") {
-		t.Errorf("html body = %q, want the one-liner", html.body)
+	if !strings.Contains(html.body, "👍 Me reacted to your message:") {
+		t.Errorf("html body = %q, want the banner", html.body)
 	}
 
 	reactionPart := root.children[1]
@@ -184,8 +185,88 @@ func TestBuildMessageNoSenderNameFallsBackToEmail(t *testing.T) {
 	}
 	root := parseMIMEParts(t, raw)
 	plain := root.children[0].children[0]
-	if !strings.Contains(plain.body, "🎉 — me@example.com reacted to your message") {
+	if !strings.Contains(plain.body, "🎉 me@example.com reacted to your message:") {
 		t.Errorf("plain body = %q, want sender email as the name fallback", plain.body)
+	}
+}
+
+// --- Banner + quoted original (Outlook fallback format) -----------------
+
+func TestBuildMessageQuotesOriginal(t *testing.T) {
+	orig := testOriginal()
+	orig.Date = time.Date(2026, time.November, 9, 15, 55, 0, 0, time.UTC)
+	orig.Cc = []string{"team@example.com"}
+	raw, _, err := BuildMessage(BuildOptions{
+		Emoji:            "👍",
+		SenderName:       "Me",
+		SenderEmail:      "me@example.com",
+		Original:         orig,
+		OriginalBodyText: "Can we meet at 3 on Monday?\n\nThanks,\nAlice",
+		OriginalBodyHTML: "<p>Can we meet at 3 on Monday?</p><p>Thanks,<br>Alice</p>",
+	})
+	if err != nil {
+		t.Fatalf("BuildMessage() error = %v", err)
+	}
+	root := parseMIMEParts(t, raw)
+	plain, gmail, html := root.children[0].children[0], root.children[0].children[1], root.children[0].children[2]
+	// The MIME writer uses CRLF; normalize before matching body text.
+	plainBody := strings.ReplaceAll(plain.body, "\r\n", "\n")
+
+	// Plain part: banner, then the original's headers, then the full body.
+	for _, want := range []string{
+		"👍 Me reacted to your message:",
+		"From: Alice <alice@example.com>",
+		"Sent: Monday, November 9, 2026 3:55 PM",
+		"To: me@example.com",
+		"Cc: team@example.com",
+		"Subject: Hello there",
+		"Can we meet at 3 on Monday?",
+		"Thanks,\nAlice",
+	} {
+		if !strings.Contains(plainBody, want) {
+			t.Errorf("plain body = %q, want it to contain %q", plain.body, want)
+		}
+	}
+	// HTML part: the same banner + headers, then the original's HTML.
+	for _, want := range []string{
+		"👍 Me reacted to your message:",
+		"From: Alice &lt;alice@example.com&gt;",
+		"Sent: Monday, November 9, 2026 3:55 PM",
+		"Subject: Hello there",
+		"<p>Can we meet at 3 on Monday?</p>",
+	} {
+		if !strings.Contains(html.body, want) {
+			t.Errorf("html body = %q, want it to contain %q", html.body, want)
+		}
+	}
+	// The machine-readable parts are untouched by the fallback restyle.
+	if strings.TrimSpace(gmail.body) != `{"version": 1, "emoji": "👍"}` {
+		t.Errorf("gmail body = %q, want the JSON part unchanged", strings.TrimSpace(gmail.body))
+	}
+	reactionPart := root.children[1]
+	if reactionPart.disposition != "reaction" || strings.TrimSpace(reactionPart.body) != "👍" {
+		t.Errorf("reaction part = %q / %q, want disposition reaction with just the emoji", reactionPart.disposition, reactionPart.body)
+	}
+}
+
+func TestBuildMessageQuoteFallsBackToHTMLBody(t *testing.T) {
+	raw, _, err := BuildMessage(BuildOptions{
+		Emoji:            "❤️",
+		SenderName:       "Me",
+		SenderEmail:      "me@example.com",
+		Original:         testOriginal(),
+		OriginalBodyHTML: "<p>Hello <b>there</b></p>",
+	})
+	if err != nil {
+		t.Fatalf("BuildMessage() error = %v", err)
+	}
+	root := parseMIMEParts(t, raw)
+	plain := root.children[0].children[0]
+	if !strings.Contains(plain.body, "Hello there") {
+		t.Errorf("plain body = %q, want the HTML body with tags stripped", plain.body)
+	}
+	if strings.Contains(plain.body, "<p>") || strings.Contains(plain.body, "<b>") {
+		t.Errorf("plain body = %q, want no HTML tags in the plain quote", plain.body)
 	}
 }
 

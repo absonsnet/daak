@@ -1,7 +1,6 @@
 package app
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -62,7 +61,9 @@ func (a *App) GetMessageReactions(messageID string) ([]MessageReaction, error) {
 // RemoveOwnReaction deletes only the current user's own reaction on a
 // message (internal id) from the local store. It sends no email: a
 // reaction already sent to the original sender cannot be retracted from
-// their mailbox — removing it only hides it here.
+// their mailbox — removing it only hides it here. A reaction still
+// queued (inside the undo window) is cancelled as well, so it does not
+// go out anyway and reappear on the next Sent sync.
 func (a *App) RemoveOwnReaction(messageID string) error {
 	msg, err := a.messageStore.Get(messageID)
 	if err != nil {
@@ -80,24 +81,30 @@ func (a *App) RemoveOwnReaction(messageID string) error {
 	if _, err := a.reactionStore.RemoveReaction(messageID, emails); err != nil {
 		return fmt.Errorf("failed to remove reaction: %w", err)
 	}
+	if n, err := a.ensureSendQueueService().store.DeletePendingReaction(messageID); err == nil && n > 0 {
+		a.ensureSendQueueService().emitEvent("sendqueue:updated", nil)
+	}
 	return nil
 }
 
-// SendReaction sends an emoji reaction to a message (internal id) as a
-// reaction email addressed to the original sender only, saves it to the
-// Sent folder, and records the user's own reaction immediately so the UI
-// shows it without waiting for a sync round-trip.
+// SendReaction queues an emoji reaction to a message (internal id) as a
+// reaction email addressed to the original sender only, for background
+// send after the undo window. It returns as soon as the reaction is
+// recorded and queued — the picker closes at once and the pill shows
+// immediately (optimistic), with the existing Undo toast offering the
+// undo window. The worker sends the queued email at dispatch and saves
+// it to the Sent folder, exactly as the old synchronous send did.
 //
-// Limits are enforced before anything is sent (see
+// Limits are enforced before anything is queued (see
 // reaction.ValidateReaction): the emoji must be a single emoji, the
 // original must not be encrypted, group-addressed, over 20 recipients,
 // or one the user was BCC'd on. A limit violation returns a distinct
 // error the UI surfaces.
 func (a *App) SendReaction(messageID string, emoji string) error {
-	return a.sendReaction(a.ctx, messageID, emoji)
+	return a.sendReaction(messageID, emoji)
 }
 
-func (a *App) sendReaction(ctx context.Context, messageID, emoji string) error {
+func (a *App) sendReaction(messageID, emoji string) error {
 	log := logging.WithComponent("app")
 
 	msg, err := a.messageStore.Get(messageID)
@@ -132,6 +139,7 @@ func (a *App) sendReaction(ctx context.Context, messageID, emoji string) error {
 		To:             addressStrings(parseAddressList(msg.ToList)),
 		Cc:             addressStrings(parseAddressList(msg.CcList)),
 		Bcc:            addressStrings(parseAddressList(msg.BccList)),
+		Date:           msg.Date,
 		SMIMEEncrypted: msg.SMIMEEncrypted,
 		PGPEncrypted:   msg.PGPEncrypted,
 	}
@@ -139,34 +147,44 @@ func (a *App) sendReaction(ctx context.Context, messageID, emoji string) error {
 		return err
 	}
 
+	// The quoted original needs the full body: fetch it first when it
+	// has not been fetched yet, rather than sending a body-less quote.
+	// (The viewer normally fetched it already when the message was
+	// opened, so this is the exception, not the rule.) Limits run
+	// first, so a disallowed reaction fails fast without a fetch.
+	if strings.TrimSpace(msg.BodyText) == "" && strings.TrimSpace(msg.BodyHTML) == "" {
+		fetched, err := a.FetchMessageBody(messageID)
+		if err != nil {
+			return fmt.Errorf("failed to fetch original body for the reaction quote: %w", err)
+		}
+		msg = fetched
+	}
+
 	raw, reactionMessageID, err := reaction.BuildMessage(reaction.BuildOptions{
-		Emoji:       emoji,
-		SenderName:  from.Name,
-		SenderEmail: from.Address,
-		Original:    orig,
-		References:  threadReferences(msg),
+		Emoji:            emoji,
+		SenderName:       from.Name,
+		SenderEmail:      from.Address,
+		Original:         orig,
+		References:       threadReferences(msg),
+		OriginalBodyText: msg.BodyText,
+		OriginalBodyHTML: msg.BodyHTML,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to build reaction message: %w", err)
 	}
 
-	// Send through the normal SMTP path (same client config, auth, and
-	// TLS as a regular send). ComposeMessage cannot express the
-	// reaction's multipart structure, so the pre-built bytes go through
-	// sendRawMessage directly.
+	// Queue first, record second: if recording fails the queued row is
+	// deleted again, so a pill never shows without its send (and a
+	// send never happens without its pill). The queue worker — not
+	// this call — sends the bytes at dispatch and saves to Sent.
+	// ComposeMessage cannot express the reaction's multipart
+	// structure, so the pre-built bytes go through as a raw item.
+	svc := a.ensureSendQueueService()
 	to := smtp.Address{Name: msg.FromName, Address: strings.TrimSpace(msg.FromEmail)}
-	if err := a.composeOps.sendRawMessage(ctx, msg.AccountID, from.Address, []string{to.Address}, raw); err != nil {
-		return fmt.Errorf("failed to send reaction: %w", err)
-	}
-
-	// Save to Sent via IMAP APPEND exactly like a normal send: skipped
-	// when the provider auto-saves Sent mail, and a save failure only
-	// warns — the send already succeeded, and the Sent sync will pick
-	// the message up later either way.
-	if acc, accErr := a.accountStore.Get(msg.AccountID); accErr == nil && acc != nil && !providerAutoSavesSentMail(acc.IMAPHost) {
-		if err := a.composeOps.saveToSentFolder(ctx, msg.AccountID, acc, raw); err != nil {
-			log.Warn().Err(err).Str("accountID", msg.AccountID).Msg("Failed to save reaction to Sent folder")
-		}
+	res, err := svc.QueueReaction(msg.AccountID, from, []string{to.Address}, raw,
+		reaction.ReactionSubject(orig.Subject), to.Address, msg.ID)
+	if err != nil {
+		return fmt.Errorf("failed to queue reaction: %w", err)
 	}
 
 	// Record immediately under the reaction email's own Message-ID, so
@@ -182,7 +200,8 @@ func (a *App) sendReaction(ctx context.Context, messageID, emoji string) error {
 		SourceMessageID: reactionMessageID,
 	}
 	if err := a.reactionStore.Record(rec); err != nil {
-		return fmt.Errorf("reaction sent but failed to record: %w", err)
+		_, _ = svc.store.Delete(res.QueueID)
+		return fmt.Errorf("reaction queued but failed to record: %w", err)
 	}
 
 	log.Info().
@@ -190,7 +209,8 @@ func (a *App) sendReaction(ctx context.Context, messageID, emoji string) error {
 		Str("emoji", emoji).
 		Str("from", from.Address).
 		Str("to", to.Address).
-		Msg("Reaction sent")
+		Str("queueID", res.QueueID).
+		Msg("Reaction queued")
 	return nil
 }
 
