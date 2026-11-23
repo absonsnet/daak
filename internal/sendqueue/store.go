@@ -3,9 +3,16 @@
 //
 // Every send is queued first and dispatched by a background worker
 // after the undo window (default 5s, see settings.KeyUndoSendDelay).
-// The queued row holds the full ComposeMessage JSON; the worker
-// re-runs the normal send path at dispatch, so signing, encryption,
-// Sent saving and draft cleanup behave exactly like a direct send.
+// A normal send's queued row holds the full ComposeMessage JSON; the
+// worker re-runs the normal send path at dispatch, so signing,
+// encryption, Sent saving and draft cleanup behave exactly like a
+// direct send. A reaction's row holds pre-built RFC 822 bytes
+// instead (ComposeMessage cannot express the reaction's multipart
+// structure) and the worker sends them raw.
+//
+// Sent rows are deleted on success and undone rows on Undo — the
+// Outbox keeps no history; the Sent folder is the record. Failed
+// rows stay, with Retry.
 //
 // This package owns persistence and the retry policy only. The worker
 // itself lives in the app package (it needs composeOps), and the
@@ -24,11 +31,20 @@ import (
 
 // Item statuses.
 const (
-	StatusPending   = "pending" // in the undo window, or waiting on a retry backoff
-	StatusSending   = "sending" // claimed by a dispatcher (transient)
-	StatusSent      = "sent"
+	StatusPending   = "pending"   // in the undo window, or waiting on a retry backoff
+	StatusSending   = "sending"   // claimed by a dispatcher (transient)
+	StatusSent      = "sent"      // kept for Stats/tests; rows are deleted on success, so none persist
 	StatusFailed    = "failed"    // permanent error, or attempts exhausted
-	StatusCancelled = "cancelled" // undone by the user
+	StatusCancelled = "cancelled" // kept for Stats/tests; undone rows are deleted, so none persist
+)
+
+// Item kinds. A normal send stores its ComposeMessage JSON and the
+// worker re-runs the send path at dispatch; a reaction stores
+// pre-built RFC 822 bytes (ComposeMessage cannot express the
+// reaction's multipart structure) and the worker sends them raw.
+const (
+	KindMessage  = "message"
+	KindReaction = "reaction"
 )
 
 // DefaultMaxAttempts is the send-attempt budget per queued item
@@ -37,24 +53,29 @@ const DefaultMaxAttempts = 5
 
 // Item is one queued normal send. MessageJSON is the full
 // smtp.ComposeMessage at queue time; it is never sent to the
-// frontend (List omits it — see listColumns).
+// frontend (List omits it — see listColumns). Reaction items
+// (KindReaction) carry pre-built bytes in RawMessage instead, plus
+// the internal id of the reacted-to message.
 type Item struct {
-	ID          string     `json:"id"`
-	AccountID   string     `json:"accountId"`
-	DraftID     string     `json:"draftId"`
-	MessageJSON string     `json:"-"`
-	Subject     string     `json:"subject"`
-	Recipient   string     `json:"recipient"`
-	FromAddress string     `json:"fromAddress"`
-	To          []string   `json:"to"`
-	Status      string     `json:"status"`
-	Attempts    int        `json:"attempts"`
-	MaxAttempts int        `json:"maxAttempts"`
-	SendAt      time.Time  `json:"sendAt"`
-	DueAt       time.Time  `json:"dueAt"`
-	LastError   string     `json:"lastError,omitempty"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	SentAt      *time.Time `json:"sentAt,omitempty"`
+	ID                string     `json:"id"`
+	AccountID         string     `json:"accountId"`
+	DraftID           string     `json:"draftId"`
+	Kind              string     `json:"kind"`
+	MessageJSON       string     `json:"-"`
+	RawMessage        []byte     `json:"-"`
+	ReactionMessageID string     `json:"reactionMessageId,omitempty"`
+	Subject           string     `json:"subject"`
+	Recipient         string     `json:"recipient"`
+	FromAddress       string     `json:"fromAddress"`
+	To                []string   `json:"to"`
+	Status            string     `json:"status"`
+	Attempts          int        `json:"attempts"`
+	MaxAttempts       int        `json:"maxAttempts"`
+	SendAt            time.Time  `json:"sendAt"`
+	DueAt             time.Time  `json:"dueAt"`
+	LastError         string     `json:"lastError,omitempty"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	SentAt            *time.Time `json:"sentAt,omitempty"`
 }
 
 // Stats is the whole send queue at a glance, for the Outbox badge.
@@ -79,6 +100,9 @@ func NewStore(db *database.DB) *Store {
 
 // Enqueue inserts one queued send.
 func (s *Store) Enqueue(item Item) error {
+	if item.Kind == "" {
+		item.Kind = KindMessage
+	}
 	toRaw, err := json.Marshal(item.To)
 	if err != nil {
 		return fmt.Errorf("sendqueue: encode recipients: %w", err)
@@ -88,11 +112,13 @@ func (s *Store) Enqueue(item Item) error {
 	}
 	_, err = s.db.Exec(`
 		INSERT INTO send_queue
-			(id, account_id, draft_id, message_json, subject, recipient,
+			(id, account_id, draft_id, kind, message_json, raw_message,
+			 reaction_message_id, subject, recipient,
 			 from_address, to_json, status, attempts, max_attempts,
 			 send_at, due_at, last_error, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, item.ID, item.AccountID, item.DraftID, item.MessageJSON, item.Subject,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, item.ID, item.AccountID, item.DraftID, item.Kind, item.MessageJSON,
+		item.RawMessage, item.ReactionMessageID, item.Subject,
 		item.Recipient, item.FromAddress, string(toRaw), item.Status,
 		item.Attempts, item.MaxAttempts,
 		item.SendAt.UTC().Format(time.RFC3339Nano),
@@ -105,8 +131,10 @@ func (s *Store) Enqueue(item Item) error {
 }
 
 // listColumns is the SELECT list for list views (never the raw
-// message JSON — the list view never needs it).
-const listColumns = `id, account_id, draft_id, subject, recipient,
+// message JSON or the pre-built reaction bytes — the list view never
+// needs either).
+const listColumns = `id, account_id, draft_id, kind, reaction_message_id,
+	subject, recipient,
 	from_address, to_json, status, attempts, max_attempts,
 	send_at, due_at, last_error, created_at, sent_at`
 
@@ -116,6 +144,7 @@ func scanItem(rows *sql.Rows) (Item, error) {
 	var sendAt, dueAt, createdAt string
 	var sentAt sql.NullString
 	if err := rows.Scan(&item.ID, &item.AccountID, &item.DraftID,
+		&item.Kind, &item.ReactionMessageID,
 		&item.Subject, &item.Recipient, &item.FromAddress, &toRaw,
 		&item.Status, &item.Attempts, &item.MaxAttempts,
 		&sendAt, &dueAt, &item.LastError, &createdAt, &sentAt); err != nil {
@@ -162,18 +191,22 @@ func (s *Store) Get(id string) (*Item, error) {
 	return &item, nil
 }
 
-// GetForSend loads one item WITH its message JSON, for dispatch.
+// GetForSend loads one item WITH its message JSON (or, for a
+// reaction item, its pre-built bytes), for dispatch.
 func (s *Store) GetForSend(id string) (*Item, error) {
 	var item Item
 	var toRaw string
 	var sendAt, dueAt, createdAt string
 	var sentAt sql.NullString
+	var rawMessage []byte
 	err := s.db.QueryRow(`
-		SELECT id, account_id, draft_id, message_json, subject, recipient,
+		SELECT id, account_id, draft_id, kind, message_json, raw_message,
+			reaction_message_id, subject, recipient,
 			from_address, to_json, status, attempts, max_attempts,
 			send_at, due_at, last_error, created_at, sent_at
 		FROM send_queue WHERE id = ?
-	`, id).Scan(&item.ID, &item.AccountID, &item.DraftID, &item.MessageJSON,
+	`, id).Scan(&item.ID, &item.AccountID, &item.DraftID, &item.Kind,
+		&item.MessageJSON, &rawMessage, &item.ReactionMessageID,
 		&item.Subject, &item.Recipient, &item.FromAddress, &toRaw,
 		&item.Status, &item.Attempts, &item.MaxAttempts,
 		&sendAt, &dueAt, &item.LastError, &createdAt, &sentAt)
@@ -183,6 +216,7 @@ func (s *Store) GetForSend(id string) (*Item, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sendqueue: get for send: %w", err)
 	}
+	item.RawMessage = rawMessage
 	if err := json.Unmarshal([]byte(toRaw), &item.To); err != nil {
 		return nil, fmt.Errorf("sendqueue: parse recipients: %w", err)
 	}
@@ -322,7 +356,25 @@ func (s *Store) Claim(id string, now time.Time) (bool, error) {
 	return n == 1, nil
 }
 
-// MarkSent marks a claimed item sent.
+// Delete removes a queued item outright. Sent rows are deleted on
+// success — the Outbox keeps no history; the Sent folder is the
+// record. Returns false when the item does not exist.
+func (s *Store) Delete(id string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM send_queue WHERE id = ?`, id)
+	if err != nil {
+		return false, fmt.Errorf("sendqueue: delete: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("sendqueue: delete rows: %w", err)
+	}
+	return n == 1, nil
+}
+
+// MarkSent marks a claimed item sent. Fallback only: when Delete
+// fails after a successful send, marking the row sent keeps it from
+// being re-queued (and re-sent) by the stale-claim reset. The
+// frontend hides sent rows, so a fallback row is invisible.
 func (s *Store) MarkSent(id string, sentAt time.Time) error {
 	_, err := s.db.Exec(`
 		UPDATE send_queue
@@ -333,6 +385,25 @@ func (s *Store) MarkSent(id string, sentAt time.Time) error {
 		return fmt.Errorf("sendqueue: mark sent: %w", err)
 	}
 	return nil
+}
+
+// DeletePending atomically deletes a queued item only while it is
+// still pending, for Undo. Returns false when the item is not
+// pending — already sending/sent/failed, or already gone. Only a
+// pending item can be undone: once the SMTP transaction completes
+// the mail is gone and cannot be recalled.
+func (s *Store) DeletePending(id string) (bool, error) {
+	res, err := s.db.Exec(`
+		DELETE FROM send_queue WHERE id = ? AND status = 'pending'
+	`, id)
+	if err != nil {
+		return false, fmt.Errorf("sendqueue: delete pending: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("sendqueue: delete pending rows: %w", err)
+	}
+	return n == 1, nil
 }
 
 // RecordAttempt records a failed send attempt: attempts, status
@@ -371,24 +442,25 @@ func (s *Store) ResetStaleSending(cutoff time.Time) (int, error) {
 	return int(n), nil
 }
 
-// Cancel undoes a queued send: pending → cancelled. Returns false
-// when the item is not pending — already sending/sent/failed, or
-// already cancelled. Only a pending item can be undone: once the
-// SMTP transaction completes the mail is gone and cannot be
-// recalled.
-func (s *Store) Cancel(id string) (bool, error) {
+// DeletePendingReaction deletes still-pending queued reactions on one
+// message (internal id), for RemoveOwnReaction: removing the pill while
+// the send is still cancellable cancels the send, so the reaction does
+// not go out anyway and reappear on the next Sent sync. Returns the
+// number deleted. A reaction already dispatched is untouched —
+// removing it stays local-only.
+func (s *Store) DeletePendingReaction(messageID string) (int, error) {
 	res, err := s.db.Exec(`
-		UPDATE send_queue SET status = 'cancelled', claimed_at = NULL
-		WHERE id = ? AND status = 'pending'
-	`, id)
+		DELETE FROM send_queue
+		WHERE kind = 'reaction' AND reaction_message_id = ? AND status = 'pending'
+	`, messageID)
 	if err != nil {
-		return false, fmt.Errorf("sendqueue: cancel: %w", err)
+		return 0, fmt.Errorf("sendqueue: delete pending reaction: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("sendqueue: cancel rows: %w", err)
+		return 0, fmt.Errorf("sendqueue: delete pending reaction rows: %w", err)
 	}
-	return n == 1, nil
+	return int(n), nil
 }
 
 // Retry returns a failed item to the queue, due immediately, with a

@@ -935,11 +935,12 @@
 
   // Undo from the countdown toast or the Outbox row: cancel the
   // queued send and reopen the composer with the draft, intact.
+  // A reaction undo has no draft — there is nothing to reopen.
   async function handleUndoSend(countdown: UndoSendCountdown) {
     try {
       const res = await UndoSend(countdown.queueId)
       removeUndoSendCountdown(countdown.queueId)
-      await handleEditDraft(res.draftId, res.accountId)
+      if (res.draftId) await handleEditDraft(res.draftId, res.accountId)
     } catch (err) {
       // Already sent: the worker beat the click. The mail is gone;
       // say so plainly instead of reopening a stale draft.

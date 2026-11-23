@@ -132,6 +132,7 @@
     "outboxRetry": "Retry",
     "outboxSendAt": "Sending at {time}",
     "outboxHistory": "Sent & cancelled",
+    "outboxReaction": "Reaction",
     "outboxStatusQueued": "Queued",
     "outboxStatusSending": "Sending",
     "outboxStatusSent": "Sent",

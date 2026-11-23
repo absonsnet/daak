@@ -25,7 +25,14 @@ import (
 // KeyUndoSendDelay). The composer closes immediately; a countdown
 // toast with Undo shows in the main window, and the Outbox row
 // offers Undo too. Undo cancels the queue item and the composer
-// reopens with the draft, intact.
+// reopens with the draft, intact. Reactions ride the same queue
+// (QueueReaction): the picker closes at once, the pill is applied
+// optimistically, and Undo cancels the queued reaction and removes
+// the local record.
+//
+// A dispatched row is deleted, not kept as history — the Outbox
+// holds no sent or cancelled rows; the Sent folder is the record.
+// Failed rows stay, with Retry.
 //
 // The worker runs ONLY in the main process (App.Startup). The
 // detached composer shares the same DB file and the same queue, but
@@ -83,6 +90,12 @@ type sendQueueService struct {
 	workerMu      sync.Mutex
 	workerRunning bool
 	workerStop    chan struct{}
+
+	// onUndo runs after a queued item is undone, with the deleted
+	// row. The App sets it so undoing a reaction also removes the
+	// local reaction record (the pill); a normal send has no
+	// reaction to remove. Nil-safe: the detached composer passes none.
+	onUndo func(item sendqueue.Item)
 }
 
 func (s *sendQueueService) clock() time.Time {
@@ -159,6 +172,7 @@ func (s *sendQueueService) QueueSend(accountID string, msg smtp.ComposeMessage, 
 		ID:          uuid.New().String(),
 		AccountID:   accountID,
 		DraftID:     draftID,
+		Kind:        sendqueue.KindMessage,
 		MessageJSON: string(raw),
 		Subject:     msg.Subject,
 		Recipient:   recipient,
@@ -191,11 +205,94 @@ func (s *sendQueueService) QueueSend(accountID string, msg smtp.ComposeMessage, 
 	}, nil
 }
 
+// QueueReaction queues a pre-built reaction email for background
+// send after the undo window. Unlike QueueSend there is no draft:
+// Undo removes the local reaction record instead of reopening a
+// composer. It never touches the network: validation failures
+// surface here, at click time, instead of failing silently in the
+// background.
+func (s *sendQueueService) QueueReaction(accountID string, from smtp.Address, to []string, raw []byte, subject, recipient, reactionMessageID string) (QueueSendResult, error) {
+	log := logging.WithComponent("sendqueue")
+	now := s.clock()
+
+	acc, err := s.ops.accountStore.Get(accountID)
+	if err != nil {
+		return QueueSendResult{}, fmt.Errorf("failed to get account: %w", err)
+	}
+	if acc == nil {
+		return QueueSendResult{}, fmt.Errorf("account not found: %s", accountID)
+	}
+	if acc.NoOutgoingServer {
+		return QueueSendResult{}, fmt.Errorf("account %q is configured as receive-only (no outgoing server)", acc.Email)
+	}
+	if len(to) == 0 {
+		return QueueSendResult{}, fmt.Errorf("no recipients specified")
+	}
+	if len(raw) == 0 {
+		return QueueSendResult{}, fmt.Errorf("no reaction message bytes to queue")
+	}
+
+	delay, err := s.settings.GetUndoSendDelay()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to read undo-send delay, using default")
+		delay = settings.DefaultUndoSendDelay
+	}
+
+	sendAt := now.Add(time.Duration(delay) * time.Second)
+	item := sendqueue.Item{
+		ID:                uuid.New().String(),
+		AccountID:         accountID,
+		Kind:              sendqueue.KindReaction,
+		RawMessage:        raw,
+		ReactionMessageID: reactionMessageID,
+		Subject:           subject,
+		Recipient:         recipient,
+		FromAddress:       from.Address,
+		To:                to,
+		Status:            sendqueue.StatusPending,
+		Attempts:          0,
+		MaxAttempts:       sendqueue.DefaultMaxAttempts,
+		SendAt:            sendAt,
+		DueAt:             sendAt,
+		CreatedAt:         now,
+	}
+	if err := s.store.Enqueue(item); err != nil {
+		return QueueSendResult{}, err
+	}
+
+	log.Info().
+		Str("queue_id", item.ID).
+		Str("account_id", accountID).
+		Str("reaction_message_id", reactionMessageID).
+		Int("delay_seconds", delay).
+		Msg("Reaction queued for background send")
+
+	s.emitEvent("sendqueue:updated", nil)
+	// Start the Undo countdown toast in the main window: the same
+	// event the detached composer uses to hand its toast over.
+	s.emitEvent("sendqueue:queued", map[string]interface{}{
+		"queueId":      item.ID,
+		"accountId":    accountID,
+		"draftId":      "",
+		"subject":      subject,
+		"recipient":    recipient,
+		"delaySeconds": delay,
+	})
+	return QueueSendResult{
+		QueueID:      item.ID,
+		DraftID:      "",
+		DelaySeconds: delay,
+		SendAt:       sendAt.Format(time.RFC3339),
+	}, nil
+}
+
 // UndoSend cancels a queued send that has not dispatched yet and
 // returns the draft to reopen. It fails when the item already
 // dispatched (sending/sent) — once the SMTP transaction completes
 // the mail is gone and cannot be recalled — or when the item is
-// already cancelled/failed.
+// already cancelled/failed. A reaction has no draft: undoing it
+// deletes the queued send and removes the local reaction record
+// (via onUndo), so the pill disappears.
 func (s *sendQueueService) UndoSend(queueID string) (UndoSendResult, error) {
 	item, err := s.store.Get(queueID)
 	if err != nil {
@@ -204,7 +301,7 @@ func (s *sendQueueService) UndoSend(queueID string) (UndoSendResult, error) {
 	if item == nil {
 		return UndoSendResult{}, fmt.Errorf("queued send %q not found", queueID)
 	}
-	ok, err := s.store.Cancel(queueID)
+	ok, err := s.store.DeletePending(queueID)
 	if err != nil {
 		return UndoSendResult{}, err
 	}
@@ -218,10 +315,14 @@ func (s *sendQueueService) UndoSend(queueID string) (UndoSendResult, error) {
 			return UndoSendResult{}, fmt.Errorf("message cannot be undone (status %q)", item.Status)
 		}
 	}
+	if s.onUndo != nil {
+		s.onUndo(*item)
+	}
 	log := logging.WithComponent("sendqueue")
 	log.Info().
 		Str("queue_id", queueID).
 		Str("draft_id", item.DraftID).
+		Str("kind", item.Kind).
 		Msg("Queued send undone, message back in Drafts")
 	s.emitEvent("sendqueue:updated", nil)
 	return UndoSendResult{QueueID: queueID, AccountID: item.AccountID, DraftID: item.DraftID}, nil
@@ -372,6 +473,10 @@ func (s *sendQueueService) sendOne(item sendqueue.Item, now time.Time) bool {
 		// reset re-queues it.
 		return false
 	}
+	// Reactions carry pre-built bytes, not a ComposeMessage.
+	if full.Kind == sendqueue.KindReaction {
+		return s.sendReactionItem(*full, now)
+	}
 	var msg smtp.ComposeMessage
 	if err := json.Unmarshal([]byte(full.MessageJSON), &msg); err != nil {
 		_ = s.store.RecordAttempt(item.ID, sendqueue.DefaultMaxAttempts, sendqueue.StatusFailed, now, fmt.Sprintf("corrupt queued message: %v", err))
@@ -386,8 +491,14 @@ func (s *sendQueueService) sendOne(item sendqueue.Item, now time.Time) bool {
 		s.recordFailure(*full, now, err)
 		return false
 	}
-	if err := s.store.MarkSent(item.ID, now); err != nil {
-		log.Warn().Err(err).Str("queue_id", item.ID).Msg("Message sent but failed to mark sent")
+	// Sent: delete the row instead of keeping it as history. If the
+	// delete fails, mark it sent as a fallback — the mail is gone,
+	// and a 'sending' row left behind would be re-queued and re-sent
+	// by the stale-claim reset. The frontend hides sent rows.
+	if ok, err := s.store.Delete(item.ID); err != nil || !ok {
+		if merr := s.store.MarkSent(item.ID, now); merr != nil {
+			log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Message sent but failed to delete or mark sent")
+		}
 	}
 	log.Info().
 		Str("queue_id", item.ID).
@@ -403,6 +514,56 @@ func (s *sendQueueService) sendOne(item sendqueue.Item, now time.Time) bool {
 	})
 	if s.syncSent != nil {
 		accountID := full.AccountID
+		go func() {
+			defer recoverPanic("sendqueue", "sync sent folder")
+			s.syncSent(accountID)
+		}()
+	}
+	return true
+}
+
+// sendReactionItem dispatches one queued reaction: the pre-built
+// bytes go out raw (the same post-build steps the old synchronous
+// sendReaction ran), the Sent copy is saved, and the row is deleted.
+// A failed attempt is recorded with backoff like a failed send; the
+// optimistic pill stays — the local reaction record already exists —
+// until the user removes it or a retry succeeds. No "sent" snackbar:
+// a reaction is not a message the user wants to open from Sent.
+func (s *sendQueueService) sendReactionItem(item sendqueue.Item, now time.Time) bool {
+	log := logging.WithComponent("sendqueue")
+	if len(item.RawMessage) == 0 {
+		_ = s.store.RecordAttempt(item.ID, sendqueue.DefaultMaxAttempts, sendqueue.StatusFailed, now, "queued reaction has no message bytes")
+		s.emitEvent("sendqueue:updated", nil)
+		return false
+	}
+	if err := s.ops.sendRawMessage(s.ctx, item.AccountID, item.FromAddress, item.To, item.RawMessage); err != nil {
+		s.recordFailure(item, now, err)
+		return false
+	}
+	// Save to Sent via IMAP APPEND exactly like a normal send:
+	// skipped when the provider auto-saves Sent mail, and a save
+	// failure only warns — the send already succeeded, and the Sent
+	// sync will pick the message up later either way.
+	if acc, accErr := s.ops.accountStore.Get(item.AccountID); accErr == nil && acc != nil && !providerAutoSavesSentMail(acc.IMAPHost) {
+		if err := s.ops.saveToSentFolder(s.ctx, item.AccountID, acc, item.RawMessage); err != nil {
+			log.Warn().Err(err).Str("accountID", item.AccountID).Msg("Failed to save reaction to Sent folder")
+		}
+	}
+	// Sent: delete the row instead of keeping it as history (same
+	// fallback as a normal send — never re-queue a sent mail).
+	if ok, err := s.store.Delete(item.ID); err != nil || !ok {
+		if merr := s.store.MarkSent(item.ID, now); merr != nil {
+			log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Reaction sent but failed to delete or mark sent")
+		}
+	}
+	log.Info().
+		Str("queue_id", item.ID).
+		Str("account_id", item.AccountID).
+		Str("subject", item.Subject).
+		Msg("Queued reaction sent")
+	s.emitEvent("sendqueue:updated", nil)
+	if s.syncSent != nil {
+		accountID := item.AccountID
 		go func() {
 			defer recoverPanic("sendqueue", "sync sent folder")
 			s.syncSent(accountID)
@@ -491,6 +652,23 @@ func (a *App) newSendQueueService() *sendQueueService {
 		},
 		syncSent: func(accountID string) {
 			_ = a.syncSentFolder(accountID)
+		},
+		// Undoing a reaction removes its local record (the pill) —
+		// there is no draft to reopen. A normal send has no
+		// reaction to remove.
+		onUndo: func(item sendqueue.Item) {
+			if item.Kind != sendqueue.KindReaction || item.ReactionMessageID == "" {
+				return
+			}
+			if a.reactionStore == nil {
+				return
+			}
+			own := a.ownEmailsForAccount(item.AccountID)
+			emails := make([]string, 0, len(own))
+			for email := range own {
+				emails = append(emails, email)
+			}
+			_, _ = a.reactionStore.RemoveReaction(item.ReactionMessageID, emails)
 		},
 		saveDraft: func(accountID string, msg smtp.ComposeMessage, draftID string) (string, error) {
 			res, err := a.SaveDraft(accountID, msg, draftID)

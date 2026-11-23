@@ -920,23 +920,31 @@
   async function handleSendReaction(emoji: string) {
     const messageId = reactionPickerMessageId
     if (!messageId || sendingReaction) return
+    // The picker closes at click time: the reaction is recorded
+    // optimistically and queued for background send, so there is no
+    // wait for the network — and no greyed-out palette while it
+    // queues. The Undo toast appears via the sendqueue:queued event.
+    // (sendingReaction stays as a double-click guard only; it no
+    // longer disables the buttons.)
     sendingReaction = true
+    closeReactionPicker()
     try {
       await SendReaction(messageId, emoji)
-      toasts.success($_('viewer.reactionSent'))
-      closeReactionPicker()
       await loadReactions(messageId)
     } catch (err) {
       console.error('Send reaction failed:', err)
-      // Keep the popover open so the user can try another emoji.
+      // Reopen the picker so the user can try another emoji.
+      reactionPickerMessageId = messageId
+      reactionPickerOpen = true
       toasts.error(`${$_('viewer.failedToSendReaction')}: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
       sendingReaction = false
     }
   }
 
-  // Removing your own reaction only deletes the local row — the reaction
-  // email was already sent and cannot be retracted from the recipient.
+  // Removing your own reaction deletes the local row — and cancels
+  // the queued send if it is still inside the undo window. A
+  // reaction already sent cannot be retracted from the recipient.
   async function handleRemoveOwnReaction(messageId: string) {
     if (removingReactionIds.has(messageId)) return
     removingReactionIds = new Set([...removingReactionIds, messageId])
@@ -1579,8 +1587,7 @@
             <div class="absolute left-0 top-full mt-1 z-50 flex items-center gap-1 rounded-md border border-border bg-popover p-2 shadow-lg">
               {#each QUICK_REACTIONS as emoji}
                 <button
-                  class="p-1.5 text-xl rounded-md hover:bg-muted transition-colors disabled:opacity-50"
-                  disabled={sendingReaction}
+                  class="p-1.5 text-xl rounded-md hover:bg-muted transition-colors"
                   onclick={() => handleSendReaction(emoji)}
                 >
                   {emoji}

@@ -119,21 +119,23 @@ func TestClaimIsAtomic(t *testing.T) {
 	}
 }
 
-func TestCancelOnlyPending(t *testing.T) {
+func TestDeletePendingOnlyPending(t *testing.T) {
 	s := NewStore(openTestDB(t))
 	if err := s.Enqueue(testItem("q1")); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := s.Cancel("q1")
+	ok, err := s.DeletePending("q1")
 	if err != nil || !ok {
-		t.Fatalf("Cancel(pending) = %v, %v, want true, nil", ok, err)
+		t.Fatalf("DeletePending(pending) = %v, %v, want true, nil", ok, err)
 	}
-	// Already cancelled: a second cancel is a no-op.
-	ok, err = s.Cancel("q1")
+	// Already gone: a second delete is a no-op.
+	ok, err = s.DeletePending("q1")
 	if err != nil || ok {
-		t.Fatalf("Cancel(cancelled) = %v, %v, want false, nil", ok, err)
+		t.Fatalf("DeletePending(deleted) = %v, %v, want false, nil", ok, err)
 	}
-	// A sent item cannot be cancelled (the mail is gone).
+	// A claimed (sending) item cannot be undone — the dispatch is
+	// already running — but Delete still removes it outright (the
+	// post-send path, after a successful send).
 	if err := s.Enqueue(testItem("q2")); err != nil {
 		t.Fatal(err)
 	}
@@ -141,12 +143,50 @@ func TestCancelOnlyPending(t *testing.T) {
 	if _, err := s.Claim("q2", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkSent("q2", now); err != nil {
+	ok, err = s.DeletePending("q2")
+	if err != nil || ok {
+		t.Fatalf("DeletePending(sending) = %v, %v, want false, nil", ok, err)
+	}
+	ok, err = s.Delete("q2")
+	if err != nil || !ok {
+		t.Fatalf("Delete(sending) = %v, %v, want true, nil", ok, err)
+	}
+	if got, err := s.Get("q2"); err != nil || got != nil {
+		t.Fatalf("Get(deleted) = %+v, %v, want nil, nil", got, err)
+	}
+}
+
+func TestReactionItemRoundTrip(t *testing.T) {
+	s := NewStore(openTestDB(t))
+	raw := []byte("From: me@example.com\r\n\r\nbody")
+	item := testItem("r1")
+	item.Kind = KindReaction
+	item.MessageJSON = ""
+	item.RawMessage = raw
+	item.ReactionMessageID = "msg-1"
+	item.DraftID = ""
+	if err := s.Enqueue(item); err != nil {
 		t.Fatal(err)
 	}
-	ok, err = s.Cancel("q2")
-	if err != nil || ok {
-		t.Fatalf("Cancel(sent) = %v, %v, want false, nil", ok, err)
+	// The list view carries the kind and the reacted-to message id,
+	// but never the pre-built bytes.
+	got, err := s.Get("r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Kind != KindReaction || got.ReactionMessageID != "msg-1" {
+		t.Fatalf("Get(reaction) = %+v, want kind reaction / msg-1", got)
+	}
+	if len(got.RawMessage) != 0 {
+		t.Fatalf("Get(reaction) returned %d raw bytes, want none in the list view", len(got.RawMessage))
+	}
+	// Dispatch loads the bytes.
+	full, err := s.GetForSend("r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full == nil || string(full.RawMessage) != string(raw) {
+		t.Fatalf("GetForSend(reaction) raw = %q, want the queued bytes", full.RawMessage)
 	}
 }
 
@@ -219,15 +259,16 @@ func TestStatsAndCountPending(t *testing.T) {
 	if _, err := s.Claim("q1", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkSent("q1", now); err != nil {
-		t.Fatal(err)
+	// A sent row is deleted, not kept: the Outbox holds no history.
+	if ok, err := s.Delete("q1"); err != nil || !ok {
+		t.Fatalf("Delete(sent) = %v, %v, want true, nil", ok, err)
 	}
 	st, err := s.Stats()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Total != 2 || st.Pending != 1 || st.Sent != 1 {
-		t.Fatalf("Stats = %+v, want total 2 / pending 1 / sent 1", st)
+	if st.Total != 1 || st.Pending != 1 || st.Sent != 0 {
+		t.Fatalf("Stats = %+v, want total 1 / pending 1 / sent 0", st)
 	}
 }
 

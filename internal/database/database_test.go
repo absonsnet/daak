@@ -221,6 +221,12 @@ func TestMigrationV32_LocalRecordIDsRewrittenToUUIDs(t *testing.T) {
 	if _, err := db.Exec(`ALTER TABLE message_translations DROP COLUMN body_hash`); err != nil {
 		t.Fatalf("drop message_translations.body_hash for re-migrate: %v", err)
 	}
+	// And v52's kind / raw_message / reaction_message_id on send_queue.
+	for _, col := range []string{"kind", "raw_message", "reaction_message_id"} {
+		if _, err := db.Exec(`ALTER TABLE send_queue DROP COLUMN ` + col); err != nil {
+			t.Fatalf("drop send_queue.%s for re-migrate: %v", col, err)
+		}
+	}
 
 	// Re-run migrations — migration 32 should rewrite the seeded local- id.
 	if err := db.Migrate(); err != nil {
@@ -396,6 +402,12 @@ func TestMigrationV33_CleansExistingOrphans(t *testing.T) {
 	// And v49's body_hash on message_translations.
 	if _, err := db.Exec(`ALTER TABLE message_translations DROP COLUMN body_hash`); err != nil {
 		t.Fatalf("drop message_translations.body_hash for re-migrate: %v", err)
+	}
+	// And v52's kind / raw_message / reaction_message_id on send_queue.
+	for _, col := range []string{"kind", "raw_message", "reaction_message_id"} {
+		if _, err := db.Exec(`ALTER TABLE send_queue DROP COLUMN ` + col); err != nil {
+			t.Fatalf("drop send_queue.%s for re-migrate: %v", col, err)
+		}
 	}
 
 	// Seed: orphan state row whose addressbook doesn't exist. Pre-migration,
@@ -589,7 +601,8 @@ func TestMigration31_DuplicateCardDAVEmailDoesNotFailMigration(t *testing.T) {
 func TestMigrationV51_DedupesAttachments(t *testing.T) {
 	db := openTestDB(t)
 
-	// Rewind just migration 51 so re-running Migrate() applies it.
+	// Rewind just migration 51's record (the schema stays), so
+	// applying it again below records cleanly.
 	if _, err := db.Exec(`DELETE FROM migrations WHERE version = 51`); err != nil {
 		t.Fatalf("rewind migration 51: %v", err)
 	}
@@ -620,8 +633,22 @@ func TestMigrationV51_DedupesAttachments(t *testing.T) {
 		t.Fatalf("seed attachments: %v", err)
 	}
 
-	if err := db.Migrate(); err != nil {
-		t.Fatalf("re-run Migrate(): %v", err)
+	// Apply migration 51 directly. (Do not rewind + Migrate():
+	// later migrations such as 52's ALTER TABLE ADD COLUMN are not
+	// re-runnable on a DB that already has the column, and Migrate
+	// keys off MAX(version) — 52 — so 51 would never re-run.)
+	var m51 *Migration
+	for i := range migrations {
+		if migrations[i].Version == 51 {
+			m51 = &migrations[i]
+			break
+		}
+	}
+	if m51 == nil {
+		t.Fatal("migration 51 not found")
+	}
+	if err := db.applyMigration(*m51); err != nil {
+		t.Fatalf("apply migration 51: %v", err)
 	}
 
 	var n int

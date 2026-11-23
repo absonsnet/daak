@@ -177,13 +177,11 @@
       <section class="space-y-3 rounded-md border border-border p-3">
         <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
           <span><span class="font-medium">{stats?.queued ?? 0}</span> queued</span>
-          <span class="text-green-700 dark:text-green-400">Sent: {stats?.sent ?? 0}</span>
           {#if (stats?.failed ?? 0) > 0}
             <span class="text-destructive">Failed: {stats?.failed}</span>
           {/if}
-          {#if (stats?.cancelled ?? 0) > 0}
-            <span class="text-muted-foreground">Cancelled: {stats?.cancelled}</span>
-          {/if}
+          <!-- Sent and cancelled rows are deleted from the queue on
+               success/cancel — the run list below is the record. -->
           <span class="text-xs text-muted-foreground">
             Scheduled dispatch: {config.paused ? 'paused' : `${config.perHour} per hour`}
           </span>

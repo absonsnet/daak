@@ -14,13 +14,13 @@ import (
 // Outbox queue types (Phase 2)
 // ---------------------------------------------------------------------------
 
-// QueueItemStatus values for one queued message.
+// QueueItemStatus values for one queued message. 'sent' and
+// 'cancelled' are not statuses a queue row can hold anymore — a row
+// is deleted on success or cancel, and the run log is the record.
 const (
-	QueueStatusQueued    = "queued"
-	QueueStatusSending   = "sending" // claimed by a dispatcher, transient
-	QueueStatusSent      = "sent"
-	QueueStatusFailed    = "failed" // attempts exhausted
-	QueueStatusCancelled = "cancelled"
+	QueueStatusQueued  = "queued"
+	QueueStatusSending = "sending" // claimed by a dispatcher, transient
+	QueueStatusFailed  = "failed"  // attempts exhausted
 )
 
 // DefaultMaxQueueAttempts is the send-attempt budget per queued item
@@ -362,15 +362,16 @@ func (b *MailMergeBridge) sendOneQueuedItem(sender *hostmm.RawSender, item Queue
 		newlyFailed := b.recordQueueFailure(*full, now, err)
 		return false, newlyFailed
 	}
-	if err := b.store.MarkItemSent(item.ID, now); err != nil {
-		return false, false
-	}
-	// Keep the run log in step with the queue: the row was 'queued',
-	// it is now 'sent'.
+	// The run log is the record: write the sent outcome first, then
+	// delete the queue row. If the delete fails, fall back to
+	// marking it sent — a sent mail must never be re-queued.
 	_ = b.store.SaveRowResult(item.RunID, hostmm.RowResult{
 		Index: item.RowIndex, Email: item.Recipient,
 		Status: hostmm.RowSent, Timestamp: now,
 	})
+	if _, err := b.store.DeleteQueueItem(item.ID); err != nil {
+		_ = b.store.MarkItemSent(item.ID, now)
+	}
 	return true, false
 }
 
@@ -565,7 +566,8 @@ func (b *MailMergeBridge) MailMerge_ResumeQueuedRun(runID string) error {
 	return nil
 }
 
-// MailMerge_CancelQueuedItem cancels one queued message (never sent).
+// MailMerge_CancelQueuedItem cancels one queued message (never sent):
+// the run log records it skipped, then the queue row is deleted.
 func (b *MailMergeBridge) MailMerge_CancelQueuedItem(itemID string) error {
 	if !b.gateEnabled() {
 		return nil
@@ -580,7 +582,7 @@ func (b *MailMergeBridge) MailMerge_CancelQueuedItem(itemID string) error {
 	if item == nil {
 		return fmt.Errorf("mail-merge: queue item %q not found", itemID)
 	}
-	ok, err := b.store.CancelQueueItem(itemID)
+	ok, err := b.store.DeleteQueueItem(itemID)
 	if err != nil {
 		return err
 	}
@@ -608,7 +610,7 @@ func (b *MailMergeBridge) MailMerge_CancelQueuedRun(runID string) error {
 		return err
 	}
 	// Update the run log for the cancelled rows first (so the counts
-	// recompute correctly), then cancel the items.
+	// recompute correctly), then delete the items.
 	items, err := b.store.ListQueueItems()
 	if err != nil {
 		return err
@@ -622,7 +624,7 @@ func (b *MailMergeBridge) MailMerge_CancelQueuedRun(runID string) error {
 			})
 		}
 	}
-	if _, err := b.store.CancelRunQueueItems(runID); err != nil {
+	if _, err := b.store.DeleteRunQueueItems(runID); err != nil {
 		return err
 	}
 	b.refreshRunCounts(runID)

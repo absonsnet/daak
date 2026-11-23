@@ -169,14 +169,17 @@
   // normal sends waiting out the Undo Send window. Both share one
   // list: normal sends are `kind: 'send'` with status 'pending'
   // (in the undo window or on retry backoff) and carry the draft to
-  // reopen on Undo; Mail Merge rows are `kind: 'mailmerge'` with
-  // status 'queued'. ListQueue returns nil when the extension is
-  // disabled, so a disabled extension reads as an empty outbox.
+  // reopen on Undo; reactions are `kind: 'reaction'` (same pending
+  // window, no draft); Mail Merge rows are `kind: 'mailmerge'`
+  // with status 'queued'. ListQueue returns nil when the extension
+  // is disabled, so a disabled extension reads as an empty outbox.
   // One shared row shape; the template branches on `kind` for the
-  // Undo/Retry/Cancel actions.
+  // Undo/Retry/Cancel actions. Sent and cancelled rows are deleted
+  // by the backend on success/undo, so the list shows only rows
+  // still in flight or failed — there is no history section.
   interface OutboxRow {
     id: string
-    kind: 'mailmerge' | 'send'
+    kind: 'mailmerge' | 'send' | 'reaction'
     accountId: string
     draftId?: string
     recipient: string
@@ -204,14 +207,13 @@
   // go out on their own countdown, so the button enables on those.
   const waitingMailMergeItems = $derived(waitingQueueItems.filter((i) => i.kind === 'mailmerge'))
   const failedQueueItems = $derived(queueItems.filter((i) => i.status === 'failed'))
-  const doneQueueItems = $derived(queueItems.filter((i) => i.status === 'sent' || i.status === 'cancelled'))
 
-  // Waiting, then failed, then sent/cancelled — each group only when
-  // non-empty (the template skips empty groups).
+  // Waiting, then failed — each group only when non-empty (the
+  // template skips empty groups). Sent and cancelled rows are
+  // deleted by the backend, so there is no history group.
   const queueGroups = $derived([
     { key: 'waiting', label: $_('messageList.outboxStatusQueued'), items: waitingQueueItems },
     { key: 'failed', label: $_('messageList.outboxStatusFailed'), items: failedQueueItems },
-    { key: 'done', label: $_('messageList.outboxHistory'), items: doneQueueItems },
   ].filter((g) => g.items.length > 0))
 
   async function loadQueue() {
@@ -222,7 +224,10 @@
         MailMerge_ListQueue(),
         ListSendQueue(),
       ])
-      const mmRows: OutboxRow[] = normalizeQueueItems((mmItems as MailMergeQueuedItem[] | null) ?? []).map((i) => ({
+      // Sent and cancelled rows are deleted by the backend, but a
+      // fallback row can survive a failed delete — filter them out
+      // here too so the history section never reappears.
+      const mmRows: OutboxRow[] = normalizeQueueItems((mmItems as MailMergeQueuedItem[] | null) ?? []).filter((i) => i.status !== 'sent' && i.status !== 'cancelled').map((i) => ({
         id: i.id,
         kind: 'mailmerge',
         accountId: i.accountId,
@@ -239,10 +244,11 @@
         sentAt: i.sentAt,
       }))
       // Normal sends first (newest action on top), then the Mail
-      // Merge queue in its existing order.
-      const sendRows: OutboxRow[] = ((sendItems as sendqueue.Item[] | null) ?? []).map((i) => ({
+      // Merge queue in its existing order. Reaction rows keep their
+      // kind so the template can label them; they have no draft.
+      const sendRows: OutboxRow[] = ((sendItems as sendqueue.Item[] | null) ?? []).filter((i) => i.status !== 'sent' && i.status !== 'cancelled').map((i) => ({
         id: i.id,
-        kind: 'send',
+        kind: i.kind === 'reaction' ? 'reaction' : 'send',
         accountId: i.accountId,
         draftId: i.draftId,
         recipient: i.recipient,
@@ -315,10 +321,11 @@
   // Undo Send: cancel a normal send still in its undo window and
   // reopen the composer with the draft (the parent owns that flow).
   async function undoSendQueueItem(item: OutboxRow) {
-    if (!item.draftId) return
+    // Reactions have no draft to reopen — the App handler tolerates
+    // an empty draftId, so no guard here.
     queueActionBusy = `undo-${item.id}`
     try {
-      await onUndoSend?.(item.id, item.draftId, item.accountId)
+      await onUndoSend?.(item.id, item.draftId ?? '', item.accountId)
       await loadQueue()
     } catch (err) {
       console.error('Undo queued send failed:', err)
@@ -2601,6 +2608,11 @@
                   <span class="block truncate text-sm font-medium">{item.subject || $_('messageList.noContent')}</span>
                   <span class="block truncate text-xs text-muted-foreground">{item.recipient}</span>
                 </span>
+                {#if item.kind === 'reaction'}
+                  <span class="flex-shrink-0 px-1.5 py-0.5 text-xs font-medium rounded-full bg-muted text-muted-foreground">
+                    {$_('messageList.outboxReaction')}
+                  </span>
+                {/if}
                 <span class="flex-shrink-0 px-1.5 py-0.5 text-xs font-medium rounded-full {item.status === 'failed' ? 'bg-destructive/10 text-destructive' : item.status === 'sent' ? 'bg-emerald-500/10 text-emerald-600' : 'bg-muted text-muted-foreground'}">
                   {queueStatusLabel(item.status)}
                 </span>
@@ -2610,7 +2622,7 @@
                   <p class="truncate">From: {item.fromAddress}</p>
                   <p class="break-words">To: {item.to.join(', ')}</p>
                   <p>{$_('messageList.outboxAttempts', { values: { attempts: item.attempts, max: item.maxAttempts } })}</p>
-                  {#if item.kind === 'send' && item.status === 'pending' && item.sendAt}
+                  {#if (item.kind === 'send' || item.kind === 'reaction') && item.status === 'pending' && item.sendAt}
                     <p>{$_('messageList.outboxSendAt', { values: { time: formatQueueTime(item.sendAt) } })}</p>
                   {/if}
                   {#if item.status === 'queued' && item.nextAttemptAt}
@@ -2622,7 +2634,7 @@
                   {#if item.lastError}
                     <p class="text-destructive break-words">{$_('messageList.outboxLastError', { values: { error: item.lastError } })}</p>
                   {/if}
-                  {#if item.kind === 'send' && item.status === 'pending'}
+                  {#if (item.kind === 'send' || item.kind === 'reaction') && item.status === 'pending'}
                     <div class="pt-1 flex gap-2">
                       <Button
                         size="sm"
@@ -2634,7 +2646,7 @@
                       </Button>
                     </div>
                   {/if}
-                  {#if item.kind === 'send' && item.status === 'failed'}
+                  {#if (item.kind === 'send' || item.kind === 'reaction') && item.status === 'failed'}
                     <div class="pt-1 flex gap-2">
                       <Button
                         size="sm"

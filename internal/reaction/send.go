@@ -62,6 +62,9 @@ type Original struct {
 	To        []string
 	Cc        []string
 	Bcc       []string
+	// Date is the original's sent date, for the "Sent:" line of the
+	// quoted original in the fallback bodies. Zero omits the line.
+	Date time.Time
 	// SMIMEEncrypted / PGPEncrypted mirror the message store's flags for
 	// the original (see internal/message.Message).
 	SMIMEEncrypted bool
@@ -185,6 +188,13 @@ type BuildOptions struct {
 	// angle brackets), parent's References plus the original's
 	// Message-ID. Empty falls back to just the original's Message-ID.
 	References []string
+	// OriginalBodyText / OriginalBodyHTML are the original message's
+	// stored body, quoted in full in the human-readable fallback
+	// bodies (the Outlook fallback format). At least one should be
+	// set — the caller fetches the body first when it has not been
+	// fetched yet.
+	OriginalBodyText string
+	OriginalBodyHTML string
 }
 
 // BuildMessage builds the reaction email as raw RFC 822 bytes and returns
@@ -195,10 +205,16 @@ type BuildOptions struct {
 //
 //	multipart/mixed
 //	├── multipart/alternative
-//	│   ├── text/plain            fallback one-liner
+//	│   ├── text/plain            fallback: banner + quoted original (full body)
 //	│   ├── text/vnd.google.email-reaction+json   {"version": 1, "emoji": "…"} (between plain and html, per Google)
-//	│   └── text/html             fallback one-liner
+//	│   └── text/html             fallback: banner + quoted original (full body)
 //	└── text/plain; Content-Disposition: reaction   single emoji line (direct child of the outermost multipart, per RFC 9078)
+//
+// The fallback bodies use the Outlook fallback format: a banner line
+// ("👍 <name> reacted to your message:") followed by the original
+// message in full (From/Sent/To/Subject headers, then the body).
+// Clients that understand the Gmail JSON part render the reaction
+// inline on the original; every other client shows this body.
 //
 // Headers: From is the sender identity, To is the original sender only,
 // Subject is "Re: <original subject>", In-Reply-To and References point
@@ -216,7 +232,7 @@ func BuildMessage(opts BuildOptions) (raw []byte, messageID string, err error) {
 	if senderName == "" {
 		senderName = strings.TrimSpace(opts.SenderEmail)
 	}
-	oneLiner := fmt.Sprintf("%s — %s reacted to your message", strings.TrimSpace(opts.Emoji), senderName)
+	banner := fmt.Sprintf("%s %s reacted to your message:", strings.TrimSpace(opts.Emoji), senderName)
 
 	messageID = fmt.Sprintf("<%s@daak>", uuid.New().String())
 	inReplyTo := ensureAngleBrackets(orig.MessageID)
@@ -224,21 +240,123 @@ func BuildMessage(opts BuildOptions) (raw []byte, messageID string, err error) {
 	if len(refs) == 0 {
 		refs = []string{inReplyTo}
 	}
-	raw, err = buildMixedBody(opts, oneLiner, messageID, inReplyTo, refs)
+	raw, err = buildMixedBody(opts, banner, messageID, inReplyTo, refs)
 	if err != nil {
 		return nil, "", err
 	}
 	return raw, messageID, nil
 }
 
+// fallbackPlainBody renders the human-readable fallback for the
+// text/plain part: the banner, a separator, the original's headers,
+// then the original's full body text.
+func fallbackPlainBody(opts BuildOptions, banner string) string {
+	orig := opts.Original
+	var b strings.Builder
+	b.WriteString(banner)
+	b.WriteString("\n")
+	b.WriteString(strings.Repeat("_", 60))
+	b.WriteString("\n")
+	b.WriteString("From: " + formatAddress(orig.FromName, orig.FromEmail) + "\n")
+	if !orig.Date.IsZero() {
+		b.WriteString("Sent: " + orig.Date.Format("Monday, January 2, 2006 3:04 PM") + "\n")
+	}
+	if len(orig.To) > 0 {
+		b.WriteString("To: " + strings.Join(orig.To, ", ") + "\n")
+	}
+	if len(orig.Cc) > 0 {
+		b.WriteString("Cc: " + strings.Join(orig.Cc, ", ") + "\n")
+	}
+	b.WriteString("Subject: " + orig.Subject + "\n")
+	b.WriteString("\n")
+	b.WriteString(plainBodyText(opts))
+	return b.String()
+}
+
+// fallbackHTMLBody renders the same fallback for the text/html part:
+// the banner, a rule, the original's headers, then the original's
+// full body (its stored HTML when available, else the plain text).
+func fallbackHTMLBody(opts BuildOptions, banner string) string {
+	orig := opts.Original
+	var b strings.Builder
+	b.WriteString("<p>" + escapeHTML(banner) + "</p>")
+	b.WriteString("<hr>")
+	b.WriteString("<p>")
+	b.WriteString("From: " + escapeHTML(formatAddress(orig.FromName, orig.FromEmail)) + "<br>")
+	if !orig.Date.IsZero() {
+		b.WriteString("Sent: " + escapeHTML(orig.Date.Format("Monday, January 2, 2006 3:04 PM")) + "<br>")
+	}
+	if len(orig.To) > 0 {
+		b.WriteString("To: " + escapeHTML(strings.Join(orig.To, ", ")) + "<br>")
+	}
+	if len(orig.Cc) > 0 {
+		b.WriteString("Cc: " + escapeHTML(strings.Join(orig.Cc, ", ")) + "<br>")
+	}
+	b.WriteString("Subject: " + escapeHTML(orig.Subject))
+	b.WriteString("</p>")
+	if strings.TrimSpace(opts.OriginalBodyHTML) != "" {
+		b.WriteString(opts.OriginalBodyHTML)
+	} else {
+		b.WriteString("<p>" + strings.ReplaceAll(escapeHTML(plainBodyText(opts)), "\n", "<br>") + "</p>")
+	}
+	return b.String()
+}
+
+// plainBodyText is the original's full body as plain text: the stored
+// plain body when present, else the stored HTML with its tags
+// stripped.
+func plainBodyText(opts BuildOptions) string {
+	if strings.TrimSpace(opts.OriginalBodyText) != "" {
+		return opts.OriginalBodyText
+	}
+	return stripHTMLTags(opts.OriginalBodyHTML)
+}
+
+// formatAddress renders a name + address the way a mail header
+// shows it: "Name <address>", or just the address when unnamed.
+func formatAddress(name, address string) string {
+	name = strings.TrimSpace(name)
+	address = strings.TrimSpace(address)
+	if name == "" {
+		return address
+	}
+	return fmt.Sprintf("%s <%s>", name, address)
+}
+
+// stripHTMLTags removes tags from a small HTML fragment and unescapes
+// the common entities, for the plain-text fallback when only the
+// HTML body was stored. It is a quote helper, not a sanitizer.
+func stripHTMLTags(html string) string {
+	var b strings.Builder
+	inTag := false
+	for _, r := range html {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+		case !inTag:
+			b.WriteRune(r)
+		}
+	}
+	s := b.String()
+	for _, pair := range [][2]string{
+		{"&nbsp;", " "}, {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"},
+		{"&quot;", `"`}, {"&#39;", "'"},
+	} {
+		s = strings.ReplaceAll(s, pair[0], pair[1])
+	}
+	return strings.TrimSpace(s)
+}
+
 // buildMixedBody writes the full message (headers + multipart/mixed body).
 // Split out of BuildMessage so the boundary is generated exactly once.
-func buildMixedBody(opts BuildOptions, oneLiner, messageID, inReplyTo string, refs []string) ([]byte, error) {
+func buildMixedBody(opts BuildOptions, banner, messageID, inReplyTo string, refs []string) ([]byte, error) {
 	orig := opts.Original
 	var buf bytes.Buffer
 	writeHeader(&buf, "From", (&mail.Address{Name: opts.SenderName, Address: opts.SenderEmail}).String())
 	writeHeader(&buf, "To", (&mail.Address{Name: orig.FromName, Address: strings.TrimSpace(orig.FromEmail)}).String())
-	writeHeader(&buf, "Subject", encodeSubject(reactionSubject(orig.Subject)))
+	writeHeader(&buf, "Subject", encodeSubject(ReactionSubject(orig.Subject)))
 	writeHeader(&buf, "Date", time.Now().Format(time.RFC1123Z))
 	writeHeader(&buf, "Message-ID", messageID)
 	writeHeader(&buf, "MIME-Version", "1.0")
@@ -271,7 +389,7 @@ func buildMixedBody(opts BuildOptions, oneLiner, messageID, inReplyTo string, re
 	if err != nil {
 		return nil, err
 	}
-	writeQuotedPrintable(textPart, oneLiner)
+	writeQuotedPrintable(textPart, fallbackPlainBody(opts, banner))
 
 	gmailHeader := textproto.MIMEHeader{}
 	gmailHeader.Set("Content-Type", GmailReactionContentType+"; charset=utf-8")
@@ -289,7 +407,7 @@ func buildMixedBody(opts BuildOptions, oneLiner, messageID, inReplyTo string, re
 	if err != nil {
 		return nil, err
 	}
-	writeQuotedPrintable(htmlPart, "<p>"+escapeHTML(oneLiner)+"</p>")
+	writeQuotedPrintable(htmlPart, fallbackHTMLBody(opts, banner))
 
 	if err := alt.Close(); err != nil {
 		return nil, err
@@ -321,9 +439,11 @@ func gmailReactionJSON(emoji string) string {
 	return `{"version": 1, "emoji": ` + string(encoded) + `}`
 }
 
-// reactionSubject prefixes "Re: " unless the subject already carries it,
-// mirroring the reply subject rule in the composer.
-func reactionSubject(subject string) string {
+// ReactionSubject prefixes "Re: " unless the subject already carries it,
+// mirroring the reply subject rule in the composer. Exported so the app
+// layer can label the queued reaction row with the same subject the
+// built email carries.
+func ReactionSubject(subject string) string {
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(subject)), "re:") {
 		return subject
 	}
