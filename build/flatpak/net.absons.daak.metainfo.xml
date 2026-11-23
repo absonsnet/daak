@@ -375,6 +375,14 @@
   </provides>
 
   <releases>
+    <release version="0.7.34" date="2026-11-23">
+      <description>
+        <ul>
+          <li>Reactions are now sent Outlook-style: the fallback text quotes the full original message under a banner, and reacting queues the reaction in the Outbox with Undo instead of greying out the picker</li>
+          <li>Sent and cancelled rows are deleted from the Outbox instead of kept as history — the Sent folder and the Mail Merge run log are the record</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.33" date="2026-11-23">
       <description>
         <ul>

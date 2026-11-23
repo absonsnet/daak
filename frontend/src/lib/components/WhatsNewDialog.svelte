@@ -60,12 +60,13 @@
       </div>
 
       <div class="space-y-4 max-h-[60vh] overflow-y-auto text-sm">
-        <p>🚀 Welcome to {APP_NAME} v0.7.33!</p>
+        <p>🚀 Welcome to {APP_NAME} v0.7.34!</p>
 
-        <p>v0.7.33 adds Empty Spam to the Spam folder's right-click menu in the sidebar:</p>
+        <p>v0.7.34 reworks reactions and cleans up the Outbox:</p>
 
         <ul class="list-disc pl-6 space-y-1">
-          <li>🗑️ Right-click any account's Spam folder and choose Empty Spam — same confirmation and result as the Empty Spam button in the message list</li>
+          <li>👍 Reactions are sent Outlook-style: the fallback text quotes the full original message under a banner — and reacting no longer greys out the picker; the pill shows at once, the reaction queues in the Outbox, and Undo cancels it</li>
+          <li>🧹 The Outbox no longer keeps history: sent rows are deleted once sent and cancelled rows on Undo, in both queues — the Sent folder and the Mail Merge run log are the record</li>
         </ul>
 
         <p>🏷 See the full change log here:</p>
