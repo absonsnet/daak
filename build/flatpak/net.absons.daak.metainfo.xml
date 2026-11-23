@@ -375,6 +375,13 @@
   </provides>
 
   <releases>
+    <release version="0.7.35" date="2026-11-23">
+      <description>
+        <ul>
+          <li>The reaction email banner now renders as a pale-blue card with the sender's name in bold and a larger font, like Outlook's fallback</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.34" date="2026-11-23">
       <description>
         <ul>

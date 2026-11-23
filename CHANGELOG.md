@@ -1,5 +1,10 @@
 # CHANGELOG
 
+**v0.7.35 - 23-11-2026**
+---
+
+- The reaction email's banner now renders exactly like Outlook's fallback: the whole sentence sits in a pale-blue card, the sender's name is bold, and the banner font is larger than the quoted original below it. Plain-text part, Gmail JSON part and RFC 9078 part unchanged
+
 **v0.7.34 - 23-11-2026**
 ---
 

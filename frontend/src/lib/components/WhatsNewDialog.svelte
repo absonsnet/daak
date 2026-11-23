@@ -60,13 +60,12 @@
       </div>
 
       <div class="space-y-4 max-h-[60vh] overflow-y-auto text-sm">
-        <p>🚀 Welcome to {APP_NAME} v0.7.34!</p>
+        <p>🚀 Welcome to {APP_NAME} v0.7.35!</p>
 
-        <p>v0.7.34 reworks reactions and cleans up the Outbox:</p>
+        <p>v0.7.35 polishes the reaction email:</p>
 
         <ul class="list-disc pl-6 space-y-1">
-          <li>👍 Reactions are sent Outlook-style: the fallback text quotes the full original message under a banner — and reacting no longer greys out the picker; the pill shows at once, the reaction queues in the Outbox, and Undo cancels it</li>
-          <li>🧹 The Outbox no longer keeps history: sent rows are deleted once sent and cancelled rows on Undo, in both queues — the Sent folder and the Mail Merge run log are the record</li>
+          <li>👍 The reaction banner now renders as a pale-blue card with the sender's name in bold and a larger font, exactly like Outlook's fallback — the quoted original below it is unchanged</li>
         </ul>
 
         <p>🏷 See the full change log here:</p>

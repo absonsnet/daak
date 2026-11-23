@@ -149,8 +149,8 @@ func TestBuildMessageStructure(t *testing.T) {
 	if html.contentType != "text/html" {
 		t.Errorf("alternative[2] = %q, want text/html", html.contentType)
 	}
-	if !strings.Contains(html.body, "👍 Me reacted to your message:") {
-		t.Errorf("html body = %q, want the banner", html.body)
+	if !strings.Contains(html.body, "👍 <b>Me</b> reacted to your message:") {
+		t.Errorf("html body = %q, want the banner with the name bold", html.body)
 	}
 
 	reactionPart := root.children[1]
@@ -228,8 +228,9 @@ func TestBuildMessageQuotesOriginal(t *testing.T) {
 		}
 	}
 	// HTML part: the same banner + headers, then the original's HTML.
+	// The banner is a card now, so the name sits inside a <b> element.
 	for _, want := range []string{
-		"👍 Me reacted to your message:",
+		"👍 <b>Me</b> reacted to your message:",
 		"From: Alice &lt;alice@example.com&gt;",
 		"Sent: Monday, November 9, 2026 3:55 PM",
 		"Subject: Hello there",
@@ -240,6 +241,65 @@ func TestBuildMessageQuotesOriginal(t *testing.T) {
 		}
 	}
 	// The machine-readable parts are untouched by the fallback restyle.
+	if strings.TrimSpace(gmail.body) != `{"version": 1, "emoji": "👍"}` {
+		t.Errorf("gmail body = %q, want the JSON part unchanged", strings.TrimSpace(gmail.body))
+	}
+	reactionPart := root.children[1]
+	if reactionPart.disposition != "reaction" || strings.TrimSpace(reactionPart.body) != "👍" {
+		t.Errorf("reaction part = %q / %q, want disposition reaction with just the emoji", reactionPart.disposition, reactionPart.body)
+	}
+}
+
+// --- HTML banner card (measured from the Outlook fallback screenshot) ---
+
+func TestBuildMessageBannerCard(t *testing.T) {
+	raw, _, err := BuildMessage(BuildOptions{
+		Emoji:            "👍",
+		SenderName:       "Dr Sana Zulfiqar",
+		SenderEmail:      "sana@example.com",
+		Original:         testOriginal(),
+		OriginalBodyText: "Can we meet at 3 on Monday?",
+	})
+	if err != nil {
+		t.Fatalf("BuildMessage() error = %v", err)
+	}
+	root := parseMIMEParts(t, raw)
+	plain, gmail, html := root.children[0].children[0], root.children[0].children[1], root.children[0].children[2]
+
+	// The banner card: pale-blue background (#eff6fb, sampled from the
+	// reference), rounded corners, padding, banner font ~1.5x the
+	// quoted body (21px vs 14px), sender name bold — all inline
+	// styles, no <style> block (mail clients strip those).
+	for _, want := range []string{
+		"background-color:#eff6fb",
+		"border-radius:6px",
+		"padding:12px 20px",
+		"font-size:21px",
+		"👍 <b>Dr Sana Zulfiqar</b> reacted to your message:",
+		"font-size:14px",
+	} {
+		if !strings.Contains(html.body, want) {
+			t.Errorf("html body = %q, want it to contain %q", html.body, want)
+		}
+	}
+	if strings.Contains(html.body, "<style") {
+		t.Errorf("html body = %q, want inline styles only, no <style> block", html.body)
+	}
+	// The banner sentence is one card: the bold name sits between the
+	// emoji and the rest of the sentence, inside the card div.
+	if idx := strings.Index(html.body, "background-color:#eff6fb"); idx >= 0 {
+		if !strings.Contains(html.body[idx:], "<b>Dr Sana Zulfiqar</b> reacted to your message:") {
+			t.Errorf("html body = %q, want the whole sentence inside the card", html.body)
+		}
+	}
+	// Plain part unchanged: the plain banner line, no markup, no card.
+	if !strings.Contains(plain.body, "👍 Dr Sana Zulfiqar reacted to your message:") {
+		t.Errorf("plain body = %q, want the plain banner line", plain.body)
+	}
+	if strings.Contains(plain.body, "<b>") || strings.Contains(plain.body, "background-color") {
+		t.Errorf("plain body = %q, want no styling in the plain part", plain.body)
+	}
+	// Machine-readable parts untouched by the card restyle.
 	if strings.TrimSpace(gmail.body) != `{"version": 1, "emoji": "👍"}` {
 		t.Errorf("gmail body = %q, want the JSON part unchanged", strings.TrimSpace(gmail.body))
 	}
