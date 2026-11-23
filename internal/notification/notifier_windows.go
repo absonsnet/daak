@@ -5,17 +5,23 @@ package notification
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
 	"git.sr.ht/~jackmordaunt/go-toast/v2/wintoast"
 	"github.com/absonsnet/daak/internal/logging"
 	"github.com/rs/zerolog"
+	"golang.org/x/sys/windows/registry"
 )
 
 const (
 	windowsAppID = "net.absons.daak"
 	windowsGUID  = "{8F2B5A4E-3C1D-4E6F-9A7B-2D8E1F0C3B5A}"
+	// appIdentityKeyPath is the registry key Windows reads for a toast's
+	// sender name and icon when no Start menu shortcut carries the
+	// AppUserModelID.
+	appIdentityKeyPath = `SOFTWARE\Classes\AppUserModelId\` + windowsAppID
 )
 
 // windowsNotifier uses Windows Toast notifications with COM activation
@@ -49,6 +55,14 @@ func (n *windowsNotifier) Start(ctx context.Context) error {
 		n.log.Warn().Err(err).Msg("Failed to register Windows app data (notifications may not support click handling)")
 	}
 
+	// Repair the toast sender identity (see toast_identity.go): SetAppData
+	// writes DisplayName = the raw AppID and never overwrites an existing
+	// value, so machines that ran v0.7.30/31 show "net.absons.daak" with a
+	// generic icon. This unconditional write repairs it on the next launch
+	// after upgrading. Best-effort: a failure here only leaves the old
+	// sender name/icon; toasts still arrive.
+	n.fixToastIdentity()
+
 	// Set up the activation callback for toast interactions.
 	// invokedArgs contains our notification ID (set in the toast launch attribute).
 	wintoast.SetActivationCallback(func(appUserModelId string, invokedArgs string, userData []wintoast.UserData) {
@@ -80,6 +94,26 @@ func (n *windowsNotifier) Start(ctx context.Context) error {
 	n.initialized = true
 	n.log.Info().Msg("Windows notification support started (Toast/COM)")
 	return nil
+}
+
+// fixToastIdentity overwrites the toast sender identity Windows shows for
+// this app: DisplayName = the app name ("Daak") and IconUri = the icon.ico
+// shipped next to daak.exe. It runs after SetAppData on purpose — SetAppData
+// skips writing DisplayName once it exists, so running this last guarantees
+// the final value is ours. It only touches DisplayName and IconUri; the
+// CustomActivator/GUID registration from SetAppData is left alone.
+func (n *windowsNotifier) fixToastIdentity() {
+	key, _, err := registry.CreateKey(registry.CURRENT_USER, appIdentityKeyPath, registry.SET_VALUE)
+	if err != nil {
+		n.log.Warn().Err(err).Msg("Failed to open Windows toast identity key (toasts will show the app ID)")
+		return
+	}
+	exePath, _ := os.Executable()
+	if err := writeToastIdentity(key, n.appName, toastIconPathFor(exePath)); err != nil {
+		n.log.Warn().Err(err).Msg("Failed to set Windows toast sender identity (toasts will show the app ID)")
+		return
+	}
+	n.log.Debug().Str("displayName", n.appName).Msg("Windows toast sender identity set")
 }
 
 func (n *windowsNotifier) Stop() {
