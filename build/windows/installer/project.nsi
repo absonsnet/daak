@@ -640,6 +640,11 @@ Section
 
     !insertmacro wails.files
 
+    ; Ship the app icon next to the exe: the notifier points the toast
+    ; IconUri at $INSTDIR\icon.ico (internal/notification/toast_identity.go).
+    ; Same relative path as MUI_ICON above, so it exists at build time.
+    File "..\icon.ico"
+
     CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
     CreateShortCut "$DESKTOP\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
 
