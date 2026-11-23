@@ -375,6 +375,13 @@
   </provides>
 
   <releases>
+    <release version="0.7.32" date="2026-11-23">
+      <description>
+        <ul>
+          <li>Fixed Windows toast notifications showing the raw app ID — toasts now show "Daak" with the Daak logo instead of "net.absons.daak" with a generic icon</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.31" date="2026-11-21">
       <description>
         <ul>

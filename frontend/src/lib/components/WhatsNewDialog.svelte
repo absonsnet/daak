@@ -60,12 +60,12 @@
       </div>
 
       <div class="space-y-4 max-h-[60vh] overflow-y-auto text-sm">
-        <p>🚀 Welcome to {APP_NAME} v0.7.31!</p>
+        <p>🚀 Welcome to {APP_NAME} v0.7.32!</p>
 
-        <p>v0.7.31 fixes the Windows tray menu never showing on any click — the tray now runs on its own thread, so double-click opens the window and right-click shows the menu:</p>
+        <p>v0.7.32 fixes Windows toast notifications showing the raw app ID instead of the app name and logo:</p>
 
         <ul class="list-disc pl-6 space-y-1">
-          <li>🖱️ Tray menu fixed on Windows — left double-click opens Daak, right-click shows the menu (Open Daak, Compose, Check mail, Settings, Quit). The icon was always there; clicks were silently dropped before</li>
+          <li>🔔 Toasts fixed on Windows — new-mail notifications now show "Daak" with the Daak logo instead of "net.absons.daak" with a generic icon</li>
         </ul>
 
         <p>🏷 See the full change log here:</p>

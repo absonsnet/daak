@@ -1,5 +1,10 @@
 # CHANGELOG
 
+**v0.7.32 - 23-11-2026**
+---
+
+- Fixed Windows toast notifications showing the raw app ID: toasts now show "Daak" with the Daak logo. The sender identity (DisplayName + IconUri) is now written to the registry on every launch, overwriting the stale "net.absons.daak" value left by earlier versions; the installer also ships the app icon next to the exe for it
+
 **v0.7.31 - 21-11-2026**
 ---
 
