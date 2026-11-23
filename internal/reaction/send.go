@@ -212,7 +212,9 @@ type BuildOptions struct {
 //
 // The fallback bodies use the Outlook fallback format: a banner line
 // ("👍 <name> reacted to your message:") followed by the original
-// message in full (From/Sent/To/Subject headers, then the body).
+// message in full (From/Sent/To/Subject headers, then the body). In
+// the HTML part the banner renders as a pale-blue card with the name
+// in bold, at ~1.5x the quoted body size (see fallbackHTMLBody).
 // Clients that understand the Gmail JSON part render the reaction
 // inline on the original; every other client shows this body.
 //
@@ -240,7 +242,7 @@ func BuildMessage(opts BuildOptions) (raw []byte, messageID string, err error) {
 	if len(refs) == 0 {
 		refs = []string{inReplyTo}
 	}
-	raw, err = buildMixedBody(opts, banner, messageID, inReplyTo, refs)
+	raw, err = buildMixedBody(opts, banner, senderName, messageID, inReplyTo, refs)
 	if err != nil {
 		return nil, "", err
 	}
@@ -274,13 +276,25 @@ func fallbackPlainBody(opts BuildOptions, banner string) string {
 }
 
 // fallbackHTMLBody renders the same fallback for the text/html part:
-// the banner, a rule, the original's headers, then the original's
-// full body (its stored HTML when available, else the plain text).
-func fallbackHTMLBody(opts BuildOptions, banner string) string {
+// the banner as a pale-blue card, a rule, the original's headers,
+// then the original's full body (its stored HTML when available,
+// else the plain text).
+//
+// The card is measured from the Outlook fallback in the reference
+// screenshot (image-41e6ac4e.png): background #eff6fb, banner font
+// ~1.5x the quoted body (21px vs 14px), sender name bold, whole
+// sentence inside the one card. Styling is inline on the elements
+// (background, padding, radius, font sizes) — mail clients strip
+// <style> blocks, so nothing here relies on one.
+func fallbackHTMLBody(opts BuildOptions, emoji, senderName string) string {
 	orig := opts.Original
 	var b strings.Builder
-	b.WriteString("<p>" + escapeHTML(banner) + "</p>")
+	b.WriteString(`<div style="font-family:Arial,Helvetica,sans-serif;">`)
+	b.WriteString(`<div style="background-color:#eff6fb;border-radius:6px;padding:12px 20px;font-size:21px;line-height:1.4;">`)
+	b.WriteString(escapeHTML(strings.TrimSpace(emoji)) + " <b>" + escapeHTML(senderName) + "</b> reacted to your message:")
+	b.WriteString(`</div>`)
 	b.WriteString("<hr>")
+	b.WriteString(`<div style="font-size:14px;">`)
 	b.WriteString("<p>")
 	b.WriteString("From: " + escapeHTML(formatAddress(orig.FromName, orig.FromEmail)) + "<br>")
 	if !orig.Date.IsZero() {
@@ -299,6 +313,8 @@ func fallbackHTMLBody(opts BuildOptions, banner string) string {
 	} else {
 		b.WriteString("<p>" + strings.ReplaceAll(escapeHTML(plainBodyText(opts)), "\n", "<br>") + "</p>")
 	}
+	b.WriteString(`</div>`)
+	b.WriteString(`</div>`)
 	return b.String()
 }
 
@@ -351,7 +367,9 @@ func stripHTMLTags(html string) string {
 
 // buildMixedBody writes the full message (headers + multipart/mixed body).
 // Split out of BuildMessage so the boundary is generated exactly once.
-func buildMixedBody(opts BuildOptions, banner, messageID, inReplyTo string, refs []string) ([]byte, error) {
+// senderName is the resolved reacting-user name (email fallback applied),
+// used for the bold name in the HTML banner card.
+func buildMixedBody(opts BuildOptions, banner, senderName, messageID, inReplyTo string, refs []string) ([]byte, error) {
 	orig := opts.Original
 	var buf bytes.Buffer
 	writeHeader(&buf, "From", (&mail.Address{Name: opts.SenderName, Address: opts.SenderEmail}).String())
@@ -407,7 +425,7 @@ func buildMixedBody(opts BuildOptions, banner, messageID, inReplyTo string, refs
 	if err != nil {
 		return nil, err
 	}
-	writeQuotedPrintable(htmlPart, fallbackHTMLBody(opts, banner))
+	writeQuotedPrintable(htmlPart, fallbackHTMLBody(opts, opts.Emoji, senderName))
 
 	if err := alt.Close(); err != nil {
 		return nil, err
