@@ -866,8 +866,32 @@ func (s *Store) Create(m *Message) error {
 // Upsert inserts a message or updates it if a row with the same (folder_id, uid) already exists.
 // This handles cases where a previous copy was deleted but the stale row remains, or where
 // the IMAP server reuses UIDs after EXPUNGE.
+//
+// On conflict only header/flag/enrichment columns are updated. The id, the body
+// columns (body_text, body_html, body_fetched, snippet, has_attachments), the
+// computed thread_id, and received_at are NEVER overwritten: the header path
+// calls Upsert with a header-only message (BodyFetched=false, empty body), so
+// overwriting them would wipe an already-fetched body, blank the snippet,
+// clear the attachment flag, strand attachment/reaction rows (their foreign
+// keys have no ON UPDATE CASCADE, so changing id fails outright), and reset
+// received_at to "now" on every re-sync. received_at is therefore first-seen
+// time, set on insert only; thread_id is computed by finalizeSavedHeaders
+// after the save.
 func (s *Store) Upsert(m *Message) error {
-	if m.ID == "" {
+	// Reuse the stored id on conflict: it is the primary key referenced by
+	// attachment/reaction rows, and the caller (header sync) needs m.ID to
+	// keep pointing at the same row for the thread computation that follows.
+	var existingID string
+	err := s.db.QueryRow(
+		"SELECT id FROM messages WHERE folder_id = ? AND uid = ?",
+		m.FolderID, m.UID,
+	).Scan(&existingID)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("failed to look up existing message: %w", err)
+	}
+	if existingID != "" {
+		m.ID = existingID
+	} else if m.ID == "" {
 		m.ID = uuid.New().String()
 	}
 	if m.ReceivedAt.IsZero() {
@@ -885,20 +909,17 @@ func (s *Store) Upsert(m *Message) error {
 			extract_kind, extract_value, extract_rule
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(folder_id, uid) DO UPDATE SET
-			id=excluded.id, account_id=excluded.account_id,
+			account_id=excluded.account_id,
 			message_id=excluded.message_id, in_reply_to=excluded.in_reply_to,
-			references_list=excluded.references_list, thread_id=excluded.thread_id,
+			references_list=excluded.references_list,
 			subject=excluded.subject, from_name=excluded.from_name, from_email=excluded.from_email,
 			to_list=excluded.to_list, cc_list=excluded.cc_list, bcc_list=excluded.bcc_list,
 			reply_to=excluded.reply_to, date=excluded.date,
-			snippet=excluded.snippet, is_read=excluded.is_read, is_starred=excluded.is_starred,
+			is_read=excluded.is_read, is_starred=excluded.is_starred,
 			is_answered=excluded.is_answered, is_forwarded=excluded.is_forwarded,
 			is_draft=excluded.is_draft, is_deleted=excluded.is_deleted,
-			size=excluded.size, has_attachments=excluded.has_attachments,
-			body_text=excluded.body_text, body_html=excluded.body_html,
-			body_fetched=excluded.body_fetched,
+			size=excluded.size,
 			read_receipt_to=excluded.read_receipt_to, read_receipt_handled=excluded.read_receipt_handled,
-			received_at=excluded.received_at,
 			list_unsubscribe=excluded.list_unsubscribe,
 			list_unsubscribe_post=excluded.list_unsubscribe_post,
 			category=excluded.category, sub_category=excluded.sub_category,
@@ -906,7 +927,7 @@ func (s *Store) Upsert(m *Message) error {
 			extract_rule=excluded.extract_rule
 	`
 
-	_, err := s.db.Exec(query,
+	_, err = s.db.Exec(query,
 		m.ID, m.AccountID, m.FolderID, m.UID,
 		nullString(m.MessageID), nullString(m.InReplyTo), nullString(m.References), nullString(m.ThreadID),
 		m.Subject, m.FromName, m.FromEmail,
