@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/absonsnet/daak/internal/logging"
@@ -43,9 +44,14 @@ type UserInfo struct {
 	Name  string `json:"name,omitempty"`
 }
 
-// Manager handles OAuth2 authorization flows
+// Manager handles OAuth2 authorization flows. It holds at most one active
+// flow at a time: mail setup, contacts-only setup and the extension Auth
+// Broker share the one Manager, so starting a second flow while one is
+// active is rejected instead of killing the first flow's callback server
+// (audit finding 24). mu guards activeSession and callbackServer.
 type Manager struct {
 	log            zerolog.Logger
+	mu             sync.Mutex
 	activeSession  *AuthSession
 	callbackServer *CallbackServer
 	httpClient     *http.Client
@@ -87,10 +93,25 @@ func (m *Manager) StartAuthFlowWithProvider(ctx context.Context, provider *Provi
 	return m.startAuthFlowInternal(ctx, provider.Name, *provider, provider)
 }
 
-// startAuthFlowInternal is the common implementation for starting OAuth flows
+// startAuthFlowInternal is the common implementation for starting OAuth flows.
+// It rejects a new flow while one is already active instead of cancelling
+// the in-flight flow: the previous behaviour unconditionally cancelled the
+// existing session, which killed the first flow's callback server and
+// surfaced a generic oauth:error to its waiter (audit finding 24).
 func (m *Manager) startAuthFlowInternal(ctx context.Context, providerName string, provider ProviderConfig, customConfig *ProviderConfig) (string, error) {
-	// Cancel any existing session
-	m.CancelAuthFlow()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.activeSession != nil {
+		return "", fmt.Errorf("OAuth authorization flow already in progress for provider %q: finish or cancel the current sign-in before starting another one", m.activeSession.Provider)
+	}
+	// Defensive: no session should exist without a server, and vice versa.
+	// If a previous flow's server somehow outlived its session, stop it
+	// here rather than leaking the port.
+	if m.callbackServer != nil {
+		m.callbackServer.Stop()
+		m.callbackServer = nil
+	}
 
 	// Generate PKCE code verifier and challenge
 	verifier, err := generateCodeVerifier()
@@ -106,11 +127,12 @@ func (m *Manager) startAuthFlowInternal(ctx context.Context, providerName string
 	}
 
 	// Start callback server
-	m.callbackServer = NewCallbackServer()
-	port, err := m.callbackServer.Start(ctx)
+	server := NewCallbackServer()
+	port, err := server.Start(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to start callback server: %w", err)
 	}
+	m.callbackServer = server
 
 	// Create session
 	m.activeSession = &AuthSession{
@@ -134,13 +156,25 @@ func (m *Manager) startAuthFlowInternal(ctx context.Context, providerName string
 }
 
 // WaitForCallback waits for the OAuth callback and exchanges the code for tokens
-// Returns the tokens and user email on success
+// Returns the tokens and user email on success. The active session and its
+// callback server are cleared on EVERY exit path — success, callback
+// failure, state mismatch, token-exchange failure — so a failed flow never
+// leaves a stale session (and port) behind that blocks the next sign-in
+// (audit finding 24).
 func (m *Manager) WaitForCallback(ctx context.Context) (*TokenResponse, string, error) {
+	m.mu.Lock()
 	if m.activeSession == nil || m.callbackServer == nil {
+		m.mu.Unlock()
 		return nil, "", fmt.Errorf("no active OAuth session")
 	}
-
 	session := m.activeSession
+	server := m.callbackServer
+	m.mu.Unlock()
+
+	// Clear the session/server on every exit path. The wait itself runs
+	// outside mu so CancelAuthFlow and a (rejected) concurrent Start can
+	// still observe the in-progress flow while we block here.
+	defer m.clearSession()
 
 	// Use custom provider config if available, otherwise look up by name
 	var provider ProviderConfig
@@ -155,7 +189,7 @@ func (m *Manager) WaitForCallback(ctx context.Context) (*TokenResponse, string, 
 	}
 
 	// Wait for callback
-	result, err := m.callbackServer.WaitForCallback(ctx)
+	result, err := server.WaitForCallback(ctx)
 	if err != nil {
 		return nil, "", fmt.Errorf("callback failed: %w", err)
 	}
@@ -183,9 +217,6 @@ func (m *Manager) WaitForCallback(ctx context.Context) (*TokenResponse, string, 
 		email = "" // Non-fatal, will need to be provided by user
 	}
 
-	// Clear session
-	m.activeSession = nil
-
 	m.log.Info().
 		Str("provider", session.Provider).
 		Str("email", email).
@@ -194,13 +225,22 @@ func (m *Manager) WaitForCallback(ctx context.Context) (*TokenResponse, string, 
 	return tokens, email, nil
 }
 
-// CancelAuthFlow cancels any active OAuth flow
-func (m *Manager) CancelAuthFlow() {
+// clearSession stops the callback server (if any) and drops the active
+// session. It is the single cleanup path for WaitForCallback (every exit)
+// and CancelAuthFlow, so no failure mode can leave a stale session behind.
+func (m *Manager) clearSession() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.callbackServer != nil {
 		m.callbackServer.Stop()
 		m.callbackServer = nil
 	}
 	m.activeSession = nil
+}
+
+// CancelAuthFlow cancels any active OAuth flow
+func (m *Manager) CancelAuthFlow() {
+	m.clearSession()
 }
 
 // RefreshToken uses a refresh token to obtain a new access token. Provider is
@@ -276,6 +316,8 @@ func (m *Manager) RefreshTokenWithProvider(provider ProviderConfig, refreshToken
 
 // HasActiveSession returns true if there's an active OAuth session
 func (m *Manager) HasActiveSession() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.activeSession != nil
 }
 
