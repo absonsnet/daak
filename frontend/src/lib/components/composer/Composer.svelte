@@ -1445,9 +1445,16 @@
       onClose?.()
     } catch (err) {
       console.error('Failed to queue message:', err)
+      // A draft that is already queued (its undo window is still
+      // open) is rejected by the backend instead of sending twice:
+      // keep the composer open and say so, rather than showing the
+      // generic failure toast.
+      const message = err instanceof Error ? err.message : String(err)
       addToast({
         type: 'error',
-        message: $_('composer.failedToSend'),
+        message: message.includes('already queued for send')
+          ? $_('composer.alreadyQueuedForSend')
+          : $_('composer.failedToSend'),
       })
     } finally {
       sending = false

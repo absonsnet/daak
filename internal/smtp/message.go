@@ -80,12 +80,20 @@ type ComposeMessage struct {
 	InReplyTo  string   `json:"in_reply_to,omitempty"` // Message-ID of the message being replied to
 	References []string `json:"references,omitempty"`  // Thread references
 
+	// MessageID is the Message-ID this message must carry. When set,
+	// ToRFC822 reuses it verbatim on every build; when empty, a fresh
+	// one is generated. QueueSend assigns one at queue time so a
+	// retried or rebuilt send carries the same Message-ID as the
+	// first attempt — a crash after the server accepts DATA must not
+	// produce a second, differently-identified copy of the mail.
+	MessageID string `json:"message_id,omitempty"`
+
 	// Options
 	RequestReadReceipt bool `json:"request_read_receipt"`
-	SignMessage         bool `json:"sign_message"`    // S/MIME sign this message
-	EncryptMessage      bool `json:"encrypt_message"` // S/MIME encrypt this message
-	PGPSignMessage      bool `json:"pgp_sign_message"`    // PGP sign this message
-	PGPEncryptMessage   bool `json:"pgp_encrypt_message"` // PGP encrypt this message
+	SignMessage        bool `json:"sign_message"`        // S/MIME sign this message
+	EncryptMessage     bool `json:"encrypt_message"`     // S/MIME encrypt this message
+	PGPSignMessage     bool `json:"pgp_sign_message"`    // PGP sign this message
+	PGPEncryptMessage  bool `json:"pgp_encrypt_message"` // PGP encrypt this message
 }
 
 // AllRecipients returns all recipients (To + Cc + Bcc)
@@ -103,12 +111,40 @@ func (m *ComposeMessage) AllRecipients() []string {
 	return recipients
 }
 
+// NewMessageID generates a fresh Message-ID in Daak's form.
+func NewMessageID() string {
+	return fmt.Sprintf("<%s@daak>", uuid.New().String())
+}
+
+// normalizeMessageID trims a caller-supplied Message-ID and ensures
+// it is wrapped in angle brackets. Returns "" when blank, so the
+// caller generates a fresh one instead.
+func normalizeMessageID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	if !strings.HasPrefix(id, "<") {
+		id = "<" + id
+	}
+	if !strings.HasSuffix(id, ">") {
+		id = id + ">"
+	}
+	return id
+}
+
 // ToRFC822 converts the message to RFC 822 format for sending
 func (m *ComposeMessage) ToRFC822() ([]byte, error) {
 	var buf bytes.Buffer
 
-	// Generate Message-ID
-	messageID := fmt.Sprintf("<%s@daak>", uuid.New().String())
+	// Reuse the queued Message-ID when one was assigned at queue
+	// time; otherwise generate a fresh one. Rebuilding the same
+	// queued message (retry, redispatch after a crash) must not
+	// mint a new identity for the same mail.
+	messageID := normalizeMessageID(m.MessageID)
+	if messageID == "" {
+		messageID = NewMessageID()
+	}
 
 	// Write headers
 	writeHeader(&buf, "From", m.From.String())

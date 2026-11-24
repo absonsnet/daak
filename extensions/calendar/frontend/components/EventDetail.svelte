@@ -334,6 +334,12 @@
       calendarView.selectEvent(null)
     } catch (err) {
       toasts.error((err as Error)?.message ?? String(err))
+      // A server-side conflict means the event was not deleted and the
+      // server version was kept: pull it in so the view shows the current
+      // state.
+      if (String(err).includes('server-side conflict')) {
+        void calendarSources.syncAll()
+      }
     } finally {
       deleting = false
       showConfirmDelete = false

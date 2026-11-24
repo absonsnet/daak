@@ -353,7 +353,9 @@ func (q *PendingQueue) recordOutcome(row pendingRow, perr error) {
 		return
 	}
 	if errors.Is(perr, ErrConflict) {
-		// Drop the row + signal the frontend so the user re-edits.
+		// Drop the row + signal the frontend so the user re-edits. The
+		// summary names the event in the toast; the server version was
+		// kept, so the next sync re-fetches it.
 		_ = q.deleteRow(row.ID)
 		if q.events != nil {
 			_ = q.events.Publish("calendar:write-conflict", map[string]any{
@@ -361,6 +363,7 @@ func (q *PendingQueue) recordOutcome(row pendingRow, perr error) {
 				"calendarId": row.CalendarID,
 				"eventId":    row.EventID,
 				"op":         row.Op,
+				"summary":    row.Payload.Summary,
 			})
 		}
 		return

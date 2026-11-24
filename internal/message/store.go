@@ -866,8 +866,32 @@ func (s *Store) Create(m *Message) error {
 // Upsert inserts a message or updates it if a row with the same (folder_id, uid) already exists.
 // This handles cases where a previous copy was deleted but the stale row remains, or where
 // the IMAP server reuses UIDs after EXPUNGE.
+//
+// On conflict only header/flag/enrichment columns are updated. The id, the body
+// columns (body_text, body_html, body_fetched, snippet, has_attachments), the
+// computed thread_id, and received_at are NEVER overwritten: the header path
+// calls Upsert with a header-only message (BodyFetched=false, empty body), so
+// overwriting them would wipe an already-fetched body, blank the snippet,
+// clear the attachment flag, strand attachment/reaction rows (their foreign
+// keys have no ON UPDATE CASCADE, so changing id fails outright), and reset
+// received_at to "now" on every re-sync. received_at is therefore first-seen
+// time, set on insert only; thread_id is computed by finalizeSavedHeaders
+// after the save.
 func (s *Store) Upsert(m *Message) error {
-	if m.ID == "" {
+	// Reuse the stored id on conflict: it is the primary key referenced by
+	// attachment/reaction rows, and the caller (header sync) needs m.ID to
+	// keep pointing at the same row for the thread computation that follows.
+	var existingID string
+	err := s.db.QueryRow(
+		"SELECT id FROM messages WHERE folder_id = ? AND uid = ?",
+		m.FolderID, m.UID,
+	).Scan(&existingID)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("failed to look up existing message: %w", err)
+	}
+	if existingID != "" {
+		m.ID = existingID
+	} else if m.ID == "" {
 		m.ID = uuid.New().String()
 	}
 	if m.ReceivedAt.IsZero() {
@@ -885,20 +909,17 @@ func (s *Store) Upsert(m *Message) error {
 			extract_kind, extract_value, extract_rule
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(folder_id, uid) DO UPDATE SET
-			id=excluded.id, account_id=excluded.account_id,
+			account_id=excluded.account_id,
 			message_id=excluded.message_id, in_reply_to=excluded.in_reply_to,
-			references_list=excluded.references_list, thread_id=excluded.thread_id,
+			references_list=excluded.references_list,
 			subject=excluded.subject, from_name=excluded.from_name, from_email=excluded.from_email,
 			to_list=excluded.to_list, cc_list=excluded.cc_list, bcc_list=excluded.bcc_list,
 			reply_to=excluded.reply_to, date=excluded.date,
-			snippet=excluded.snippet, is_read=excluded.is_read, is_starred=excluded.is_starred,
+			is_read=excluded.is_read, is_starred=excluded.is_starred,
 			is_answered=excluded.is_answered, is_forwarded=excluded.is_forwarded,
 			is_draft=excluded.is_draft, is_deleted=excluded.is_deleted,
-			size=excluded.size, has_attachments=excluded.has_attachments,
-			body_text=excluded.body_text, body_html=excluded.body_html,
-			body_fetched=excluded.body_fetched,
+			size=excluded.size,
 			read_receipt_to=excluded.read_receipt_to, read_receipt_handled=excluded.read_receipt_handled,
-			received_at=excluded.received_at,
 			list_unsubscribe=excluded.list_unsubscribe,
 			list_unsubscribe_post=excluded.list_unsubscribe_post,
 			category=excluded.category, sub_category=excluded.sub_category,
@@ -906,7 +927,7 @@ func (s *Store) Upsert(m *Message) error {
 			extract_rule=excluded.extract_rule
 	`
 
-	_, err := s.db.Exec(query,
+	_, err = s.db.Exec(query,
 		m.ID, m.AccountID, m.FolderID, m.UID,
 		nullString(m.MessageID), nullString(m.InReplyTo), nullString(m.References), nullString(m.ThreadID),
 		m.Subject, m.FromName, m.FromEmail,
@@ -1184,13 +1205,36 @@ func (s *Store) GetHighestUID(folderID string) (uint32, error) {
 }
 
 // UpdateBody updates the body content of a message and marks it as fetched
-func (s *Store) UpdateBody(messageID, bodyHTML, bodyText, snippet string, hasAttachments bool) error {
+// UpdateBody persists a single fetched body. It mirrors UpdateBodiesBatch:
+// the raw S/MIME/PGP bodies are stored alongside the text (they are what
+// make an encrypted message decryptable on view), verification status is
+// NOT cached (computed fresh on each view), and an empty raw body is stored
+// as NULL so HasSMIME/HasPGP (computed as raw_body IS NOT NULL) stay
+// accurate. Previously this updated only the text columns, so an encrypted
+// message opened before the background body fetch ran was marked
+// body_fetched=1 with an empty body and its raw body discarded —
+// permanently undecryptable.
+func (s *Store) UpdateBody(u BodyUpdate) error {
 	query := `
 		UPDATE messages
-		SET body_html = ?, body_text = ?, snippet = ?, body_fetched = 1, has_attachments = ?
+		SET body_html = ?, body_text = ?, snippet = ?, body_fetched = 1, has_attachments = ?,
+		    smime_raw_body = ?, smime_encrypted = ?,
+		    pgp_raw_body = ?, pgp_encrypted = ?
 		WHERE id = ?
 	`
-	_, err := s.db.Exec(query, nullString(bodyHTML), nullString(bodyText), nullString(snippet), hasAttachments, messageID)
+	var smimeRawBody interface{}
+	if len(u.SMIMERawBody) > 0 {
+		smimeRawBody = u.SMIMERawBody
+	}
+	var pgpRawBody interface{}
+	if len(u.PGPRawBody) > 0 {
+		pgpRawBody = u.PGPRawBody
+	}
+	_, err := s.db.Exec(query,
+		nullString(u.BodyHTML), nullString(u.BodyText), nullString(u.Snippet), u.HasAttachments,
+		smimeRawBody, u.SMIMEEncrypted,
+		pgpRawBody, u.PGPEncrypted,
+		u.MessageID)
 	if err != nil {
 		return fmt.Errorf("failed to update body: %w", err)
 	}
@@ -1349,10 +1393,23 @@ func (s *Store) CountByFolder(folderID string) (int, error) {
 
 // DeleteOlderThan deletes messages older than the specified time for an account
 // Returns the number of messages deleted
-func (s *Store) DeleteOlderThan(accountID string, before time.Time) (int, error) {
+// DeleteOlderThan deletes messages in one folder whose first-seen time is
+// older than the given cutoff (the sync-period purge). The retention clock
+// is received_at — when Daak first saw the message, which for promptly
+// synced mail is effectively the arrival time — NOT the header Date: a
+// missing/invalid Date stores as zero (below every cutoff) and an old Date
+// on a recently arrived message would otherwise be deleted on every sync
+// and re-fetched forever (bodies re-downloaded, unread counts flickering,
+// the message never settling). Rows with a zero/NULL received_at are never
+// purged here, and the purge is scoped to the folder being synced, so old
+// mail in other folders is untouched.
+func (s *Store) DeleteOlderThan(accountID, folderID string, before time.Time) (int, error) {
 	result, err := s.db.Exec(
-		"DELETE FROM messages WHERE account_id = ? AND date < ?",
-		accountID, before,
+		`DELETE FROM messages
+		 WHERE account_id = ? AND folder_id = ?
+		   AND received_at IS NOT NULL AND received_at > '1970-01-01'
+		   AND received_at < ?`,
+		accountID, folderID, before,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete old messages: %w", err)
@@ -1387,6 +1444,16 @@ func (s *Store) GetMessageUIDAndFolder(messageID string) (uint32, string, error)
 	}
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to get message: %w", err)
+	}
+	// A just-moved message carries a negative placeholder UID (uid = -rowid,
+	// written by MoveMessages until the destination sync fetches the real
+	// UID and DeleteTempUIDs cleans the row up). Converting it to uint32
+	// would yield a huge bogus UID that the server can never return, and a
+	// fetch under it returns nothing — which the old body-fetch code then
+	// treated as a "ghost" and deleted. Refuse instead: callers leave the
+	// row alone and the destination sync resolves it.
+	if uidI64 <= 0 {
+		return 0, "", fmt.Errorf("message has no server UID yet (placeholder UID): %s", messageID)
 	}
 	return uint32(uidI64), folderID, nil
 }

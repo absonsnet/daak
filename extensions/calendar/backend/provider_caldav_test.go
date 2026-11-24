@@ -12,12 +12,14 @@ package backend
 // SyncCalendar test is tracked as a follow-up.
 
 import (
+	"database/sql"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	coreapi "github.com/absonsnet/daak/internal/core/api/v1"
 )
@@ -412,5 +414,237 @@ func TestJoinHref(t *testing.T) {
 				t.Errorf("joinHref(%q, %q) = %q, want %q", tt.base, tt.suffix, got, tt.want)
 			}
 		})
+	}
+}
+
+// --- Finding 5: 412 handling ----------------------------------------------
+//
+// A 412 used to trigger an unconditional retry of the PUT/DELETE, silently
+// overwriting (or deleting) another person's edit to a shared calendar.
+// Now the provider re-fetches the server copy first and retries
+// unconditionally ONLY if it is substantively identical to the locally
+// stored version — i.e. the 412 came from our own stale ETag. Otherwise it
+// returns ErrConflict and the server sees no second write at all.
+
+const conflictTestICS = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Daak//Test//EN\r\n" +
+	"BEGIN:VEVENT\r\nUID:evt-1@daak-caldav\r\nDTSTAMP:20261124T000000Z\r\n" +
+	"DTSTART:20261124T100000Z\r\nDTEND:20261124T110000Z\r\n" +
+	"SUMMARY:Team sync\r\nDESCRIPTION:Weekly sync\r\nLOCATION:Room 1\r\n" +
+	"END:VEVENT\r\nEND:VCALENDAR\r\n"
+
+// Same event, edited by someone else on the server: different summary and
+// a moved start time.
+const conflictTestICSChanged = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Daak//Test//EN\r\n" +
+	"BEGIN:VEVENT\r\nUID:evt-1@daak-caldav\r\nDTSTAMP:20261124T000000Z\r\n" +
+	"DTSTART:20261124T120000Z\r\nDTEND:20261124T130000Z\r\n" +
+	"SUMMARY:Team sync (moved by someone else)\r\nDESCRIPTION:Weekly sync\r\nLOCATION:Room 1\r\n" +
+	"END:VEVENT\r\nEND:VCALENDAR\r\n"
+
+// conflictFakeServer serves the 412 dance: a conditional write (If-Match
+// set) gets 412, a GET returns the configured server copy, and an
+// unconditional write succeeds. Every request is recorded so tests can
+// prove whether an unconditional retry happened.
+type conflictFakeServer struct {
+	srv       *httptest.Server
+	requests  []recordedRequest
+	serverICS string
+}
+
+func newConflictFakeServer(t *testing.T, serverICS string) *conflictFakeServer {
+	t.Helper()
+	fs := &conflictFakeServer{serverICS: serverICS}
+	fs.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		fs.requests = append(fs.requests, recordedRequest{
+			method:      r.Method,
+			path:        r.URL.Path,
+			ifMatch:     r.Header.Get("If-Match"),
+			ifNoneMatch: r.Header.Get("If-None-Match"),
+			contentType: r.Header.Get("Content-Type"),
+			body:        string(body),
+		})
+		switch r.Method {
+		case http.MethodPut:
+			if r.Header.Get("If-Match") != "" {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				return
+			}
+			w.Header().Set("ETag", `"new-etag"`)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			if r.Header.Get("If-Match") != "" {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "text/calendar; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, fs.serverICS)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	return fs
+}
+
+func (fs *conflictFakeServer) countMethod(method string) int {
+	n := 0
+	for _, req := range fs.requests {
+		if req.method == method {
+			n++
+		}
+	}
+	return n
+}
+
+// seedCalDAVStoredEvent stores the event as of the last sync — the local row
+// the provider compares the re-fetched server copy against — and returns the
+// source + calendar to call the provider with.
+func seedCalDAVStoredEvent(t *testing.T, store *Store, srvURL string) (Source, Calendar) {
+	t.Helper()
+	srcID, calID := "src-conflict", "cal-conflict"
+	now := time.Now().Unix()
+	if err := store.WithTx(func(tx *sql.Tx) error {
+		if err := store.CreateSourceTx(tx, Source{
+			ID: srcID, Type: SourceTypeCalDAV, Name: "Test",
+			Enabled: true, Writable: true, CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+		return store.CreateCalendarTx(tx, Calendar{
+			ID: calID, SourceID: srcID, URL: srvURL + "/calendars/user/personal/",
+			DisplayName: "Personal", Visible: true, CreatedAt: now,
+		})
+	}); err != nil {
+		t.Fatalf("seed source/calendar: %v", err)
+	}
+	parsed, err := ParseCalendarObject(conflictTestICS)
+	if err != nil {
+		t.Fatalf("parse seed ICS: %v", err)
+	}
+	stored := parsed.Master
+	stored.ID = "ev-1"
+	stored.CalendarID = calID
+	stored.ETag = `"stale-etag"`
+	stored.Href = "/calendars/user/personal/evt-1@daak-caldav.ics"
+	stored.ICSBlob = conflictTestICS
+	if err := store.WithTx(func(tx *sql.Tx) error {
+		return store.UpsertEventTx(tx, stored)
+	}); err != nil {
+		t.Fatalf("seed stored event: %v", err)
+	}
+	src := Source{ID: srcID, Type: SourceTypeCalDAV, Username: "user", URL: srvURL}
+	cal := Calendar{ID: calID, URL: srvURL + "/calendars/user/personal/"}
+	return src, cal
+}
+
+func TestCalDAVProvider_PushEvent_Update412_ChangedServerCopyIsConflict(t *testing.T) {
+	store := newTestStore(t)
+	fs := newConflictFakeServer(t, conflictTestICSChanged)
+	defer fs.srv.Close()
+	src, cal := seedCalDAVStoredEvent(t, store, fs.srv.URL)
+	p := caldavProvider{store: store, secrets: fakeSecrets{password: "secret"}}
+
+	// The user's edit: a new summary, pushed with the stale local ETag.
+	ev := Event{
+		UID:     "evt-1@daak-caldav",
+		Href:    "/calendars/user/personal/evt-1@daak-caldav.ics",
+		ETag:    `"stale-etag"`,
+		ICSBlob: strings.Replace(conflictTestICS, "SUMMARY:Team sync", "SUMMARY:Team sync (my edit)", 1),
+	}
+	_, err := p.PushEvent(t.Context(), src, cal, ev)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("PushEvent err = %v, want ErrConflict", err)
+	}
+	// The server must have seen exactly one PUT (the conditional one) and
+	// the re-fetch GET — no unconditional retry overwrote the other edit.
+	if got := fs.countMethod(http.MethodPut); got != 1 {
+		t.Fatalf("server saw %d PUTs, want 1 (no unconditional retry); requests=%+v", got, fs.requests)
+	}
+	if got := fs.countMethod(http.MethodGet); got != 1 {
+		t.Fatalf("server saw %d GETs, want 1 (re-fetch to verify); requests=%+v", got, fs.requests)
+	}
+}
+
+func TestCalDAVProvider_PushEvent_Update412_UnchangedServerCopyRetriesUnconditional(t *testing.T) {
+	store := newTestStore(t)
+	fs := newConflictFakeServer(t, conflictTestICS)
+	defer fs.srv.Close()
+	src, cal := seedCalDAVStoredEvent(t, store, fs.srv.URL)
+	p := caldavProvider{store: store, secrets: fakeSecrets{password: "secret"}}
+
+	ev := Event{
+		UID:     "evt-1@daak-caldav",
+		Href:    "/calendars/user/personal/evt-1@daak-caldav.ics",
+		ETag:    `"stale-etag"`,
+		ICSBlob: strings.Replace(conflictTestICS, "SUMMARY:Team sync", "SUMMARY:Team sync (my edit)", 1),
+	}
+	result, err := p.PushEvent(t.Context(), src, cal, ev)
+	if err != nil {
+		t.Fatalf("PushEvent: %v", err)
+	}
+	if result.ETag != `"new-etag"` {
+		t.Errorf("ETag = %q, want %q", result.ETag, `"new-etag"`)
+	}
+	// Conditional PUT 412s, GET proves the server copy is our own stale
+	// one, unconditional PUT lands the edit.
+	if got := fs.countMethod(http.MethodPut); got != 2 {
+		t.Fatalf("server saw %d PUTs, want 2 (conditional + verified retry); requests=%+v", got, fs.requests)
+	}
+	if got := fs.countMethod(http.MethodGet); got != 1 {
+		t.Fatalf("server saw %d GETs, want 1; requests=%+v", got, fs.requests)
+	}
+	if fs.requests[1].ifMatch != "" {
+		t.Errorf("retry PUT carried If-Match %q, want none", fs.requests[1].ifMatch)
+	}
+}
+
+func TestCalDAVProvider_DeleteRemote_412_ChangedServerCopyIsConflict(t *testing.T) {
+	store := newTestStore(t)
+	fs := newConflictFakeServer(t, conflictTestICSChanged)
+	defer fs.srv.Close()
+	src, cal := seedCalDAVStoredEvent(t, store, fs.srv.URL)
+	p := caldavProvider{store: store, secrets: fakeSecrets{password: "secret"}}
+
+	ev := Event{
+		UID:  "evt-1@daak-caldav",
+		Href: "/calendars/user/personal/evt-1@daak-caldav.ics",
+		ETag: `"stale-etag"`,
+	}
+	if err := p.DeleteRemote(t.Context(), src, cal, ev); !errors.Is(err, ErrConflict) {
+		t.Fatalf("DeleteRemote err = %v, want ErrConflict", err)
+	}
+	// Exactly one DELETE (the conditional one) + the re-fetch GET: the
+	// other person's version was not deleted.
+	if got := fs.countMethod(http.MethodDelete); got != 1 {
+		t.Fatalf("server saw %d DELETEs, want 1 (no unconditional retry); requests=%+v", got, fs.requests)
+	}
+	if got := fs.countMethod(http.MethodGet); got != 1 {
+		t.Fatalf("server saw %d GETs, want 1; requests=%+v", got, fs.requests)
+	}
+}
+
+func TestCalDAVProvider_DeleteRemote_412_UnchangedServerCopyRetriesUnconditional(t *testing.T) {
+	store := newTestStore(t)
+	fs := newConflictFakeServer(t, conflictTestICS)
+	defer fs.srv.Close()
+	src, cal := seedCalDAVStoredEvent(t, store, fs.srv.URL)
+	p := caldavProvider{store: store, secrets: fakeSecrets{password: "secret"}}
+
+	ev := Event{
+		UID:  "evt-1@daak-caldav",
+		Href: "/calendars/user/personal/evt-1@daak-caldav.ics",
+		ETag: `"stale-etag"`,
+	}
+	if err := p.DeleteRemote(t.Context(), src, cal, ev); err != nil {
+		t.Fatalf("DeleteRemote: %v", err)
+	}
+	if got := fs.countMethod(http.MethodDelete); got != 2 {
+		t.Fatalf("server saw %d DELETEs, want 2 (conditional + verified retry); requests=%+v", got, fs.requests)
+	}
+	if got := fs.countMethod(http.MethodGet); got != 1 {
+		t.Fatalf("server saw %d GETs, want 1; requests=%+v", got, fs.requests)
 	}
 }

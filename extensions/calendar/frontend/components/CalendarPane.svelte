@@ -57,9 +57,12 @@
     // Phase 2 Chunk 5: the host syncer's pending-write queue drains on
     // network-online / wake / sync tick. When it hits a 412 conflict, it
     // drops the pending row and publishes `calendar:write-conflict` —
-    // surface a toast so the user knows to re-edit.
-    unsubWriteConflict = EventsOn('calendar:write-conflict', () => {
-      toasts.error($_('calendar.write.conflict'))
+    // surface a toast naming the event (the backend publishes its summary)
+    // and re-sync so the kept server version is pulled in promptly.
+    unsubWriteConflict = EventsOn('calendar:write-conflict', (data: { summary?: string } | undefined) => {
+      const summary = data?.summary
+      toasts.error($_('calendar.write.conflict') + (summary ? ` — ${summary}` : ''))
+      void calendarSources.syncAll()
     })
     unsubWriteQueued = EventsOn('calendar:write-queued', () => {
       toasts.info($_('calendar.write.queued'))

@@ -30,16 +30,30 @@ func (f *fakeDraftSaver) SaveDraft(_ string, msg smtp.ComposeMessage) error {
 
 type fakeSender struct {
 	sent []string
-	fail map[string]error
+	// sentRaw records the exact bytes of every transmission that
+	// reached the (fake) server, including ones the client then
+	// treats as failed — the lost-acknowledgement case.
+	sentRaw []string
+	fail    map[string]error
+	// failAfterSend, when set for a recipient, records the bytes and
+	// then returns the error: the server accepted DATA but the ack
+	// was lost, so the worker must retry with identical bytes.
+	failAfterSend map[string]error
 }
 
-func (f *fakeSender) SendMail(_ string, to []string, _ []byte) error {
+func (f *fakeSender) SendMail(_ string, to []string, raw []byte) error {
 	for _, rcpt := range to {
 		if err, ok := f.fail[rcpt]; ok {
 			return err
 		}
 	}
 	f.sent = append(f.sent, to...)
+	f.sentRaw = append(f.sentRaw, string(raw))
+	for _, rcpt := range to {
+		if err, ok := f.failAfterSend[rcpt]; ok {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -87,7 +101,7 @@ func newBridgeTestEnvWithSigner(t *testing.T, signer hostmm.MessageSigner) *brid
 	t.Helper()
 	dir := t.TempDir()
 	saver := &fakeDraftSaver{}
-	sender := &fakeSender{fail: map[string]error{}}
+	sender := &fakeSender{fail: map[string]error{}, failAfterSend: map[string]error{}}
 	factory := &fakeSenderFactory{sender: sender}
 	sent := &fakeSentSaver{}
 	svc := hostmm.NewService(hostmm.ServiceDeps{

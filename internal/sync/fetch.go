@@ -46,6 +46,26 @@ type ProcessedBody struct {
 	ReceivedBytes int64
 }
 
+// bodyUpdateFromProcessedBody converts a fetched body into the store
+// update. Shared by the batch body-fetch path and the on-demand
+// FetchMessageBody so both persist exactly the same fields — notably the
+// raw S/MIME/PGP bodies that make an encrypted message decryptable on
+// view. (Verification status is deliberately not carried: it is computed
+// fresh on each view.)
+func bodyUpdateFromProcessedBody(pb *ProcessedBody) message.BodyUpdate {
+	return message.BodyUpdate{
+		MessageID:      pb.MessageID,
+		BodyHTML:       pb.BodyHTML,
+		BodyText:       pb.BodyText,
+		Snippet:        pb.Snippet,
+		HasAttachments: pb.HasAttachments,
+		SMIMERawBody:   pb.SMIMERawBody,
+		SMIMEEncrypted: pb.SMIMEEncrypted,
+		PGPRawBody:     pb.PGPRawBody,
+		PGPEncrypted:   pb.PGPEncrypted,
+	}
+}
+
 // FetchMessageBody fetches the body for a single message on-demand.
 // Uses streaming fetch internally to avoid blocking on .Collect().
 func (e *Engine) FetchMessageBody(ctx context.Context, accountID, messageID string) (*message.Message, error) {
@@ -89,17 +109,32 @@ func (e *Engine) FetchMessageBody(ctx context.Context, accountID, messageID stri
 
 	result, ok := results[uid]
 	if !ok || result == nil {
-		// Message no longer exists on server — clean up the ghost
-		e.log.Warn().Str("messageID", messageID).Uint32("uid", uid).Msg("Message not found on server, deleting ghost")
-		if delErr := e.messageStore.Delete(messageID); delErr != nil {
-			e.log.Debug().Err(delErr).Str("messageID", messageID).Msg("Failed to delete ghost message")
-		}
+		// The server did not return this UID. That does not prove the
+		// message is gone: a transient empty fetch, or a just-moved
+		// message whose destination sync hasn't completed yet, looks
+		// identical — and deleting here destroys local state (read flag,
+		// enrichment) the server copy may still hold. Leave the row so
+		// the next open (or sync) retries it. Only a confirmed expunge —
+		// the UID missing from a complete folder listing during sync —
+		// deletes local rows (see reconcileUIDs).
+		e.log.Warn().Str("messageID", messageID).Uint32("uid", uid).Msg("Message body not returned by server, leaving local copy")
 		return nil, fmt.Errorf("message not found on server")
 	}
 
-	// Update message in store
+	// Update message in store, including the raw S/MIME/PGP bodies: they
+	// are what make an encrypted message decryptable on view, and the
+	// on-demand path previously dropped them while still marking the
+	// message body_fetched — permanently blank for encrypted mail.
 	if !result.IsReaction {
-		if err := e.messageStore.UpdateBody(messageID, result.BodyHTML, result.BodyText, result.Snippet, result.HasAttachments); err != nil {
+		// An encrypted message whose raw body wasn't captured must NOT be
+		// marked body_fetched: the row would be excluded from re-fetch
+		// and could never be decrypted. Leave it unfetched so the next
+		// body pass retries it.
+		if (result.SMIMEEncrypted && len(result.SMIMERawBody) == 0) ||
+			(result.PGPEncrypted && len(result.PGPRawBody) == 0) {
+			return nil, fmt.Errorf("encrypted message body could not be stored: raw body missing")
+		}
+		if err := e.messageStore.UpdateBody(bodyUpdateFromProcessedBody(result)); err != nil {
 			return nil, fmt.Errorf("failed to update message body: %w", err)
 		}
 		// Full sync-time enrichment for the on-demand body fetch.
@@ -257,10 +292,12 @@ func (e *Engine) fetchMessageBodiesBatch(ctx context.Context, client *imapclient
 		}
 
 		if len(rawBytes) == 0 {
-			e.log.Warn().Uint32("uid", uid).Str("messageID", messageID).Msg("Empty message body — deleting ghost message")
-			if delErr := e.messageStore.Delete(messageID); delErr != nil {
-				e.log.Warn().Err(delErr).Str("messageID", messageID).Msg("Failed to delete ghost message")
-			}
+			// An empty fetch is not proof the message is gone (transient
+			// failure, or a just-moved message not yet on the server in
+			// this folder). Never delete the local row here: leave it so
+			// the next fetch retries it. Only a confirmed expunge during
+			// sync deletes local rows (see reconcileUIDs).
+			e.log.Warn().Uint32("uid", uid).Str("messageID", messageID).Msg("Empty message body — leaving local copy")
 			continue
 		}
 
@@ -836,18 +873,8 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 					continue
 				}
 
-				// Build body update
-				bu := message.BodyUpdate{
-					MessageID:      pb.MessageID,
-					BodyHTML:       pb.BodyHTML,
-					BodyText:       pb.BodyText,
-					Snippet:        pb.Snippet,
-					HasAttachments: pb.HasAttachments,
-					SMIMERawBody:   pb.SMIMERawBody,
-					SMIMEEncrypted: pb.SMIMEEncrypted,
-					PGPRawBody:     pb.PGPRawBody,
-					PGPEncrypted:   pb.PGPEncrypted,
-				}
+				// Build body update (same mapping as the on-demand path)
+				bu := bodyUpdateFromProcessedBody(pb)
 				// Full sync-time enrichment: category + code/reference
 				// extraction from the body head. Runs in the processing
 				// goroutine so the DB update (next iteration) carries it.
@@ -933,6 +960,13 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 // FetchRawMessage fetches the raw RFC822 content of a message from the IMAP server.
 // Uses streaming fetch to avoid blocking on .Collect().
 func (e *Engine) FetchRawMessage(ctx context.Context, accountID, folderID string, uid uint32) ([]byte, error) {
+	// UID 0 is never a real server UID (a just-moved message has no server
+	// UID yet — see GetMessageUIDAndFolder). Refuse rather than issuing a
+	// fetch the server cannot answer.
+	if uid == 0 {
+		return nil, fmt.Errorf("cannot fetch raw message without a server UID")
+	}
+
 	// Get folder path
 	f, err := e.folderStore.Get(folderID)
 	if err != nil {
