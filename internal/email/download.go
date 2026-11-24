@@ -44,13 +44,14 @@ func (d *AttachmentDownloader) ExtractAttachmentContent(raw []byte, targetFilena
 	}
 
 	// Single-part message: the whole entity may itself be the attachment.
+	// entity.Body is already transfer-decoded by go-message — decoding
+	// again here would corrupt content that happens to look base64-encoded.
 	if getFilename(entity) == targetFilename {
 		content, err := io.ReadAll(entity.Body)
 		if err != nil {
 			return nil, err
 		}
-		transferEncoding := strings.ToLower(entity.Header.Get("Content-Transfer-Encoding"))
-		return decodeContent(content, transferEncoding), nil
+		return content, nil
 	}
 
 	return nil, fmt.Errorf("attachment not found: %s", targetFilename)
@@ -111,18 +112,14 @@ func (d *AttachmentDownloader) findInlineAttachmentsInMultipart(mr gomessage.Mul
 			contentType = "application/octet-stream"
 		}
 
-		// Read content
+		// Read content (already transfer-decoded by go-message)
 		content, err := io.ReadAll(part.Body)
 		if err != nil {
 			continue
 		}
 
-		// Decode content if transfer-encoded
-		transferEncoding := strings.ToLower(part.Header.Get("Content-Transfer-Encoding"))
-		decodedContent := decodeContent(content, transferEncoding)
-
 		// Build data URL
-		dataURL := buildDataURL(contentType, decodedContent)
+		dataURL := buildDataURL(contentType, content)
 		result[contentID] = dataURL
 	}
 }
@@ -180,14 +177,14 @@ func (d *AttachmentDownloader) findAttachmentInMultipart(mr gomessage.MultipartR
 		// Check filename
 		filename := getFilename(part)
 		if filename == targetFilename {
+			// part.Body is already transfer-decoded by go-message — do not
+			// decode again: decoded content that happens to be valid base64
+			// would silently come back as shorter garbage bytes.
 			content, err := io.ReadAll(part.Body)
 			if err != nil {
 				return nil, err
 			}
-
-			// Decode content if transfer-encoded
-			transferEncoding := strings.ToLower(part.Header.Get("Content-Transfer-Encoding"))
-			return decodeContent(content, transferEncoding), nil
+			return content, nil
 		}
 	}
 

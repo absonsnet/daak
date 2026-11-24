@@ -485,8 +485,8 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 				Str("charset", params["charset"]).
 				Msg("Processing multipart part")
 
-			// Check for attachments
-			if disposition == "attachment" {
+			// Check for attachments (signature parts are not attachments)
+			if disposition == "attachment" && !isSignaturePart(contentType) {
 				hasAttachments = true
 				continue
 			}
@@ -577,7 +577,7 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 				if disposition == "inline" && strings.HasPrefix(contentType, "image/") {
 					// Inline images need to be extracted so they can be displayed
 					hasAttachments = true
-				} else if contentType != "" && !strings.HasPrefix(contentType, "text/") {
+				} else if contentType != "" && !strings.HasPrefix(contentType, "text/") && !isSignaturePart(contentType) {
 					hasAttachments = true
 				}
 			}
@@ -589,6 +589,21 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 			Str("contentType", contentType).
 			Str("charset", params["charset"]).
 			Msg("Processing single-part message")
+
+		// A single-part body can itself be an attachment (e.g. a DMARC
+		// report whose whole body is application/zip) — mirror the modern
+		// parseSinglePartBody classification. Without this the flag stays
+		// false and FetchServerMessage never runs the extractor, so a
+		// single-part attachment opened from server search gets no
+		// downloadable rows. Signature parts are excluded, and the raw
+		// attachment bytes are not dumped into the body text.
+		disposition, _, _ := mime.ParseMediaType(entity.Header.Get("Content-Disposition"))
+		isNonTextBody := contentType != "" && !strings.HasPrefix(contentType, "text/") &&
+			!isSignaturePart(contentType)
+		if disposition == "attachment" || isNonTextBody {
+			hasAttachments = true
+			return "", "", true
+		}
 
 		// Read with size limit to prevent memory exhaustion
 		lr := io.LimitReader(entity.Body, maxPartSize)
@@ -657,7 +672,8 @@ func (e *Engine) parseNestedMultipart(entity *gomessage.Entity) (bodyText, bodyH
 		contentType, params, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
 		disposition, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
 
-		if disposition == "attachment" {
+		// Signature parts are not attachments.
+		if disposition == "attachment" && !isSignaturePart(contentType) {
 			hasAttachments = true
 			continue
 		}
