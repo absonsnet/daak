@@ -326,3 +326,54 @@ func TestIsPermanentError(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// TestHasActiveForDraft: a draft is "active" while its queue row is
+// pending or sending, and stops being active once the row is gone
+// (undone/sent) or failed — so QueueSend can reject a second queue
+// attempt for the same draft during the undo window.
+func TestHasActiveForDraft(t *testing.T) {
+	s := NewStore(openTestDB(t))
+	if active, err := s.HasActiveForDraft("draft-1"); err != nil || active {
+		t.Fatalf("HasActiveForDraft(empty) = %v, %v, want false, nil", active, err)
+	}
+	if active, err := s.HasActiveForDraft(""); err != nil || active {
+		t.Fatalf("HasActiveForDraft(\"\") = %v, %v, want false, nil", active, err)
+	}
+	if err := s.Enqueue(testItem("q1")); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := s.HasActiveForDraft("draft-1"); err != nil || !active {
+		t.Fatalf("HasActiveForDraft(pending) = %v, %v, want true, nil", active, err)
+	}
+	if active, err := s.HasActiveForDraft("other-draft"); err != nil || active {
+		t.Fatalf("HasActiveForDraft(other) = %v, %v, want false, nil", active, err)
+	}
+	// Claimed (sending) still counts as active.
+	now := time.Now().UTC()
+	if ok, err := s.Claim("q1", now); err != nil || !ok {
+		t.Fatalf("Claim = %v, %v, want true, nil", ok, err)
+	}
+	if active, err := s.HasActiveForDraft("draft-1"); err != nil || !active {
+		t.Fatalf("HasActiveForDraft(sending) = %v, %v, want true, nil", active, err)
+	}
+	// Failed rows do not block a fresh queue attempt.
+	if err := s.RecordAttempt("q1", 1, StatusFailed, now, "boom"); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := s.HasActiveForDraft("draft-1"); err != nil || active {
+		t.Fatalf("HasActiveForDraft(failed) = %v, %v, want false, nil", active, err)
+	}
+	// Neither does a deleted (undone/sent) row.
+	if err := s.Enqueue(testItem("q2")); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := s.HasActiveForDraft("draft-1"); err != nil || !active {
+		t.Fatalf("HasActiveForDraft(re-queued) = %v, %v, want true, nil", active, err)
+	}
+	if ok, err := s.DeletePending("q2"); err != nil || !ok {
+		t.Fatalf("DeletePending = %v, %v, want true, nil", ok, err)
+	}
+	if active, err := s.HasActiveForDraft("draft-1"); err != nil || active {
+		t.Fatalf("HasActiveForDraft(deleted) = %v, %v, want false, nil", active, err)
+	}
+}

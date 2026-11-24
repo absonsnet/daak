@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,7 +45,18 @@ import (
 // ComposeMessage, so signing, encryption, Sent saving, contact
 // updates and draft cleanup behave exactly like a direct send.
 // The draft row is deliberately kept until dispatch: it is the Undo
-// payload, and sendMessage deletes it on success.
+// payload, and sendMessage deletes it on success — unless it was
+// edited during the undo window, in which case the queued snapshot
+// is what sends and the edited draft is kept. Undo restores the
+// queued snapshot into the draft row, so the reopened composer
+// shows the message that was about to send. A draft with a live
+// queue row cannot be queued a second time (QueueSend rejects it).
+// The stored ComposeMessage carries the Message-ID assigned at queue
+// time, so a retry or a redispatch after a crash rebuilds the same
+// mail with the same identity; and the queue row is deleted the
+// moment SMTP accepts the mail (via sendMessage's afterSMTP hook),
+// before the Sent-folder save — a crash in that post-send work
+// cannot re-send the mail.
 //
 // Retry policy (see internal/sendqueue/policy.go): transient errors
 // (connect/timeout/DNS/4xx/server-busy) retry with backoff 1m, 2m,
@@ -134,6 +146,16 @@ func (s *sendQueueService) QueueSend(accountID string, msg smtp.ComposeMessage, 
 		return QueueSendResult{}, fmt.Errorf("failed to build message: %w", err)
 	}
 
+	// Assign the Message-ID once, here, at queue time. The stored
+	// MessageJSON carries it, so every rebuild at dispatch — first
+	// attempt, retry, or redispatch after a crash — emits the same
+	// Message-ID for the same mail. A fresh id per rebuild would let
+	// a crash after SMTP acceptance produce a second copy the server
+	// cannot recognise as a duplicate. A caller-supplied id is kept.
+	if msg.MessageID == "" {
+		msg.MessageID = smtp.NewMessageID()
+	}
+
 	delay, err := s.settings.GetUndoSendDelay()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to read undo-send delay, using default")
@@ -157,6 +179,23 @@ func (s *sendQueueService) QueueSend(accountID string, msg smtp.ComposeMessage, 
 			return QueueSendResult{}, fmt.Errorf("failed to save draft for undo: %w", err)
 		}
 		draftID = id
+	}
+
+	// A draft that already has a live queue row (still in its undo
+	// window, waiting on a retry, or being dispatched) cannot be
+	// queued again: the first row already holds the snapshot that
+	// will send, and a second row would dispatch a second copy.
+	// The draft stays in Drafts during the window, so this is the
+	// guard that makes re-opening it and hitting Send harmless.
+	// (Best-effort across processes: two processes queueing the same
+	// draft in the same instant could both pass this check — the
+	// atomic Claim is what keeps one row from sending twice, and a
+	// unique index would be needed to close this check-then-insert
+	// race entirely.)
+	if active, err := s.store.HasActiveForDraft(draftID); err != nil {
+		return QueueSendResult{}, err
+	} else if active {
+		return QueueSendResult{}, fmt.Errorf("draft %q is already queued for send", draftID)
 	}
 
 	raw, err := json.Marshal(msg)
@@ -292,9 +331,15 @@ func (s *sendQueueService) QueueReaction(accountID string, from smtp.Address, to
 // the mail is gone and cannot be recalled — or when the item is
 // already cancelled/failed. A reaction has no draft: undoing it
 // deletes the queued send and removes the local reaction record
-// (via onUndo), so the pill disappears.
+// (via onUndo), so the pill disappears. Undo restores the queued
+// snapshot into the draft row, so the reopened composer shows the
+// message that was about to send — not edits made to the live draft
+// during the undo window.
 func (s *sendQueueService) UndoSend(queueID string) (UndoSendResult, error) {
-	item, err := s.store.Get(queueID)
+	// GetForSend, not Get: Undo restores the queued MessageJSON
+	// snapshot into the draft row, and Get deliberately omits the
+	// message JSON (list view never needs it).
+	item, err := s.store.GetForSend(queueID)
 	if err != nil {
 		return UndoSendResult{}, err
 	}
@@ -319,13 +364,35 @@ func (s *sendQueueService) UndoSend(queueID string) (UndoSendResult, error) {
 		s.onUndo(*item)
 	}
 	log := logging.WithComponent("sendqueue")
+	// Restore the queued snapshot into the draft row. The draft is
+	// the Undo payload, but it is a live row: the user may have
+	// edited it during the undo window (it stays visible in Drafts),
+	// and Undo must reopen the message that was about to send, not
+	// the later edits. The queued MessageJSON is the snapshot taken
+	// at queue time, so write it back over the live draft. When the
+	// draft no longer exists, saving creates a fresh one — use its
+	// id, so the composer reopens the restored content either way.
+	// A restore failure must not fail the undo itself: the queued
+	// send is already cancelled, and the live draft is still there
+	// to reopen.
+	draftID := item.DraftID
+	if item.Kind == sendqueue.KindMessage && item.MessageJSON != "" && s.saveDraft != nil {
+		var snapshot smtp.ComposeMessage
+		if err := json.Unmarshal([]byte(item.MessageJSON), &snapshot); err != nil {
+			log.Warn().Err(err).Str("queue_id", queueID).Msg("Queued send undone, but the snapshot could not be restored to the draft")
+		} else if id, err := s.saveDraft(item.AccountID, snapshot, item.DraftID); err != nil {
+			log.Warn().Err(err).Str("queue_id", queueID).Msg("Queued send undone, but the snapshot could not be restored to the draft")
+		} else if id != "" {
+			draftID = id
+		}
+	}
 	log.Info().
 		Str("queue_id", queueID).
-		Str("draft_id", item.DraftID).
+		Str("draft_id", draftID).
 		Str("kind", item.Kind).
 		Msg("Queued send undone, message back in Drafts")
 	s.emitEvent("sendqueue:updated", nil)
-	return UndoSendResult{QueueID: queueID, AccountID: item.AccountID, DraftID: item.DraftID}, nil
+	return UndoSendResult{QueueID: queueID, AccountID: item.AccountID, DraftID: draftID}, nil
 }
 
 // ListSendQueue returns the Outbox rows for normal sends, newest
@@ -487,14 +554,45 @@ func (s *sendQueueService) sendOne(item sendqueue.Item, now time.Time) bool {
 	if full.DraftID != "" && s.draftStore != nil {
 		d, _ = s.draftStore.Get(full.DraftID) // nil when already gone; send anyway
 	}
-	if _, err := s.ops.sendMessage(s.ctx, full.AccountID, msg, d); err != nil {
+	// Send the queued snapshot, never the live draft: the worker
+	// already sends msg (unmarshalled from the stored MessageJSON).
+	// The live draft row is only the post-send cleanup target — and
+	// only when it still matches the snapshot. If the user edited
+	// the draft during the undo window, deleting it would silently
+	// destroy those edits, so pass nil and leave the edited draft
+	// in Drafts. When the draft conversion is unavailable (no
+	// draftOps, e.g. in tests), fall back to the old behaviour of
+	// passing the draft through.
+	if d != nil && s.ops != nil && s.ops.draftOps != nil {
+		if live := s.ops.draftOps.toComposeMessage(d); !sameDraftContent(live, &msg) {
+			log.Info().Str("queue_id", item.ID).Str("draft_id", d.ID).
+				Msg("Queued message sent from its snapshot; live draft was edited during the undo window and is kept")
+			d = nil
+		}
+	}
+	// Record SMTP acceptance durably the moment it happens: the
+	// hook deletes (or marks sent) the queue row before sendMessage
+	// does its post-send work (Sent-folder save, contacts, draft
+	// cleanup). A crash in that post-send work must not re-queue
+	// a mail the server already accepted. The Delete/MarkSent after
+	// sendMessage returns is the fallback for the (already deleted)
+	// row — both are idempotent.
+	markAccepted := func(_ []byte) {
+		if ok, err := s.store.Delete(item.ID); err != nil || !ok {
+			if merr := s.store.MarkSent(item.ID, now); merr != nil {
+				log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Message accepted by SMTP but failed to delete or mark sent")
+			}
+		}
+	}
+	if _, err := s.ops.sendMessageWithHook(s.ctx, full.AccountID, msg, d, markAccepted); err != nil {
 		s.recordFailure(*full, now, err)
 		return false
 	}
-	// Sent: delete the row instead of keeping it as history. If the
-	// delete fails, mark it sent as a fallback — the mail is gone,
-	// and a 'sending' row left behind would be re-queued and re-sent
-	// by the stale-claim reset. The frontend hides sent rows.
+	// Sent: the afterSMTP hook above already deleted the row the
+	// moment SMTP accepted the mail; this is the fallback for a
+	// hook that could not delete it. Either way the row must not
+	// survive as 'sending' — the stale-claim reset would re-queue
+	// and re-send it. Sent rows are deleted, not kept as history.
 	if ok, err := s.store.Delete(item.ID); err != nil || !ok {
 		if merr := s.store.MarkSent(item.ID, now); merr != nil {
 			log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Message sent but failed to delete or mark sent")
@@ -540,6 +638,16 @@ func (s *sendQueueService) sendReactionItem(item sendqueue.Item, now time.Time) 
 		s.recordFailure(item, now, err)
 		return false
 	}
+	// SMTP accepted the reaction: delete (or mark sent) the row
+	// BEFORE the Sent-folder save below. A crash during that save
+	// must not re-queue a reaction the server already accepted —
+	// the pre-built bytes carry a fixed Message-ID, so a redispatch
+	// would otherwise send an identical second copy.
+	if ok, err := s.store.Delete(item.ID); err != nil || !ok {
+		if merr := s.store.MarkSent(item.ID, now); merr != nil {
+			log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Reaction sent but failed to delete or mark sent")
+		}
+	}
 	// Save to Sent via IMAP APPEND exactly like a normal send:
 	// skipped when the provider auto-saves Sent mail, and a save
 	// failure only warns — the send already succeeded, and the Sent
@@ -547,13 +655,6 @@ func (s *sendQueueService) sendReactionItem(item sendqueue.Item, now time.Time) 
 	if acc, accErr := s.ops.accountStore.Get(item.AccountID); accErr == nil && acc != nil && !providerAutoSavesSentMail(acc.IMAPHost) {
 		if err := s.ops.saveToSentFolder(s.ctx, item.AccountID, acc, item.RawMessage); err != nil {
 			log.Warn().Err(err).Str("accountID", item.AccountID).Msg("Failed to save reaction to Sent folder")
-		}
-	}
-	// Sent: delete the row instead of keeping it as history (same
-	// fallback as a normal send — never re-queue a sent mail).
-	if ok, err := s.store.Delete(item.ID); err != nil || !ok {
-		if merr := s.store.MarkSent(item.ID, now); merr != nil {
-			log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Reaction sent but failed to delete or mark sent")
 		}
 	}
 	log.Info().
@@ -570,6 +671,71 @@ func (s *sendQueueService) sendReactionItem(item sendqueue.Item, now time.Time) 
 		}()
 	}
 	return true
+}
+
+// sameDraftContent reports whether a live draft (converted back to
+// a ComposeMessage) still holds exactly the content that was queued.
+// Only fields the draft round-trip preserves are compared: the
+// draft carries no From, References, read-receipt flag or
+// Message-ID, so those are skipped — they cannot tell an edit apart
+// from the round-trip itself. Anything uncomparable (an attachment
+// whose content cannot be resolved, a body that cannot be
+// decrypted) counts as different: the safe direction is to keep the
+// draft, never to delete a possibly-edited one.
+func sameDraftContent(live, snapshot *smtp.ComposeMessage) bool {
+	if live == nil || snapshot == nil {
+		return live == snapshot
+	}
+	if !sameAddresses(live.To, snapshot.To) ||
+		!sameAddresses(live.Cc, snapshot.Cc) ||
+		!sameAddresses(live.Bcc, snapshot.Bcc) ||
+		!sameAddressPtr(live.ReplyTo, snapshot.ReplyTo) ||
+		live.Subject != snapshot.Subject ||
+		live.TextBody != snapshot.TextBody ||
+		live.HTMLBody != snapshot.HTMLBody ||
+		live.InReplyTo != snapshot.InReplyTo ||
+		live.SignMessage != snapshot.SignMessage ||
+		live.PGPSignMessage != snapshot.PGPSignMessage ||
+		live.EncryptMessage != snapshot.EncryptMessage ||
+		live.PGPEncryptMessage != snapshot.PGPEncryptMessage {
+		return false
+	}
+	if len(live.Attachments) != len(snapshot.Attachments) {
+		return false
+	}
+	for i := range live.Attachments {
+		a, b := live.Attachments[i], snapshot.Attachments[i]
+		if a.Filename != b.Filename || a.ContentType != b.ContentType ||
+			a.Inline != b.Inline || a.ContentID != b.ContentID {
+			return false
+		}
+		ac, aerr := a.ResolveContent()
+		bc, berr := b.ResolveContent()
+		if aerr != nil || berr != nil || len(ac) != len(bc) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameAddresses(a, b []smtp.Address) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !strings.EqualFold(strings.TrimSpace(a[i].Address), strings.TrimSpace(b[i].Address)) ||
+			a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
+}
+
+func sameAddressPtr(a, b *smtp.Address) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return strings.EqualFold(strings.TrimSpace(a.Address), strings.TrimSpace(b.Address)) && a.Name == b.Name
 }
 
 // recordFailure records one failed dispatch: permanent errors fail

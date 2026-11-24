@@ -481,6 +481,29 @@ func (s *Store) Retry(id string, now time.Time) (bool, error) {
 	return n == 1, nil
 }
 
+// HasActiveForDraft reports whether the draft already has a queued
+// send that has not finished — status 'pending' (still in the undo
+// window or waiting on a retry backoff) or 'sending' (being
+// dispatched right now). QueueSend uses it to reject a second queue
+// attempt for the same draft: the draft stays visible in Drafts
+// during the undo window, and without this guard opening it and
+// sending again would enqueue a second row and dispatch twice. The
+// pending row itself is the "queued" mark on the draft — no draft
+// schema change is needed to carry it.
+func (s *Store) HasActiveForDraft(draftID string) (bool, error) {
+	if draftID == "" {
+		return false, nil
+	}
+	var n int
+	if err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM send_queue
+		WHERE draft_id = ? AND status IN ('pending', 'sending')
+	`, draftID).Scan(&n); err != nil {
+		return false, fmt.Errorf("sendqueue: check active draft: %w", err)
+	}
+	return n > 0, nil
+}
+
 // RequeueSending is used by tests to put a 'sending' item back to
 // pending without waiting for the stale-claim window.
 func (s *Store) RequeueSending(id string) error {

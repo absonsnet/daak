@@ -542,3 +542,77 @@ func findQueueItem(t *testing.T, b *MailMergeBridge, runID, recipient string) Qu
 	t.Fatalf("no queue item for run %s recipient %s", runID, recipient)
 	return QueuedItem{}
 }
+
+// TestQueueRetryResendsIdenticalBytes is the finding-8 Mail Merge
+// regression test: the queued bytes are rendered once at queue time,
+// so a retry after a lost acknowledgement must transmit the exact
+// same bytes — same Message-ID — as the first attempt, not a
+// freshly rendered copy.
+func TestQueueRetryResendsIdenticalBytes(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	fakeNow := time.Now().UTC().Truncate(time.Second)
+	env.bridge.nowFunc = func() time.Time { return fakeNow }
+	env.sender.failAfterSend["john@example.com"] = errors.New("read tcp: i/o timeout")
+
+	runID := startLaterRun(t, env, testBridgeRows()[:1])
+
+	// Attempt 1: the bytes reach the server, the ack is lost.
+	res, err := env.bridge.MailMerge_SendUnsent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Sent != 0 || res.Failed != 0 {
+		t.Fatalf("attempt 1 %+v, want nothing sent/failed", res)
+	}
+	if len(env.sender.sentRaw) != 1 {
+		t.Fatalf("recorded transmissions %d, want 1", len(env.sender.sentRaw))
+	}
+	john := findQueueItem(t, env.bridge, runID, "john@example.com")
+	if john.Status != QueueStatusQueued || john.Attempts != 1 {
+		t.Fatalf("john after attempt 1 %+v, want queued / 1 attempt", john)
+	}
+
+	// After the backoff, with the connection back: the retry sends.
+	fakeNow = fakeNow.Add(2 * time.Minute)
+	delete(env.sender.failAfterSend, "john@example.com")
+	res, err = env.bridge.MailMerge_SendUnsent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Sent != 1 {
+		t.Fatalf("retry dispatch %+v, want 1 sent", res)
+	}
+	if len(env.sender.sentRaw) != 2 {
+		t.Fatalf("recorded transmissions %d, want 2 (first attempt + retry)", len(env.sender.sentRaw))
+	}
+	if env.sender.sentRaw[0] != env.sender.sentRaw[1] {
+		t.Fatalf("retry bytes differ from first attempt:\n%s\n---\n%s", env.sender.sentRaw[0], env.sender.sentRaw[1])
+	}
+	if got := queueMessageID(env.sender.sentRaw[0]); got == "" {
+		t.Fatal("transmitted bytes carry no Message-ID")
+	}
+	// The queue row is gone and the run log records the send once.
+	items, err := env.bridge.MailMerge_ListQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("queue after retry %+v, want empty", items)
+	}
+	run, err := env.bridge.MailMerge_GetRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.SentCount != 1 || run.QueuedCount != 0 {
+		t.Fatalf("run after retry %+v, want sent 1 / queued 0", run)
+	}
+}
+
+func queueMessageID(raw string) string {
+	for _, line := range strings.Split(raw, "\r\n") {
+		if strings.HasPrefix(line, "Message-ID:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "Message-ID:"))
+		}
+	}
+	return ""
+}
