@@ -407,11 +407,16 @@ func shouldChargeFailure(receivedBytes, reportedSize int64) bool {
 }
 
 // markUnresolvedAsFailed persists messages.body_failed=1 for any requested ID
-// whose body parsed to empty AND wasn't encrypted, OR whose UID the server
+// whose body parsed to nothing usable AND wasn't encrypted, OR whose UID the server
 // didn't return at all. Encrypted messages (which legitimately carry empty
-// plaintext until view-time decryption) are treated as resolved. The flag
-// excludes the message from future body-fetch queries via the body_failed=0
-// guard in GetMessagesWithoutBody/AndSize/Count (see migration v39).
+// plaintext until view-time decryption) are treated as resolved, as are
+// attachment-only messages (the fetch succeeded — the attachments were
+// extracted — so there is nothing to retry; flagging them would leave them
+// permanently body-less for no reason). The flag excludes the message from
+// future body-fetch queries via the body_failed=0 guard in
+// GetMessagesWithoutBody/AndSize/Count (see migration v39). It is NOT
+// permanent: a Force Resync (ClearBodiesForFolder) resets it for the whole
+// folder, and a later body persist carrying usable content clears it.
 //
 // consumedIDs are messages whose bodies were consumed without a body update
 // — linked reaction emails, hidden by handleReaction. They count as
@@ -440,7 +445,10 @@ func (e *Engine) markUnresolvedAsFailed(requestedIDs []string, updates []message
 	}
 	resolved := make(map[string]bool, len(updates))
 	for _, u := range updates {
-		if u.BodyHTML != "" || u.BodyText != "" || u.SMIMEEncrypted || u.PGPEncrypted {
+		// One shared definition of "usable" (see BodyUpdate.HasUsableContent):
+		// body text/HTML, an encrypted payload, or attachments. Anything
+		// else means the fetch produced nothing worth keeping.
+		if u.HasUsableContent() {
 			resolved[u.MessageID] = true
 		}
 	}
@@ -648,11 +656,13 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 				Int("fetchedCount", result.fetchedCount).
 				Msg("Received result from processing goroutine")
 
-			// Persist parse failures via messages.body_failed so we never
-			// re-fetch these from IMAP again. A message is "resolved" if its
-			// parsed body is non-empty OR it's encrypted (encrypted bodies are
-			// intentionally empty until decrypted at view time). Everything
-			// else — including IDs the server didn't return — gets flagged.
+			// Persist parse failures via messages.body_failed so the next
+			// sync doesn't re-fetch these from IMAP. A message is "resolved"
+			// if its parsed body is non-empty OR it's encrypted (encrypted
+			// bodies are intentionally empty until decrypted at view time)
+			// OR it has attachments. Everything else — including IDs the
+			// server didn't return — gets flagged. The flag is cleared by
+			// a Force Resync or a later successful body persist.
 			e.markUnresolvedAsFailed(result.requestedIDs, result.bodyUpdates, result.sizes, result.consumedIDs)
 
 			// Apply database updates - MUST complete before querying next batch
@@ -838,7 +848,8 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 		failedBatches = 0
 
 		// If we got no bodies back, persist the failure for every requested
-		// ID so they are excluded from future syncs forever — otherwise the
+		// ID so they are excluded from future syncs until a Force Resync
+		// (or a later successful fetch) clears the flag — otherwise the
 		// next cycle would query and FETCH the same UIDs again.
 		if len(bodies) == 0 {
 			e.log.Warn().Int("requested", len(uidToMessageID)).Msg("IMAP returned no bodies for batch")

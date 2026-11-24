@@ -11,7 +11,7 @@ import (
 // columns survive Create/Get, the backfill queue lists unenriched rows,
 // dismissals persist, and attention candidates surface the right rows.
 func TestEnrichment_RoundTrip(t *testing.T) {
-	s, accountID, folderID := newBodyFailedTestStore(t)
+	s, _, accountID, folderID := newBodyFailedTestStore(t)
 	now := time.Now().UTC()
 
 	otp := &Message{
@@ -135,7 +135,7 @@ func TestEnrichment_RoundTrip(t *testing.T) {
 }
 
 func TestMigrationV46_V47_Shape(t *testing.T) {
-	s, accountID, folderID := newBodyFailedTestStore(t)
+	s, _, accountID, folderID := newBodyFailedTestStore(t)
 	now := time.Now().UTC()
 
 	// The migration-46/47 tables exist and accept rows.
@@ -187,7 +187,7 @@ func TestMigrationV46_V47_Shape(t *testing.T) {
 // flight-change mail) must scan cleanly instead of failing the whole
 // query with "converting NULL to string is unsupported".
 func TestAttentionCandidates_NullExtractFields(t *testing.T) {
-	s, accountID, folderID := newBodyFailedTestStore(t)
+	s, _, accountID, folderID := newBodyFailedTestStore(t)
 	now := time.Now().UTC()
 
 	flight := &Message{
