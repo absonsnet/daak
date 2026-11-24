@@ -362,13 +362,19 @@ func (s *Service) pause(ctx context.Context, req RunRequest) bool {
 // result is reported per row via onProgress. The message is fixed at
 // queue time — the queue runner never re-renders.
 //
+// onQueued reports whether the rendered message was actually
+// persisted: a non-nil error fails the row (RowFailed) instead of
+// recording it queued, and the address is NOT marked seen — a row
+// whose enqueue failed must not block a later row to the same
+// address, and the failed row stays resumable via Resume.
+//
 // Same row semantics as Execute: duplicates suppressed, per-row
 // failures recorded without stopping the run, ctx cancel stops after
 // the current row (remaining rows skipped). No pause between rows
 // (rendering is local work) and no safety cap (the cap governs
 // sending, and the queue runner enforces the per-hour budget when
 // the messages actually go out).
-func (s *Service) RenderForQueue(ctx context.Context, req RunRequest, onQueued func(QueuedMessage), onProgress func(RowResult)) (Outcome, error) {
+func (s *Service) RenderForQueue(ctx context.Context, req RunRequest, onQueued func(QueuedMessage) error, onProgress func(RowResult)) (Outcome, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -424,7 +430,6 @@ func (s *Service) RenderForQueue(ctx context.Context, req RunRequest, onQueued f
 			emit(*bad)
 			continue
 		}
-		seenTo[strings.ToLower(strings.TrimSpace(bm.email))] = true
 		raw, err := bm.msg.ToRFC822()
 		if err != nil {
 			emit(RowResult{Index: origIndex, Email: bm.email, Status: RowFailed, Error: fmt.Sprintf("build message: %v", err), Timestamp: now})
@@ -442,16 +447,23 @@ func (s *Service) RenderForQueue(ctx context.Context, req RunRequest, onQueued f
 			}
 			raw = signed
 		}
+		// The address counts for duplicate suppression only once the
+		// row is actually queued: a build/sign/enqueue failure must
+		// not poison later rows to the same address (see processRow).
 		if onQueued != nil {
-			onQueued(QueuedMessage{
+			if err := onQueued(QueuedMessage{
 				RowIndex: origIndex,
 				Email:    bm.email,
 				Subject:  bm.msg.Subject,
 				From:     bm.fromAddr.Address,
 				To:       addressStrings(bm.toAddrs),
 				Raw:      raw,
-			})
+			}); err != nil {
+				emit(RowResult{Index: origIndex, Email: bm.email, Status: RowFailed, Error: fmt.Sprintf("enqueue: %v", err), Timestamp: now})
+				continue
+			}
 		}
+		seenTo[strings.ToLower(strings.TrimSpace(bm.email))] = true
 		emit(RowResult{Index: origIndex, Email: bm.email, Status: RowQueued, Timestamp: now})
 	}
 	return out, nil
@@ -656,25 +668,30 @@ func (s *Service) processRow(ctx context.Context, req RunRequest, row map[string
 	dupKey := strings.ToLower(strings.TrimSpace(bm.email))
 	email := bm.email
 
-	// The row is accepted for delivery: it now counts for duplicate
-	// suppression even if the send/draft itself fails (a retry is the
-	// resume path, not a silent second attempt in this run). Held rows
-	// do NOT mark the address — both copies stay held and the duplicate
-	// is caught when the batch actually sends.
+	// Duplicate suppression marks an address ONLY once its row has
+	// actually succeeded (draft saved / message sent). Marking before
+	// delivery poisoned the suppression: a row that failed mid-send
+	// (build, sign, transmit) left the address in seenTo, so later
+	// rows to the same address were skipped as "duplicate recipient
+	// — already sent in this run" and the failed row was the only
+	// record — unresumable except by re-running the whole merge.
+	// A failed row stays unmarked, so a later row to the same address
+	// is delivered and the failed row is re-runnable via Resume.
+	// Held rows do NOT mark the address — both copies stay held and
+	// the duplicate is caught when the batch actually sends.
 	markSeen := func() { seenTo[dupKey] = true }
 
 	switch req.DeliverMode {
 	case "drafts":
-		markSeen()
 		if err := s.deps.DraftSaver.SaveDraft(req.AccountID, bm.msg); err != nil {
 			return fail(fmt.Sprintf("save draft: %v", err))
 		}
+		markSeen()
 		return RowResult{Index: origIndex, Email: email, Status: RowDraftSaved, Timestamp: now}
 	case "send":
 		if req.CapEnabled && *sentAttempted >= capLimit {
 			return RowResult{Index: origIndex, Email: email, Status: RowHeld, Error: "held — over cap", Timestamp: now}
 		}
-		markSeen()
 		raw, err := bm.msg.ToRFC822()
 		if err != nil {
 			return fail(fmt.Sprintf("build message: %v", err))
@@ -694,6 +711,7 @@ func (s *Service) processRow(ctx context.Context, req RunRequest, row map[string
 		if err := sender.SendMail(bm.fromAddr.Address, bm.msg.AllRecipients(), raw); err != nil {
 			return fail(fmt.Sprintf("send: %v", err))
 		}
+		markSeen()
 		*sentAttempted++
 		// Save to Sent the way App.SendMessage does. A failure here
 		// must not fail the send (the message is already out).

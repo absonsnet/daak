@@ -153,7 +153,7 @@ export interface MailMergeRun {
   createdAt: string
   accountId: string
   deliverMode: string
-  status: string // running | done | cancelled | held | queued
+  status: string // running | done | cancelled | held | queued | failed
   totalRows: number
   sentCount: number
   failedCount: number
@@ -161,6 +161,7 @@ export interface MailMergeRun {
   heldCount: number
   queuedCount: number
   rows: MailMergeRowResult[]
+  error?: string // whole-run failure (status 'failed' only)
 }
 
 export interface MailMergeRunSummary {
@@ -175,6 +176,7 @@ export interface MailMergeRunSummary {
   skippedCount: number
   heldCount: number
   queuedCount: number
+  error?: string // whole-run failure (status 'failed' only)
 }
 
 export interface MailMergeParsedFile {

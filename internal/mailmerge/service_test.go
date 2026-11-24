@@ -29,6 +29,9 @@ func (f *fakeDraftSaver) SaveDraft(_ string, msg smtp.ComposeMessage) error {
 type fakeSender struct {
 	sent []sentMail
 	fail map[string]error // fail sends to this address
+	// failOnce fails the next send to this address only, then
+	// succeeds: a transient mid-send failure for one row.
+	failOnce map[string]error
 }
 
 type sentMail struct {
@@ -40,6 +43,10 @@ type sentMail struct {
 func (f *fakeSender) SendMail(from string, to []string, msg []byte) error {
 	for _, rcpt := range to {
 		if err, ok := f.fail[rcpt]; ok {
+			return err
+		}
+		if err, ok := f.failOnce[rcpt]; ok {
+			delete(f.failOnce, rcpt)
 			return err
 		}
 	}
@@ -302,6 +309,89 @@ func TestServicePerRowSendFailureContinues(t *testing.T) {
 	}
 }
 
+// TestServiceFailedRowDoesNotPoisonDuplicateSuppression is the
+// finding-14 regression test: a row that fails mid-send must not
+// mark its address seen, so a later row to the same address is
+// delivered (not skipped as a false "duplicate"), and the failed
+// row stays failed in the log — resumable via ResumeRun, which
+// re-runs RowFailed rows only (bridge_test.go covers the resume).
+func TestServiceFailedRowDoesNotPoisonDuplicateSuppression(t *testing.T) {
+	rows := []map[string]string{
+		{"FirstName": "John", "LastName": "Doe", "Email": "john@example.com", "Code": "A1"},
+		{"FirstName": "John", "LastName": "Doe", "Email": "john@example.com", "Code": "A2"},
+		{"FirstName": "Jane", "LastName": "Smith", "Email": "jane@example.com", "Code": "B2"},
+	}
+	sender := &fakeSender{failOnce: map[string]error{"john@example.com": errors.New("452 try again later")}}
+	svc := NewService(ServiceDeps{
+		SenderFactory: &fakeSenderFactory{sender: sender},
+		SentSaver:     &fakeSentSaver{},
+	})
+	var results []RowResult
+	out, err := svc.Execute(context.Background(), RunRequest{
+		Template: testTemplate(), Rows: rows,
+		DeliverMode: "send", AccountID: "acc1",
+	}, func(r RowResult) { results = append(results, r) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results %d", len(results))
+	}
+	if results[0].Status != RowFailed || !strings.Contains(results[0].Error, "452") {
+		t.Fatalf("row 0 must fail: %+v", results[0])
+	}
+	if results[1].Status != RowSent {
+		t.Fatalf("row 1 (same address, after a failed row) must send, got %+v", results[1])
+	}
+	if results[2].Status != RowSent {
+		t.Fatalf("row 2 must send: %+v", results[2])
+	}
+	if out.SentCount != 2 || out.FailedCount != 1 || out.SkippedCount != 0 {
+		t.Fatalf("outcome %+v", out)
+	}
+	if len(sender.sent) != 2 {
+		t.Fatalf("sent %d, want 2", len(sender.sent))
+	}
+	// The same rule in drafts mode: a failed draft save must not
+	// block a later row to the same address.
+	saver := &fakeDraftSaver{}
+	// Fail the first save only, via a counting saver.
+	counting := &failOnceDraftSaver{inner: saver, fail: errors.New("disk full")}
+	svc2 := NewService(ServiceDeps{DraftSaver: counting})
+	results = nil
+	out, err = svc2.Execute(context.Background(), RunRequest{
+		Template: testTemplate(), Rows: rows,
+		DeliverMode: "drafts", AccountID: "acc1",
+	}, func(r RowResult) { results = append(results, r) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 || results[0].Status != RowFailed || results[1].Status != RowDraftSaved || results[2].Status != RowDraftSaved {
+		t.Fatalf("drafts results %+v", results)
+	}
+	if out.SentCount != 2 || out.FailedCount != 1 {
+		t.Fatalf("drafts outcome %+v", out)
+	}
+	if len(saver.saved) != 2 {
+		t.Fatalf("drafts saved %d, want 2", len(saver.saved))
+	}
+}
+
+// failOnceDraftSaver fails the first SaveDraft call, then delegates.
+type failOnceDraftSaver struct {
+	inner *fakeDraftSaver
+	fail  error
+	done  bool
+}
+
+func (f *failOnceDraftSaver) SaveDraft(accountID string, msg smtp.ComposeMessage) error {
+	if !f.done {
+		f.done = true
+		return f.fail
+	}
+	return f.inner.SaveDraft(accountID, msg)
+}
+
 func TestServiceStartStop(t *testing.T) {
 	saver := &fakeDraftSaver{}
 	svc := NewService(ServiceDeps{DraftSaver: saver})
@@ -511,7 +601,7 @@ func TestRenderForQueue(t *testing.T) {
 	var results []RowResult
 	out, err := svc.RenderForQueue(context.Background(), RunRequest{
 		Template: testTemplate(), Rows: testRows(), AccountID: "acc1",
-	}, func(qm QueuedMessage) { queued = append(queued, qm) },
+	}, func(qm QueuedMessage) error { queued = append(queued, qm); return nil },
 		func(r RowResult) { results = append(results, r) })
 	if err != nil {
 		t.Fatal(err)
@@ -551,7 +641,7 @@ func TestRenderForQueue(t *testing.T) {
 	results = nil
 	out, err = svc.RenderForQueue(context.Background(), RunRequest{
 		Template: testTemplate(), Rows: dupRows, AccountID: "acc1",
-	}, func(qm QueuedMessage) { queued = append(queued, qm) },
+	}, func(qm QueuedMessage) error { queued = append(queued, qm); return nil },
 		func(r RowResult) { results = append(results, r) })
 	if err != nil {
 		t.Fatal(err)
@@ -567,12 +657,62 @@ func TestRenderForQueue(t *testing.T) {
 	queued = nil
 	out, err = svc.RenderForQueue(context.Background(), RunRequest{
 		Template: testTemplate(), Rows: badRows, AccountID: "acc1",
-	}, func(qm QueuedMessage) { queued = append(queued, qm) }, nil)
+	}, func(qm QueuedMessage) error { queued = append(queued, qm); return nil }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if out.QueuedCount != 1 || out.SkippedCount != 1 || len(queued) != 1 {
 		t.Fatalf("bad-row outcome %+v queued %d", out, len(queued))
+	}
+}
+
+// TestRenderForQueueEnqueueFailureFailsRow is the finding-14
+// queue-mode regression test (and the service half of finding 17):
+// when persisting a rendered row fails, the row is RowFailed — not
+// RowQueued — and its address is not marked seen, so a later row to
+// the same address still queues.
+func TestRenderForQueueEnqueueFailureFailsRow(t *testing.T) {
+	svc := NewService(ServiceDeps{})
+	rows := []map[string]string{
+		{"FirstName": "John", "LastName": "Doe", "Email": "john@example.com", "Code": "A1"},
+		{"FirstName": "John", "LastName": "Doe", "Email": "john@example.com", "Code": "A2"},
+		{"FirstName": "Jane", "LastName": "Smith", "Email": "jane@example.com", "Code": "B2"},
+	}
+	var queued []QueuedMessage
+	var results []RowResult
+	enqueueErr := errors.New("queue store unavailable")
+	failedOnce := false
+	onQueued := func(qm QueuedMessage) error {
+		if qm.Email == "john@example.com" && !failedOnce {
+			failedOnce = true
+			return enqueueErr // first john fails to persist
+		}
+		queued = append(queued, qm)
+		return nil
+	}
+	out, err := svc.RenderForQueue(context.Background(), RunRequest{
+		Template: testTemplate(), Rows: rows, AccountID: "acc1",
+	}, onQueued, func(r RowResult) { results = append(results, r) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results %d", len(results))
+	}
+	if results[0].Status != RowFailed || !strings.Contains(results[0].Error, "enqueue") {
+		t.Fatalf("row 0 must fail with an enqueue error: %+v", results[0])
+	}
+	if results[1].Status != RowQueued {
+		t.Fatalf("row 1 (same address, after a failed enqueue) must queue, got %+v", results[1])
+	}
+	if results[2].Status != RowQueued {
+		t.Fatalf("row 2 must queue: %+v", results[2])
+	}
+	if out.QueuedCount != 2 || out.FailedCount != 1 {
+		t.Fatalf("outcome %+v", out)
+	}
+	if len(queued) != 2 || queued[0].Email != "john@example.com" || queued[1].Email != "jane@example.com" {
+		t.Fatalf("queued %+v", queued)
 	}
 }
 

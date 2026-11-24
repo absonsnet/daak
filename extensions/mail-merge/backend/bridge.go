@@ -482,7 +482,9 @@ func (b *MailMergeBridge) MailMerge_CancelRun(runID string) error {
 
 // MailMerge_ResumeRun re-runs the FAILED rows of a run only (NOT held
 // rows — held rows need explicit batch approval; NOT already
-// sent/draft-saved rows). Returns the new run's ID.
+// sent/draft-saved rows). A run that failed as a whole (status
+// "failed") resumes all of its rows — none of them was ever
+// processed. Returns the new run's ID.
 func (b *MailMergeBridge) MailMerge_ResumeRun(runID string) (string, error) {
 	if !b.gateEnabled() {
 		return "", nil
@@ -509,6 +511,13 @@ func (b *MailMergeBridge) MailMerge_ResumeRun(runID string) (string, error) {
 		if r.Status == hostmm.RowFailed && r.Index >= 0 && r.Index < len(req.Rows) {
 			rows = append(rows, req.Rows[r.Index])
 		}
+	}
+	// A run that failed as a whole (RunFailed) with no failed rows
+	// recorded — e.g. the failure predates audit 16's row recording
+	// — resumes its full stored request: none of its rows was ever
+	// processed, so all of them are the failed set.
+	if len(rows) == 0 && run.Status == hostmm.RunFailed {
+		rows = append(rows, req.Rows...)
 	}
 	if len(rows) == 0 {
 		return "", fmt.Errorf("mail-merge: run %q has no failed rows to resume", runID)
@@ -724,6 +733,11 @@ func (b *MailMergeBridge) launchExecution(run *hostmm.Run, req hostmm.RunRequest
 			delete(b.active, run.ID)
 			b.mu.Unlock()
 		}
+		// persistErr records the first row-result persist failure
+		// (if any) so it can be surfaced on the run at completion
+		// instead of silently dropping the row. Written and read
+		// only by this goroutine.
+		var persistErr error
 		outcome, err := b.deps.Service.Execute(ctx, req, func(r hostmm.RowResult) {
 			if indexMap != nil {
 				if r.Index < 0 || r.Index >= len(indexMap) {
@@ -731,9 +745,17 @@ func (b *MailMergeBridge) launchExecution(run *hostmm.Run, req hostmm.RunRequest
 				}
 				r.Index = indexMap[r.Index]
 			}
-			// Persist the row, then refresh the live tally.
+			// Persist the row, then refresh the live tally. A
+			// persist failure must not silently drop the row
+			// result (a sent row would vanish from the log, a
+			// failed row would become unresumable): retry once,
+			// then record the failure to surface it on the run at
+			// completion. The in-memory tally still advances, so
+			// the live counts stay right.
 			if err := b.store.SaveRowResult(run.ID, r); err != nil {
-				return
+				if err2 := b.store.SaveRowResult(run.ID, r); err2 != nil && persistErr == nil {
+					persistErr = fmt.Errorf("mail-merge: persist row %d result: %w", r.Index, err2)
+				}
 			}
 			b.mu.Lock()
 			switch r.Status {
@@ -752,15 +774,11 @@ func (b *MailMergeBridge) launchExecution(run *hostmm.Run, req hostmm.RunRequest
 		})
 		if err != nil {
 			// The whole run failed before/without per-row results
-			// (e.g. SMTP connect failed). There is no "failed" run
-			// status in the v1 enum, so the run is marked cancelled;
-			// the per-row log stays empty and the frontend shows the
-			// run as not completed.
-			b.mu.Lock()
-			run.Status = hostmm.RunCancelled
-			b.mu.Unlock()
-			_ = b.store.UpdateRunStatusAndCounts(run)
-			b.emitRunUpdated(run.ID)
+			// (e.g. SMTP connect failed). It is recorded as failed,
+			// not cancelled: the error is stored on the run and
+			// every row the run never processed is recorded
+			// RowFailed, so ResumeRun can re-run it.
+			b.failWholeRun(run, req, indexMap, err)
 			deactivate()
 			return
 		}
@@ -778,10 +796,59 @@ func (b *MailMergeBridge) launchExecution(run *hostmm.Run, req hostmm.RunRequest
 		default:
 			final.Status = hostmm.RunDone
 		}
+		// A row result that could not be persisted is surfaced on
+		// the run (the terminal status stands — the rows were
+		// delivered, only the log is incomplete).
+		if persistErr != nil {
+			final.Error = persistErr.Error() + " (the run log may be missing rows)"
+		}
 		_ = b.store.UpdateRunStatusAndCounts(final)
 		b.emitRunUpdated(run.ID)
 		deactivate()
 	}()
+}
+
+// failWholeRun records a whole-run failure (audit 16): the run
+// becomes RunFailed with the error stored on it, and every row the
+// run never processed is recorded RowFailed with that error, so
+// ResumeRun can re-run the run. Rows already in the log (a failure
+// after partial progress) are left alone. indexMap translates the
+// executed request's row positions back to the persisted run's row
+// indices (nil = identity, for fresh runs).
+func (b *MailMergeBridge) failWholeRun(run *hostmm.Run, req hostmm.RunRequest, indexMap []int, runErr error) {
+	_, indices := hostmm.SliceRows(req.Rows, req.StartRow, req.StopRow)
+	logged := map[int]bool{}
+	if existing, err := b.store.GetRun(run.ID); err == nil && existing != nil {
+		for _, r := range existing.Rows {
+			logged[r.Index] = true
+		}
+	}
+	now := time.Now()
+	for pos, origIndex := range indices {
+		idx := origIndex
+		if indexMap != nil {
+			if pos < 0 || pos >= len(indexMap) {
+				continue
+			}
+			idx = indexMap[pos]
+		}
+		if logged[idx] {
+			continue
+		}
+		_ = b.store.SaveRowResult(run.ID, hostmm.RowResult{
+			Index: idx, Status: hostmm.RowFailed,
+			Error: runErr.Error(), Timestamp: now,
+		})
+	}
+	final, ferr := b.store.GetRun(run.ID)
+	if ferr != nil || final == nil {
+		return
+	}
+	final.RecomputeCounts()
+	final.Status = hostmm.RunFailed
+	final.Error = runErr.Error()
+	_ = b.store.UpdateRunStatusAndCounts(final)
+	b.emitRunUpdated(run.ID)
 }
 
 // sendBatch is the shared implementation of SendNextBatch (capped) and
@@ -890,11 +957,16 @@ func (b *MailMergeBridge) launchQueueExecution(run *hostmm.Run, req hostmm.RunRe
 			b.mu.Unlock()
 		}
 		now := b.queueNow()
+		// persistErr records the first row-result persist failure
+		// (if any) so it can be surfaced on the run at completion
+		// instead of silently dropping the row. Written and read
+		// only by this goroutine.
+		var persistErr error
 		outcome, err := b.deps.Service.RenderForQueue(ctx, req,
-			func(qm hostmm.QueuedMessage) {
+			func(qm hostmm.QueuedMessage) error {
 				if indexMap != nil {
 					if qm.RowIndex < 0 || qm.RowIndex >= len(indexMap) {
-						return
+						return nil
 					}
 					qm.RowIndex = indexMap[qm.RowIndex]
 				}
@@ -914,7 +986,10 @@ func (b *MailMergeBridge) launchQueueExecution(run *hostmm.Run, req hostmm.RunRe
 					NextAttemptAt: now,
 					CreatedAt:     now,
 				}
-				_ = b.store.EnqueueItem(item)
+				// An enqueue failure is returned so the service
+				// records the row failed (not queued) and does not
+				// mark the address seen — see finding 17.
+				return b.store.EnqueueItem(item)
 			},
 			func(r hostmm.RowResult) {
 				if indexMap != nil {
@@ -923,8 +998,15 @@ func (b *MailMergeBridge) launchQueueExecution(run *hostmm.Run, req hostmm.RunRe
 					}
 					r.Index = indexMap[r.Index]
 				}
+				// Persist the row, then refresh the live tally. A
+				// persist failure must not silently drop the row
+				// result: retry once, then record the failure to
+				// surface it on the run at completion (same
+				// contract as launchExecution).
 				if err := b.store.SaveRowResult(run.ID, r); err != nil {
-					return
+					if err2 := b.store.SaveRowResult(run.ID, r); err2 != nil && persistErr == nil {
+						persistErr = fmt.Errorf("mail-merge: persist row %d result: %w", r.Index, err2)
+					}
 				}
 				b.mu.Lock()
 				switch r.Status {
@@ -946,12 +1028,9 @@ func (b *MailMergeBridge) launchQueueExecution(run *hostmm.Run, req hostmm.RunRe
 		if err != nil {
 			// The whole run failed before/without per-row results
 			// (e.g. a bad base64 global attachment) — same contract
-			// as launchExecution: mark cancelled, log stays as-is.
-			b.mu.Lock()
-			run.Status = hostmm.RunCancelled
-			b.mu.Unlock()
-			_ = b.store.UpdateRunStatusAndCounts(run)
-			b.emitRunUpdated(run.ID)
+			// as launchExecution: mark failed, record the
+			// unprocessed rows failed, keep the error on the run.
+			b.failWholeRun(run, req, indexMap, err)
 			deactivate()
 			return
 		}
@@ -967,6 +1046,12 @@ func (b *MailMergeBridge) launchQueueExecution(run *hostmm.Run, req hostmm.RunRe
 			final.Status = hostmm.RunQueued
 		default:
 			final.Status = hostmm.RunDone
+		}
+		// A row result that could not be persisted is surfaced on
+		// the run (the terminal status stands — the rows were
+		// queued, only the log is incomplete).
+		if persistErr != nil {
+			final.Error = persistErr.Error() + " (the run log may be missing rows)"
 		}
 		_ = b.store.UpdateRunStatusAndCounts(final)
 		b.emitRunUpdated(run.ID)

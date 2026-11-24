@@ -11,8 +11,9 @@
   //
   // With no runId it shows the run history (MailMerge_ListRuns); picking
   // a run loads its detail. A whole-run failure (e.g. SMTP connect
-  // fails before any row) marks the run `cancelled` with an empty row
-  // log — there is no `failed` run status in the Phase 1 contract.
+  // fails before any row) marks the run `failed` with the error on
+  // the run and every unprocessed row recorded failed — Resume
+  // re-runs them.
 
   import { onMount, onDestroy } from 'svelte'
   import Icon from '@iconify/svelte'
@@ -53,6 +54,7 @@
       case 'running': return 'Running'
       case 'done': return 'Done'
       case 'cancelled': return 'Cancelled'
+      case 'failed': return 'Failed'
       case 'held': return 'Held — over cap'
       case 'queued': return 'Queued — awaiting dispatch'
       default: return status
@@ -222,6 +224,10 @@
         <span class="text-xs text-muted-foreground">{formatTime(run.createdAt)}</span>
       </div>
 
+      {#if run.error}
+        <p class="text-sm text-destructive">{run.error}</p>
+      {/if}
+
       {#if isRunning}
         <div class="h-2 rounded bg-muted overflow-hidden" role="progressbar" aria-valuenow={doneRows} aria-valuemax={run.totalRows}>
           <div
@@ -283,6 +289,8 @@
         <p class="text-sm text-muted-foreground">
           {#if run.status === 'cancelled'}
             No rows were processed — the run stopped before any message was produced (e.g. the mail server could not be reached). Check the account's SMTP settings and try again.
+          {:else if run.status === 'failed'}
+            No rows were processed — the run failed before any message was produced{run.error ? `: ${run.error}` : '.'} Check the account's SMTP settings and try again.
           {:else}
             No rows processed yet.
           {/if}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,9 +63,14 @@ func (f *fakeSender) Close() error { return nil }
 type fakeSenderFactory struct {
 	sender  *fakeSender
 	created int
+	// createErr fails NewSender (e.g. SMTP connect failure) when set.
+	createErr error
 }
 
 func (f *fakeSenderFactory) NewSender(_ context.Context, _ string) (hostmm.MailSender, error) {
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
 	f.created++
 	return f.sender, nil
 }
@@ -166,7 +172,7 @@ func waitForRun(t *testing.T, b *MailMergeBridge, runID string) hostmm.Run {
 			t.Fatal(err)
 		}
 		switch run.Status {
-		case hostmm.RunDone, hostmm.RunCancelled, hostmm.RunHeld:
+		case hostmm.RunDone, hostmm.RunCancelled, hostmm.RunHeld, hostmm.RunFailed, hostmm.RunQueued:
 			return run
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -496,6 +502,105 @@ func TestBridgeResumeFailedOnly(t *testing.T) {
 	// Resuming a run with no failed rows errors.
 	if _, err := env.bridge.MailMerge_ResumeRun(newID); err == nil {
 		t.Fatal("expected no-failed-rows error")
+	}
+}
+
+// TestBridgeWholeRunFailureIsFailedAndResumable is the finding-16
+// regression test: a run that fails before any row is sent (SMTP
+// connect failure) ends in the distinct "failed" status — not
+// "cancelled" — with the error recorded and every unprocessed row
+// logged failed, so ResumeRun can re-run it.
+func TestBridgeWholeRunFailureIsFailedAndResumable(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	env.factory.createErr = errors.New("dial tcp: connection refused")
+	runID, err := env.bridge.MailMerge_StartRun(hostmm.RunRequest{
+		Template: testBridgeTemplate(), Rows: testBridgeRows(),
+		DeliverMode: "send", AccountID: "acc1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRun(t, env.bridge, runID)
+	if run.Status != hostmm.RunFailed {
+		t.Fatalf("run status %q, want failed", run.Status)
+	}
+	if run.Error == "" || !strings.Contains(run.Error, "connection refused") {
+		t.Fatalf("run error %q, want the connect error recorded", run.Error)
+	}
+	if run.FailedCount != 3 || len(run.Rows) != 3 || run.SentCount != 0 {
+		t.Fatalf("run %+v, want 3 failed rows, 0 sent", run)
+	}
+	for i, r := range run.Rows {
+		if r.Status != hostmm.RowFailed || r.Index != i || !strings.Contains(r.Error, "connection refused") {
+			t.Fatalf("row %d %+v, want failed with the connect error", i, r)
+		}
+	}
+	if len(env.sender.sent) != 0 {
+		t.Fatalf("nothing must be sent: %v", env.sender.sent)
+	}
+	// Fix the connection and resume: all three rows re-run and send.
+	env.factory.createErr = nil
+	newID, err := env.bridge.MailMerge_ResumeRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newID == runID {
+		t.Fatal("resume must create a new run")
+	}
+	newRun := waitForRun(t, env.bridge, newID)
+	if newRun.Status != hostmm.RunDone || newRun.SentCount != 3 || newRun.TotalRows != 3 {
+		t.Fatalf("resumed run %+v, want done with 3 sent", newRun)
+	}
+	if len(env.sender.sent) != 3 {
+		t.Fatalf("sent %v", env.sender.sent)
+	}
+}
+
+// TestBridgeLaterRunWholeFailureIsFailed covers the same whole-run
+// failure in "Send later" mode: a bad base64 global attachment fails
+// the run before any row is rendered. The run is failed (not
+// cancelled) with the error recorded, and ResumeRun can proceed
+// from it — the resumed run fails the same way, deterministically,
+// because the stored request still carries the bad attachment.
+func TestBridgeLaterRunWholeFailureIsFailed(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	tmpl := testBridgeTemplate()
+	tmpl.GlobalAttachments = []hostmm.GlobalAttachment{
+		{Filename: "broken.bin", DataBase64: "!!!not-base64!!!"},
+	}
+	runID, err := env.bridge.MailMerge_StartRun(hostmm.RunRequest{
+		Template: tmpl, Rows: testBridgeRows(),
+		DeliverMode: "later", AccountID: "acc1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRun(t, env.bridge, runID)
+	if run.Status != hostmm.RunFailed {
+		t.Fatalf("run status %q, want failed", run.Status)
+	}
+	if run.Error == "" || !strings.Contains(run.Error, "invalid base64") {
+		t.Fatalf("run error %q, want the base64 error recorded", run.Error)
+	}
+	if run.FailedCount != 3 || len(run.Rows) != 3 || run.QueuedCount != 0 {
+		t.Fatalf("run %+v, want 3 failed rows, 0 queued", run)
+	}
+	items, err := env.bridge.MailMerge_ListQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("queue %+v, want empty", items)
+	}
+	// Resume proceeds from a failed run (no "no failed rows" error);
+	// the resumed run fails identically on the same bad attachment.
+	newID, err := env.bridge.MailMerge_ResumeRun(runID)
+	if err != nil {
+		t.Fatalf("resume from a failed run must proceed: %v", err)
+	}
+	newRun := waitForRun(t, env.bridge, newID)
+	if newRun.Status != hostmm.RunFailed || newRun.FailedCount != 3 {
+		t.Fatalf("resumed run %+v, want failed with 3 failed rows", newRun)
 	}
 }
 
