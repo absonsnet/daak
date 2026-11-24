@@ -291,6 +291,10 @@ func (ops *composeOps) microsoftContactsSourceForAccount(ctx context.Context, ac
 
 // saveRecipientsToCardDAVContacts saves new recipients as vCards in the
 // first enabled address book of the CardDAV source linked to this account.
+// Before creating, every enabled address book of THAT source is checked:
+// a recipient already in the second (or any other) book of the same source
+// must not be duplicated into the first. The check never looks at another
+// account's source — a contact there does not suppress creating it here.
 // Only writable sources are written to; without a linked writable source
 // this silently falls back to local collected only.
 func (ops *composeOps) saveRecipientsToCardDAVContacts(ctx context.Context, acc *account.Account, recipients []sendRecipient) {
@@ -337,12 +341,12 @@ func (ops *composeOps) saveRecipientsToCardDAVContacts(ctx context.Context, acc 
 	}
 
 	for _, r := range recipients {
-		existing, err := ops.carddavStore.GetContactByEmailInAddressbook(r.email, ab.ID)
+		exists, err := ops.carddavContactExistsInSource(r.email, addressbooks)
 		if err != nil {
 			log.Debug().Err(err).Str("email", r.email).Msg("CardDAV existence check failed, skipping recipient")
 			continue
 		}
-		if existing != nil {
+		if exists {
 			continue
 		}
 		given, family := contact.SplitDisplayName(r.name)
@@ -358,4 +362,25 @@ func (ops *composeOps) saveRecipientsToCardDAVContacts(ctx context.Context, acc 
 		}
 		log.Info().Str("email", r.email).Str("accountID", acc.ID).Str("addressbook", ab.Name).Msg("Saved new recipient to CardDAV address book")
 	}
+}
+
+// carddavContactExistsInSource reports whether any enabled address book
+// of the sending account's own CardDAV source already holds this email.
+// The check is scoped to the given books (all from one source) —
+// deliberately not the store-wide lookup, which would also see other
+// accounts' sources and wrongly suppress creating the contact here.
+func (ops *composeOps) carddavContactExistsInSource(email string, addressbooks []*carddav.Addressbook) (bool, error) {
+	for _, ab := range addressbooks {
+		if ab == nil {
+			continue
+		}
+		existing, err := ops.carddavStore.GetContactByEmailInAddressbook(email, ab.ID)
+		if err != nil {
+			return false, err
+		}
+		if existing != nil {
+			return true, nil
+		}
+	}
+	return false, nil
 }
