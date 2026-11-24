@@ -326,15 +326,33 @@ func (s *Syncer) getOrCreateOAuthAddressbook(source *Source) (*Addressbook, erro
 // valid record (this is what makes phone-only contacts land instead of being
 // dropped). Change detection keys on (addressbook_id, href=RemoteID).
 func (s *Syncer) storeOAuthContactsDelta(ab *Addressbook, result *contact.SyncResult) error {
-	switch {
-	case result.IsFullSync:
-		// Full sync: clear all existing records for this addressbook first.
-		if err := retryDBOperation(func() error {
-			return s.store.DeleteRecordsForAddressbook(ab.ID)
-		}, 5, 100*time.Millisecond, s.log); err != nil {
-			s.log.Warn().Err(err).Msg("Failed to clear existing records after retries")
+	// Full sync: atomically replace the addressbook's records and advance
+	// the token in one transaction (same guarantee as the CardDAV full
+	// sync). The old code deleted first and upserted after, so a failed
+	// upsert lost the whole addressbook even though the token was not
+	// advanced.
+	if result.IsFullSync {
+		entries := make([]RecordSyncEntry, 0, len(result.Records))
+		for _, sr := range result.Records {
+			if sr.Record == nil {
+				continue
+			}
+			entries = append(entries, RecordSyncEntry{
+				Record:        sr.Record,
+				AddressbookID: ab.ID,
+				Href:          sr.RemoteID, // provider id doubles as href for change detection
+				ETag:          sr.ETag,
+			})
 		}
-	case len(result.DeletedIDs) > 0:
+		if err := retryDBOperation(func() error {
+			return s.store.ReplaceRecordsForAddressbook(ab.ID, entries, result.NextSyncToken)
+		}, 5, 100*time.Millisecond, s.log); err != nil {
+			return fmt.Errorf("failed to replace records for full sync: %w", err)
+		}
+		return nil
+	}
+
+	if len(result.DeletedIDs) > 0 {
 		// Incremental sync: delete the records the provider reported removed.
 		s.log.Debug().Int("count", len(result.DeletedIDs)).Msg("Deleting removed OAuth contacts")
 		if err := retryDBOperation(func() error {
@@ -518,27 +536,17 @@ func (s *Syncer) syncAddressbookFull(client *Client, ab *Addressbook) error {
 		return s.syncAddressbookLegacy(client, ab)
 	}
 
-	// Delete all existing contacts and replace with synced ones
-	deleteErr := retryDBOperation(func() error {
-		return s.store.DeleteContactsForAddressbook(ab.ID)
-	}, 5, 100*time.Millisecond, s.log)
-	if deleteErr != nil {
-		s.log.Warn().Err(deleteErr).Msg("Failed to delete existing contacts after retries")
+	// Replace all existing contacts with the synced ones, atomically: if
+	// the re-insert fails, the old contacts and the old sync token survive
+	// (ReplaceRecordsForAddressbook rolls back) and the error propagates,
+	// so the next sync retries the full sync instead of incrementally
+	// syncing from a token the local store never reached.
+	entries := buildRecordSyncEntries(ab.ID, result.Updated)
+	if err := retryDBOperation(func() error {
+		return s.store.ReplaceRecordsForAddressbook(ab.ID, entries, result.SyncToken)
+	}, 5, 100*time.Millisecond, s.log); err != nil {
+		return fmt.Errorf("failed to replace records for full sync: %w", err)
 	}
-
-	// Insert all records (multi-field).
-	if len(result.Updated) > 0 {
-		entries := buildRecordSyncEntries(ab.ID, result.Updated)
-		upsertErr := retryDBOperation(func() error {
-			return s.store.UpsertRecordsBatch(entries)
-		}, 5, 100*time.Millisecond, s.log)
-		if upsertErr != nil {
-			s.log.Warn().Err(upsertErr).Msg("Failed to batch upsert records after retries")
-		}
-	}
-
-	// Store the sync token for future incremental syncs
-	s.store.UpdateAddressbookSyncToken(ab.ID, result.SyncToken)
 
 	s.log.Info().Str("addressbook", ab.Name).Int("records", len(result.Updated)).Msg("Full sync completed")
 	return nil
@@ -562,27 +570,16 @@ func (s *Syncer) syncAddressbookLegacy(client *Client, ab *Addressbook) error {
 
 	s.log.Info().Int("count", len(parsedContacts)).Str("addressbook", ab.Name).Msg("Fetched contacts")
 
-	// Delete all existing contacts and re-add
-	deleteErr := retryDBOperation(func() error {
-		return s.store.DeleteContactsForAddressbook(ab.ID)
-	}, 5, 100*time.Millisecond, s.log)
-	if deleteErr != nil {
-		s.log.Warn().Err(deleteErr).Msg("Failed to delete existing contacts after retries")
-	}
-
-	// Convert to RecordSyncEntry for the multi-field upsert.
+	// Atomically replace all existing contacts with the fetched ones (same
+	// guarantee as the sync-collection full sync above): a failed re-insert
+	// leaves the old contacts and the old sync token in place and the error
+	// propagates, instead of clearing the token and losing the addressbook.
 	entries := buildRecordSyncEntries(ab.ID, parsedContacts)
-
-	// Batch insert all records.
-	upsertErr := retryDBOperation(func() error {
-		return s.store.UpsertRecordsBatch(entries)
-	}, 5, 100*time.Millisecond, s.log)
-	if upsertErr != nil {
-		s.log.Warn().Err(upsertErr).Msg("Failed to batch upsert records after retries")
+	if err := retryDBOperation(func() error {
+		return s.store.ReplaceRecordsForAddressbook(ab.ID, entries, "")
+	}, 5, 100*time.Millisecond, s.log); err != nil {
+		return fmt.Errorf("failed to replace records for legacy sync: %w", err)
 	}
-
-	// No sync token available with legacy method
-	s.store.UpdateAddressbookSyncToken(ab.ID, "")
 
 	s.log.Info().Str("addressbook", ab.Name).Int("records", len(entries)).Msg("Legacy sync completed")
 	return nil

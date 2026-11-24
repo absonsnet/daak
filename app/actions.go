@@ -1178,8 +1178,33 @@ func (a *App) markAsNotSpamCmds(messageIDs []string) ([]undo.Command, string, er
 	return a.moveToFolderCmds(messageIDs, inboxFolder.ID)
 }
 
+// validateEmptyFolder guards the destructive empty-folder operations. The
+// folder must exist, belong to the given account, and be of the expected
+// type — otherwise a wrong or stale folderID from any caller would
+// permanently delete an arbitrary folder's contents, including Inbox.
+// Checked before any message IDs are even listed.
+func (a *App) validateEmptyFolder(accountID, folderID string, want folder.Type) error {
+	f, err := a.folderStore.Get(folderID)
+	if err != nil {
+		return fmt.Errorf("failed to get folder: %w", err)
+	}
+	if f == nil {
+		return fmt.Errorf("folder not found: %s", folderID)
+	}
+	if f.AccountID != accountID {
+		return fmt.Errorf("folder %s does not belong to account %s", folderID, accountID)
+	}
+	if f.Type != want {
+		return fmt.Errorf("folder %s is %q, not %q — refusing to empty it", folderID, f.Type, want)
+	}
+	return nil
+}
+
 // EmptyTrash permanently deletes all messages in a trash folder
 func (a *App) EmptyTrash(accountID, folderID string) error {
+	if err := a.validateEmptyFolder(accountID, folderID, folder.TypeTrash); err != nil {
+		return err
+	}
 	ids, err := a.messageStore.GetAllIDsByFolder(folderID)
 	if err != nil {
 		return fmt.Errorf("failed to get messages in trash: %w", err)
@@ -1191,9 +1216,20 @@ func (a *App) EmptyTrash(accountID, folderID string) error {
 }
 
 // EmptySpam permanently deletes all messages in a spam folder. Same
-// folder-generic mechanics as EmptyTrash.
+// folder-generic mechanics as EmptyTrash, with its own type guard: a spam
+// folder must never be emptied through the trash path or vice versa.
 func (a *App) EmptySpam(accountID, folderID string) error {
-	return a.EmptyTrash(accountID, folderID)
+	if err := a.validateEmptyFolder(accountID, folderID, folder.TypeSpam); err != nil {
+		return err
+	}
+	ids, err := a.messageStore.GetAllIDsByFolder(folderID)
+	if err != nil {
+		return fmt.Errorf("failed to get messages in spam: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return a.DeletePermanently(ids)
 }
 
 // DeletePermanently permanently deletes messages

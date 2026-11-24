@@ -618,6 +618,12 @@
       close()
     } catch (err) {
       errorMessage = (err as Error)?.message ?? String(err)
+      // A server-side conflict means the server version was kept and the
+      // edit was not applied: pull the server version in so the underlying
+      // view shows the current state once the dialog closes.
+      if (errorMessage.includes('server-side conflict')) {
+        void calendarSources.syncAll()
+      }
     } finally {
       submitting = false
     }
