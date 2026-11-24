@@ -44,7 +44,13 @@ import (
 // ComposeMessage, so signing, encryption, Sent saving, contact
 // updates and draft cleanup behave exactly like a direct send.
 // The draft row is deliberately kept until dispatch: it is the Undo
-// payload, and sendMessage deletes it on success.
+// payload, and sendMessage deletes it on success. The stored
+// ComposeMessage carries the Message-ID assigned at queue time, so
+// a retry or a redispatch after a crash rebuilds the same mail with
+// the same identity; and the queue row is deleted the moment SMTP
+// accepts the mail (via sendMessage's afterSMTP hook), before the
+// Sent-folder save — a crash in that post-send work cannot re-send
+// the mail.
 //
 // Retry policy (see internal/sendqueue/policy.go): transient errors
 // (connect/timeout/DNS/4xx/server-busy) retry with backoff 1m, 2m,
@@ -132,6 +138,16 @@ func (s *sendQueueService) QueueSend(accountID string, msg smtp.ComposeMessage, 
 	// rebuilds at dispatch (signing/encryption happen there).
 	if _, err := msg.ToRFC822(); err != nil {
 		return QueueSendResult{}, fmt.Errorf("failed to build message: %w", err)
+	}
+
+	// Assign the Message-ID once, here, at queue time. The stored
+	// MessageJSON carries it, so every rebuild at dispatch — first
+	// attempt, retry, or redispatch after a crash — emits the same
+	// Message-ID for the same mail. A fresh id per rebuild would let
+	// a crash after SMTP acceptance produce a second copy the server
+	// cannot recognise as a duplicate. A caller-supplied id is kept.
+	if msg.MessageID == "" {
+		msg.MessageID = smtp.NewMessageID()
 	}
 
 	delay, err := s.settings.GetUndoSendDelay()
@@ -487,14 +503,29 @@ func (s *sendQueueService) sendOne(item sendqueue.Item, now time.Time) bool {
 	if full.DraftID != "" && s.draftStore != nil {
 		d, _ = s.draftStore.Get(full.DraftID) // nil when already gone; send anyway
 	}
-	if _, err := s.ops.sendMessage(s.ctx, full.AccountID, msg, d); err != nil {
+	// Record SMTP acceptance durably the moment it happens: the
+	// hook deletes (or marks sent) the queue row before sendMessage
+	// does its post-send work (Sent-folder save, contacts, draft
+	// cleanup). A crash in that post-send work must not re-queue
+	// a mail the server already accepted. The Delete/MarkSent after
+	// sendMessage returns is the fallback for the (already deleted)
+	// row — both are idempotent.
+	markAccepted := func(_ []byte) {
+		if ok, err := s.store.Delete(item.ID); err != nil || !ok {
+			if merr := s.store.MarkSent(item.ID, now); merr != nil {
+				log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Message accepted by SMTP but failed to delete or mark sent")
+			}
+		}
+	}
+	if _, err := s.ops.sendMessageWithHook(s.ctx, full.AccountID, msg, d, markAccepted); err != nil {
 		s.recordFailure(*full, now, err)
 		return false
 	}
-	// Sent: delete the row instead of keeping it as history. If the
-	// delete fails, mark it sent as a fallback — the mail is gone,
-	// and a 'sending' row left behind would be re-queued and re-sent
-	// by the stale-claim reset. The frontend hides sent rows.
+	// Sent: the afterSMTP hook above already deleted the row the
+	// moment SMTP accepted the mail; this is the fallback for a
+	// hook that could not delete it. Either way the row must not
+	// survive as 'sending' — the stale-claim reset would re-queue
+	// and re-send it. Sent rows are deleted, not kept as history.
 	if ok, err := s.store.Delete(item.ID); err != nil || !ok {
 		if merr := s.store.MarkSent(item.ID, now); merr != nil {
 			log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Message sent but failed to delete or mark sent")
@@ -540,6 +571,16 @@ func (s *sendQueueService) sendReactionItem(item sendqueue.Item, now time.Time) 
 		s.recordFailure(item, now, err)
 		return false
 	}
+	// SMTP accepted the reaction: delete (or mark sent) the row
+	// BEFORE the Sent-folder save below. A crash during that save
+	// must not re-queue a reaction the server already accepted —
+	// the pre-built bytes carry a fixed Message-ID, so a redispatch
+	// would otherwise send an identical second copy.
+	if ok, err := s.store.Delete(item.ID); err != nil || !ok {
+		if merr := s.store.MarkSent(item.ID, now); merr != nil {
+			log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Reaction sent but failed to delete or mark sent")
+		}
+	}
 	// Save to Sent via IMAP APPEND exactly like a normal send:
 	// skipped when the provider auto-saves Sent mail, and a save
 	// failure only warns — the send already succeeded, and the Sent
@@ -547,13 +588,6 @@ func (s *sendQueueService) sendReactionItem(item sendqueue.Item, now time.Time) 
 	if acc, accErr := s.ops.accountStore.Get(item.AccountID); accErr == nil && acc != nil && !providerAutoSavesSentMail(acc.IMAPHost) {
 		if err := s.ops.saveToSentFolder(s.ctx, item.AccountID, acc, item.RawMessage); err != nil {
 			log.Warn().Err(err).Str("accountID", item.AccountID).Msg("Failed to save reaction to Sent folder")
-		}
-	}
-	// Sent: delete the row instead of keeping it as history (same
-	// fallback as a normal send — never re-queue a sent mail).
-	if ok, err := s.store.Delete(item.ID); err != nil || !ok {
-		if merr := s.store.MarkSent(item.ID, now); merr != nil {
-			log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Reaction sent but failed to delete or mark sent")
 		}
 	}
 	log.Info().

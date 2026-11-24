@@ -84,7 +84,7 @@ type QueueStats struct {
 	Total     int             `json:"total"`
 	Queued    int             `json:"queued"`
 	Sent      int             `json:"sent"`
-	Failed    int            `json:"failed"`
+	Failed    int             `json:"failed"`
 	Cancelled int             `json:"cancelled"`
 	Runs      []QueueRunStats `json:"runs"`
 }
@@ -362,16 +362,24 @@ func (b *MailMergeBridge) sendOneQueuedItem(sender *hostmm.RawSender, item Queue
 		newlyFailed := b.recordQueueFailure(*full, now, err)
 		return false, newlyFailed
 	}
-	// The run log is the record: write the sent outcome first, then
-	// delete the queue row. If the delete fails, fall back to
-	// marking it sent — a sent mail must never be re-queued.
+	// The queue row is deleted FIRST, before the run log is written:
+	// the row is the only thing a crash can re-queue, and the run
+	// log is post-send bookkeeping. A crash between the SMTP accept
+	// and the delete still leaves a 'sending' row, but that window
+	// no longer includes the run-log write (or the Sent save inside
+	// sender.Send) — and the stored bytes were rendered once at
+	// queue time, so a redispatch re-sends the identical bytes with
+	// the identical Message-ID. If the delete fails, fall back to
+	// marking it sent — a sent mail must never be re-queued. Only
+	// then is the sent outcome recorded in the run log; a crash in
+	// that last step loses a log row, never a duplicate mail.
+	if _, err := b.store.DeleteQueueItem(item.ID); err != nil {
+		_ = b.store.MarkItemSent(item.ID, now)
+	}
 	_ = b.store.SaveRowResult(item.RunID, hostmm.RowResult{
 		Index: item.RowIndex, Email: item.Recipient,
 		Status: hostmm.RowSent, Timestamp: now,
 	})
-	if _, err := b.store.DeleteQueueItem(item.ID); err != nil {
-		_ = b.store.MarkItemSent(item.ID, now)
-	}
 	return true, false
 }
 

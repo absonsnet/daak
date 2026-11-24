@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -411,5 +412,96 @@ func TestQueueReactionFailedDispatchRetries(t *testing.T) {
 	}
 	if len(h.sent) != 1 {
 		t.Fatalf("sent %d messages, want 1", len(h.sent))
+	}
+}
+
+func queuedMessageIDHeader(t *testing.T, raw []byte) string {
+	t.Helper()
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		if strings.HasPrefix(line, "Message-ID:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "Message-ID:"))
+		}
+	}
+	t.Fatal("no Message-ID header in sent bytes")
+	return ""
+}
+
+// TestRetriedSendReusesMessageID is the finding-8 regression test:
+// the server accepts the first attempt but the client loses the
+// acknowledgement (transient error after DATA), so the worker retries
+// — the retry must carry the same Message-ID as the first attempt,
+// not a freshly minted one, so the two copies are recognisably the
+// same mail.
+func TestRetriedSendReusesMessageID(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
+
+	// The queued row stores the Message-ID assigned at queue time.
+	full, err := h.svc.store.GetForSend(res.QueueID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full == nil {
+		t.Fatal("queued item not found")
+	}
+	var stored smtp.ComposeMessage
+	if err := json.Unmarshal([]byte(full.MessageJSON), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.MessageID == "" {
+		t.Fatal("queued message has no Message-ID stored, want one assigned at queue time")
+	}
+
+	// Capture every transmission, including the one the client
+	// treats as failed (server accepted, ack lost).
+	var transmitted [][]byte
+	h.svc.ops.rawSendOverride = func(_ context.Context, _ string, _ []string, raw []byte) error {
+		transmitted = append(transmitted, raw)
+		if h.sendErr != nil {
+			return h.sendErr
+		}
+		return nil
+	}
+	h.sendErr = fmt.Errorf("failed to send message: read tcp: i/o timeout")
+
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 0 {
+		t.Fatalf("dispatchDue(lost ack) = %d, %v, want 0, nil", n, err)
+	}
+	if len(transmitted) != 1 {
+		t.Fatalf("transmitted %d messages on first attempt, want 1", len(transmitted))
+	}
+	item := h.mustItem(t, res.QueueID)
+	if item.Status != sendqueue.StatusPending || item.Attempts != 1 {
+		t.Fatalf("after lost ack: %+v, want pending / 1 attempt", item)
+	}
+
+	// After the backoff, with the connection back: the retry sends.
+	h.now = h.now.Add(time.Minute + time.Second)
+	h.sendErr = nil
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue(retry) = %d, %v, want 1, nil", n, err)
+	}
+	if len(transmitted) != 2 {
+		t.Fatalf("transmitted %d messages, want 2 (first attempt + retry)", len(transmitted))
+	}
+	firstID := queuedMessageIDHeader(t, transmitted[0])
+	retryID := queuedMessageIDHeader(t, transmitted[1])
+	if firstID != retryID {
+		t.Fatalf("retry Message-ID = %q, want the first attempt's %q", retryID, firstID)
+	}
+	if firstID != stored.MessageID {
+		t.Fatalf("transmitted Message-ID = %q, want the queued %q", firstID, stored.MessageID)
+	}
+
+	// Sent rows are deleted: no third copy on a later tick.
+	if got, err := h.svc.store.Get(res.QueueID); err != nil || got != nil {
+		t.Fatalf("Get after retry = %+v, %v, want nil, nil (row deleted)", got, err)
+	}
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 0 {
+		t.Fatalf("dispatchDue(after success) = %d, %v, want 0, nil", n, err)
+	}
+	if len(transmitted) != 2 {
+		t.Fatalf("transmitted %d messages after success, want 2", len(transmitted))
 	}
 }

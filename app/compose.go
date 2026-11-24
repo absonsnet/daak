@@ -443,7 +443,30 @@ func (ops *composeOps) sendRawMessage(ctx context.Context, accountID, from strin
 // save to Sent folder, add recipients to contacts, and optionally delete a draft.
 // When d is non-nil, the draft is fully cleaned up (IMAP + message row + DB) after
 // a successful send. Returns the account for callers that need it post-send.
+//
+// sendMessage is sendMessageWithHook with no hook; see that method for
+// the hook's contract.
 func (ops *composeOps) sendMessage(ctx context.Context, accountID string, msg smtp.ComposeMessage, d *draft.Draft) (*account.Account, error) {
+	return ops.sendMessageWithHook(ctx, accountID, msg, d, nil)
+}
+
+// sendMessageWithHook is sendMessage with an afterSMTP hook. The hook
+// runs immediately after the SMTP transaction succeeds — before the
+// Sent-folder save, contact updates and draft cleanup — and receives
+// the exact bytes that were transmitted. It must never fail the send:
+// the mail is already out, so the hook has no error return; a hook
+// that panics would lose the post-send bookkeeping, so callers keep
+// it to a short durable write.
+//
+// The send-queue worker uses the hook to delete (or mark sent) the
+// queue row the moment SMTP accepts the mail. Before this, the row
+// was only deleted after sendMessage returned, so a crash during the
+// (slow, network) Sent-folder save left a 'sending' row that the
+// stale-claim reset re-queued and re-sent. The hook shrinks that
+// window to the SMTP return itself; combined with the stable
+// Message-ID assigned at queue time, a redispatch after a crash
+// carries the same identity as the first attempt.
+func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string, msg smtp.ComposeMessage, d *draft.Draft, afterSMTP func(raw []byte)) (*account.Account, error) {
 	log := logging.WithComponent("composeOps")
 
 	log.Info().
@@ -526,6 +549,13 @@ func (ops *composeOps) sendMessage(ctx context.Context, accountID string, msg sm
 
 	if err := ops.sendRawMessage(ctx, accountID, msg.From.Address, recipients, rawMsg); err != nil {
 		return nil, err
+	}
+
+	// SMTP accepted the mail: record that durably before any
+	// post-send work (Sent save, contacts, draft cleanup). See
+	// sendMessageWithHook's doc comment.
+	if afterSMTP != nil {
+		afterSMTP(rawMsg)
 	}
 
 	// Save to Sent folder (using IMAP APPEND) if provider doesn't auto-save

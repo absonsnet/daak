@@ -137,3 +137,88 @@ func TestToRFC822_Basic(t *testing.T) {
 		}
 	}
 }
+
+func messageIDHeader(t *testing.T, raw []byte) string {
+	t.Helper()
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		if strings.HasPrefix(line, "Message-ID:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "Message-ID:"))
+		}
+	}
+	t.Fatal("no Message-ID header in built message")
+	return ""
+}
+
+// TestToRFC822_ReusesAssignedMessageID: a message with MessageID set
+// (as QueueSend assigns at queue time) must carry that exact id on
+// every rebuild — a retry or a redispatch after a crash must not mint
+// a new identity for the same mail.
+func TestToRFC822_ReusesAssignedMessageID(t *testing.T) {
+	msg := &ComposeMessage{
+		From:      Address{Address: "me@example.com"},
+		To:        []Address{{Address: "ada@example.com"}},
+		Subject:   "hello",
+		TextBody:  "hi",
+		MessageID: "<queued-id@daak>",
+	}
+	first, err := msg.ToRFC822()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := msg.ToRFC822()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messageIDHeader(t, first); got != "<queued-id@daak>" {
+		t.Fatalf("first build Message-ID = %q, want <queued-id@daak>", got)
+	}
+	if got := messageIDHeader(t, second); got != "<queued-id@daak>" {
+		t.Fatalf("second build Message-ID = %q, want <queued-id@daak>", got)
+	}
+	if string(first) != string(second) {
+		t.Fatalf("rebuilds differ:\n%s\n---\n%s", first, second)
+	}
+}
+
+// TestToRFC822_GeneratesMessageIDWhenUnset: without an assigned id,
+// each build still gets a fresh one (the direct-send path, which
+// never rebuilds the same message).
+func TestToRFC822_GeneratesMessageIDWhenUnset(t *testing.T) {
+	msg := &ComposeMessage{
+		From:     Address{Address: "me@example.com"},
+		To:       []Address{{Address: "ada@example.com"}},
+		Subject:  "hello",
+		TextBody: "hi",
+	}
+	first, err := msg.ToRFC822()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := msg.ToRFC822()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id1, id2 := messageIDHeader(t, first), messageIDHeader(t, second)
+	if id1 == "" || id2 == "" || id1 == id2 {
+		t.Fatalf("unassigned builds got ids %q and %q, want two distinct non-empty ids", id1, id2)
+	}
+}
+
+// TestToRFC822_NormalizesBareMessageID: an id without angle brackets
+// is wrapped, not emitted bare.
+func TestToRFC822_NormalizesBareMessageID(t *testing.T) {
+	msg := &ComposeMessage{
+		From:      Address{Address: "me@example.com"},
+		To:        []Address{{Address: "ada@example.com"}},
+		Subject:   "hello",
+		TextBody:  "hi",
+		MessageID: "bare-id@daak",
+	}
+	raw, err := msg.ToRFC822()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messageIDHeader(t, raw); got != "<bare-id@daak>" {
+		t.Fatalf("Message-ID = %q, want <bare-id@daak>", got)
+	}
+}
