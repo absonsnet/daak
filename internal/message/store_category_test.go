@@ -12,7 +12,7 @@ import (
 // category, never-classified rows counting as Personal), the per-tab
 // counts, and the sender-override write path (set/get/delete + re-file).
 func TestCategory_FilterAndCounts(t *testing.T) {
-	s, accountID, folderID := newBodyFailedTestStore(t)
+	s, _, accountID, folderID := newBodyFailedTestStore(t)
 	now := time.Now().UTC()
 
 	auto := &Message{
@@ -137,7 +137,7 @@ func TestCategory_FilterAndCounts(t *testing.T) {
 // re-file: setting Personal on the automated sender moves its stored mail
 // to the Personal tab and clears the sub-category and extraction.
 func TestSenderCategoryOverride_WritePath(t *testing.T) {
-	s, accountID, folderID := newBodyFailedTestStore(t)
+	s, _, accountID, folderID := newBodyFailedTestStore(t)
 	now := time.Now().UTC()
 
 	m := &Message{

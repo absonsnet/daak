@@ -11,7 +11,7 @@ import (
 // Junk — both classified 'spam' at sync), and Starred is flag-based across
 // all folders and accounts. An unknown type is an error, not an empty list.
 func TestUnifiedFolder_CombinesAcrossAccounts(t *testing.T) {
-	s, acct1, inbox1 := newBodyFailedTestStore(t)
+	s, _, acct1, inbox1 := newBodyFailedTestStore(t)
 	db := s.db
 	now := time.Now().UTC()
 

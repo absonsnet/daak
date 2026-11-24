@@ -11,7 +11,7 @@ import (
 // emails instead of deleting them (a delete would make the next sync
 // re-fetch the UID as new).
 func TestMarkHidden_HidesFromLists(t *testing.T) {
-	s, accountID, folderID := newBodyFailedTestStore(t)
+	s, _, accountID, folderID := newBodyFailedTestStore(t)
 	now := time.Now().UTC()
 
 	visible := &Message{
@@ -113,7 +113,7 @@ func TestMarkHidden_HidesFromLists(t *testing.T) {
 // TestGetInternalIDByMessageID matches Message-IDs with or without angle
 // brackets, as sent in In-Reply-To vs stored from the envelope.
 func TestGetInternalIDByMessageID(t *testing.T) {
-	s, accountID, folderID := newBodyFailedTestStore(t)
+	s, _, accountID, folderID := newBodyFailedTestStore(t)
 
 	m := &Message{
 		ID: "m1", AccountID: accountID, FolderID: folderID,

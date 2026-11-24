@@ -9,7 +9,7 @@ import (
 // actions (only completed methods suppress the button), sender rules,
 // the Subscriptions aggregation, and listing a sender's mail in a folder.
 func TestUnsubscribeStore(t *testing.T) {
-	s, accountID, folderID := newBodyFailedTestStore(t)
+	s, _, accountID, folderID := newBodyFailedTestStore(t)
 	now := time.Now().UTC()
 
 	seed := func(id string, uid uint32, fromEmail, lu string, post bool, date time.Time) {
@@ -115,7 +115,7 @@ func TestUnsubscribeStore(t *testing.T) {
 // carries the stored List-Unsubscribe columns, so the backfill can never
 // wipe a header-time value it cannot recover.
 func TestListUnenrichedPreservesListUnsubscribe(t *testing.T) {
-	s, accountID, folderID := newBodyFailedTestStore(t)
+	s, _, accountID, folderID := newBodyFailedTestStore(t)
 	m := &Message{
 		ID: "u1", AccountID: accountID, FolderID: folderID,
 		UID: 1, Subject: "Newsletter", FromEmail: "news@example.com",

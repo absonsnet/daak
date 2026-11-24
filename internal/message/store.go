@@ -1214,10 +1214,17 @@ func (s *Store) GetHighestUID(folderID string) (uint32, error) {
 // message opened before the background body fetch ran was marked
 // body_fetched=1 with an empty body and its raw body discarded —
 // permanently undecryptable.
+//
+// A body that actually carries usable content (see BodyUpdate.HasUsableContent)
+// also clears body_failed: a message flagged after a transient failure whose
+// body later arrives — on-demand open of a body_fetched=0 row, or a Force
+// Resync — must not keep a stale flag. An empty update leaves the flag
+// alone, so the batch pass can't undo a flag markUnresolvedAsFailed just set.
 func (s *Store) UpdateBody(u BodyUpdate) error {
 	query := `
 		UPDATE messages
 		SET body_html = ?, body_text = ?, snippet = ?, body_fetched = 1, has_attachments = ?,
+		    body_failed = CASE WHEN ? THEN 0 ELSE body_failed END,
 		    smime_raw_body = ?, smime_encrypted = ?,
 		    pgp_raw_body = ?, pgp_encrypted = ?
 		WHERE id = ?
@@ -1232,6 +1239,7 @@ func (s *Store) UpdateBody(u BodyUpdate) error {
 	}
 	_, err := s.db.Exec(query,
 		nullString(u.BodyHTML), nullString(u.BodyText), nullString(u.Snippet), u.HasAttachments,
+		u.HasUsableContent(),
 		smimeRawBody, u.SMIMEEncrypted,
 		pgpRawBody, u.PGPEncrypted,
 		u.MessageID)
@@ -1241,9 +1249,11 @@ func (s *Store) UpdateBody(u BodyUpdate) error {
 	return nil
 }
 
-// GetMessagesWithoutBody returns message IDs that don't have their body fetched yet
 // GetMessagesWithoutBody returns message IDs that don't have their body fetched yet,
 // or have body_fetched=1 but empty body content (self-healing for failed parses).
+// Attachment-only messages are NOT candidates: their fetch succeeded (the
+// attachments were extracted), so re-fetching them every sync would loop
+// forever — they are complete without body text, not failed.
 // If sinceDate is not zero, only returns messages dated on or after that date.
 func (s *Store) GetMessagesWithoutBody(folderID string, limit int, sinceDate time.Time) ([]string, error) {
 	var query string
@@ -1257,7 +1267,7 @@ func (s *Store) GetMessagesWithoutBody(folderID string, limit int, sinceDate tim
 			SELECT id FROM messages
 			WHERE folder_id = ? AND is_hidden = 0 AND (
 				body_fetched = 0 OR
-				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
+				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND has_attachments = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
 			) AND body_failed = 0
 			ORDER BY date DESC
 			LIMIT ?
@@ -1268,7 +1278,7 @@ func (s *Store) GetMessagesWithoutBody(folderID string, limit int, sinceDate tim
 			SELECT id FROM messages
 			WHERE folder_id = ? AND is_hidden = 0 AND (
 				body_fetched = 0 OR
-				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
+				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND has_attachments = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
 			) AND body_failed = 0 AND (date >= ? OR date < '1970-01-01')
 			ORDER BY date DESC
 			LIMIT ?
@@ -1301,6 +1311,7 @@ type MessageWithSize struct {
 // GetMessagesWithoutBodyAndSize returns message IDs and sizes that don't have their body fetched yet,
 // ordered by date descending (newest first). Used for byte-aware batch planning.
 // If sinceDate is not zero, only returns messages dated on or after that date.
+// Attachment-only messages are NOT candidates (see GetMessagesWithoutBody).
 func (s *Store) GetMessagesWithoutBodyAndSize(folderID string, limit int, sinceDate time.Time) ([]MessageWithSize, error) {
 	var query string
 	var rows *sql.Rows
@@ -1313,7 +1324,7 @@ func (s *Store) GetMessagesWithoutBodyAndSize(folderID string, limit int, sinceD
 			SELECT id, size FROM messages
 			WHERE folder_id = ? AND is_hidden = 0 AND (
 				body_fetched = 0 OR
-				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
+				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND has_attachments = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
 			) AND body_failed = 0
 			ORDER BY date DESC
 			LIMIT ?
@@ -1324,7 +1335,7 @@ func (s *Store) GetMessagesWithoutBodyAndSize(folderID string, limit int, sinceD
 			SELECT id, size FROM messages
 			WHERE folder_id = ? AND is_hidden = 0 AND (
 				body_fetched = 0 OR
-				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
+				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND has_attachments = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
 			) AND body_failed = 0 AND (date >= ? OR date < '1970-01-01')
 			ORDER BY date DESC
 			LIMIT ?
@@ -1350,6 +1361,7 @@ func (s *Store) GetMessagesWithoutBodyAndSize(folderID string, limit int, sinceD
 
 // CountMessagesWithoutBody returns the count of messages that don't have their body fetched,
 // or have body_fetched=1 but empty body content (self-healing for failed parses).
+// Attachment-only messages are NOT counted (see GetMessagesWithoutBody).
 // If sinceDate is not zero, only counts messages dated on or after that date.
 func (s *Store) CountMessagesWithoutBody(folderID string, sinceDate time.Time) (int, error) {
 	var count int
@@ -1361,7 +1373,7 @@ func (s *Store) CountMessagesWithoutBody(folderID string, sinceDate time.Time) (
 		err = s.db.QueryRow(
 			`SELECT COUNT(*) FROM messages WHERE folder_id = ? AND is_hidden = 0 AND (
 				body_fetched = 0 OR
-				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
+				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND has_attachments = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
 			) AND body_failed = 0`,
 			folderID,
 		).Scan(&count)
@@ -1369,7 +1381,7 @@ func (s *Store) CountMessagesWithoutBody(folderID string, sinceDate time.Time) (
 		err = s.db.QueryRow(
 			`SELECT COUNT(*) FROM messages WHERE folder_id = ? AND is_hidden = 0 AND (
 				body_fetched = 0 OR
-				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
+				(body_fetched = 1 AND smime_encrypted = 0 AND pgp_encrypted = 0 AND has_attachments = 0 AND (body_text IS NULL OR body_text = '') AND (body_html IS NULL OR body_html = ''))
 			) AND body_failed = 0 AND (date >= ? OR date < '1970-01-01')`,
 			folderID, sinceDate,
 		).Scan(&count)
@@ -1520,6 +1532,18 @@ type BodyUpdate struct {
 	SMIMEEncrypted     bool
 	PGPRawBody         []byte
 	PGPEncrypted       bool
+}
+
+// HasUsableContent reports whether a fetched body carries anything worth
+// keeping: body text/HTML, an encrypted payload (decryptable on view), or
+// attachments. This is the shared "resolved" definition for the body_failed
+// flag: markUnresolvedAsFailed (internal/sync) and the flag-clearing in
+// UpdateBody/UpdateBodiesBatch must agree, or a message flips between
+// flagged and cleared on every sync. In particular an attachment-only
+// message is resolved — it legitimately has no body text, and flagging it
+// would leave it permanently body-less for no reason.
+func (u BodyUpdate) HasUsableContent() bool {
+	return u.BodyHTML != "" || u.BodyText != "" || u.SMIMEEncrypted || u.PGPEncrypted || u.HasAttachments
 }
 
 // UpdateEnrichment persists a sync-time enrichment result for one message.
@@ -2196,7 +2220,9 @@ func (s *Store) IsAttentionDismissed(messageID string) (bool, error) {
 	return count > 0, nil
 }
 
-// UpdateBodiesBatch updates body content for multiple messages in a single transaction
+// UpdateBodiesBatch updates body content for multiple messages in a single transaction.
+// An update carrying usable content (see BodyUpdate.HasUsableContent) also
+// clears body_failed for that row; an empty update leaves the flag alone.
 func (s *Store) UpdateBodiesBatch(updates []BodyUpdate) error {
 	if len(updates) == 0 {
 		return nil
@@ -2212,6 +2238,7 @@ func (s *Store) UpdateBodiesBatch(updates []BodyUpdate) error {
 		UPDATE messages
 		SET body_html = ?, body_text = ?, snippet = ?, body_fetched = 1,
 		    has_attachments = ?,
+		    body_failed = CASE WHEN ? THEN 0 ELSE body_failed END,
 		    smime_status = ?, smime_signer_email = ?, smime_signer_subject = ?,
 		    smime_raw_body = ?, smime_encrypted = ?,
 		    pgp_raw_body = ?, pgp_encrypted = ?
@@ -2246,6 +2273,7 @@ func (s *Store) UpdateBodiesBatch(updates []BodyUpdate) error {
 		_, err := stmt.Exec(
 			nullString(u.BodyHTML), nullString(u.BodyText), nullString(u.Snippet),
 			u.HasAttachments,
+			u.HasUsableContent(),
 			nullString(u.SMIMEStatus), nullString(u.SMIMESignerEmail), nullString(u.SMIMESignerSubject),
 			smimeRawBody, u.SMIMEEncrypted,
 			pgpRawBody, u.PGPEncrypted,
@@ -2305,10 +2333,14 @@ func (s *Store) GetPGPRawBody(messageID string) ([]byte, error) {
 // ClearBodiesForFolder clears body content for all messages in a folder.
 // This resets body_html, body_text, snippet to NULL and body_fetched to 0,
 // allowing the messages to be re-fetched and re-parsed during the next body sync.
+// It also resets body_failed to 0: a message whose body failed once (transient
+// timeout, or a parser that has since improved) must be retried by the
+// Force Resync, not skipped forever by the flag — otherwise clearing the
+// bodies changes nothing for exactly the messages that need it most.
 func (s *Store) ClearBodiesForFolder(folderID string) (int64, error) {
 	query := `
 		UPDATE messages
-		SET body_html = NULL, body_text = NULL, snippet = NULL, body_fetched = 0
+		SET body_html = NULL, body_text = NULL, snippet = NULL, body_fetched = 0, body_failed = 0
 		WHERE folder_id = ?
 	`
 	result, err := s.db.Exec(query, folderID)
@@ -3190,8 +3222,9 @@ func (s *Store) UpdateFlagsBatch(ids []string, isRead, isStarred *bool) error {
 // MarkBodyFailed flags messages whose body fetch+parse produced no usable content
 // so they are excluded from future body-fetch queries (GetMessagesWithoutBody and
 // friends). Idempotent: re-flagging an already-flagged row is a no-op. The flag
-// survives across sessions; clear it via a one-off migration if a future parser
-// improvement should retry these messages.
+// is cleared by a Force Resync (ClearBodiesForFolder resets it for the whole
+// folder) or by a later body persist that carries usable content
+// (UpdateBody/UpdateBodiesBatch) — it is a retry gate, not a permanent verdict.
 //
 // Without this persistent flag, an unparseable message stays empty in the local
 // DB, GetMessagesWithoutBody picks it up next sync, IMAP FETCH runs again, parse
