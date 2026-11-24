@@ -1448,13 +1448,19 @@
       // A draft that is already queued (its undo window is still
       // open) is rejected by the backend instead of sending twice:
       // keep the composer open and say so, rather than showing the
-      // generic failure toast.
+      // generic failure toast. Likewise a queued message whose
+      // countdown toast could not be shown (the detached composer's
+      // IPC notification to the main window failed): the send WILL
+      // happen unless undone from the Outbox, so say that instead
+      // of "failed to send".
       const message = err instanceof Error ? err.message : String(err)
       addToast({
         type: 'error',
         message: message.includes('already queued for send')
           ? $_('composer.alreadyQueuedForSend')
-          : $_('composer.failedToSend'),
+          : message.includes('could not be notified')
+            ? $_('composer.queuedButToastUnavailable')
+            : $_('composer.failedToSend'),
       })
     } finally {
       sending = false

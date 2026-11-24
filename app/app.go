@@ -1042,6 +1042,15 @@ func (a *App) BeforeClose(ctx context.Context) bool {
 // applies when it is first shown from the tray or single-instance activation.
 func (a *App) NotifyStartupComplete() {
 	platform.NotifyStartupComplete()
+	// Restore Undo countdowns for sends queued before a restart.
+	// The frontend is mounted and listening by now (it calls this),
+	// so re-emitted sendqueue:queued events reach the toast store.
+	// Fires even when starting hidden: the window's frontend mounts
+	// either way, and the toast is waiting when the window is first
+	// shown from the tray.
+	if a.sendQueue != nil {
+		a.sendQueue.ReemitPendingCountdowns()
+	}
 	if a.appStateStore == nil || a.GetStartHiddenActive() {
 		return
 	}
