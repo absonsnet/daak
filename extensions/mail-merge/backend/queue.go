@@ -373,7 +373,7 @@ func (b *MailMergeBridge) sendOneQueuedItem(sender *hostmm.RawSender, item Queue
 	// marking it sent — a sent mail must never be re-queued. Only
 	// then is the sent outcome recorded in the run log; a crash in
 	// that last step loses a log row, never a duplicate mail.
-	if _, err := b.store.DeleteQueueItem(item.ID); err != nil {
+	if _, err := b.store.DeleteSendingQueueItem(item.ID); err != nil {
 		_ = b.store.MarkItemSent(item.ID, now)
 	}
 	_ = b.store.SaveRowResult(item.RunID, hostmm.RowResult{
@@ -575,7 +575,10 @@ func (b *MailMergeBridge) MailMerge_ResumeQueuedRun(runID string) error {
 }
 
 // MailMerge_CancelQueuedItem cancels one queued message (never sent):
-// the run log records it skipped, then the queue row is deleted.
+// the run log records it skipped, then the queue row is deleted. An
+// item already claimed for sending is refused ("already sending"):
+// its send proceeds regardless, so cancelling it would delete the
+// row and then let the send overwrite the log as sent.
 func (b *MailMergeBridge) MailMerge_CancelQueuedItem(itemID string) error {
 	if !b.gateEnabled() {
 		return nil
@@ -589,6 +592,9 @@ func (b *MailMergeBridge) MailMerge_CancelQueuedItem(itemID string) error {
 	}
 	if item == nil {
 		return fmt.Errorf("mail-merge: queue item %q not found", itemID)
+	}
+	if item.Status == QueueStatusSending {
+		return fmt.Errorf("mail-merge: queue item %q is already sending", itemID)
 	}
 	ok, err := b.store.DeleteQueueItem(itemID)
 	if err != nil {

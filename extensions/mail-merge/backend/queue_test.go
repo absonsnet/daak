@@ -319,6 +319,135 @@ func TestQueuePauseResumeCancel(t *testing.T) {
 	}
 }
 
+// TestQueueCancelInFlightItemRefused is the finding-15 regression
+// test: cancelling an item already claimed for sending must be
+// refused — the row stays 'sending', the run log is not rewritten,
+// and the claimed send still goes out.
+func TestQueueCancelInFlightItemRefused(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	fakeNow := time.Now().UTC().Truncate(time.Second)
+	env.bridge.nowFunc = func() time.Time { return fakeNow }
+
+	runID := startLaterRun(t, env, testBridgeRows()[:1])
+	items, err := env.bridge.MailMerge_ListQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue items %d, want 1", len(items))
+	}
+	item := items[0]
+	claimed, err := env.bridge.store.ClaimItem(item.ID, fakeNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatal("claim must succeed for a queued item")
+	}
+	// Cancel is refused while the send is in flight.
+	if err := env.bridge.MailMerge_CancelQueuedItem(item.ID); err == nil || !strings.Contains(err.Error(), "already sending") {
+		t.Fatalf("cancel in-flight must fail with already-sending, got %v", err)
+	}
+	// The row is still 'sending' and the run log still says queued
+	// — nothing was deleted, nothing rewritten.
+	got, err := env.bridge.store.GetQueueItem(item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Status != QueueStatusSending {
+		t.Fatalf("item after refused cancel %+v, want sending", got)
+	}
+	run, err := env.bridge.MailMerge_GetRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.QueuedCount != 1 || len(run.Rows) != 1 || run.Rows[0].Status != hostmm.RowQueued {
+		t.Fatalf("run after refused cancel %+v, want 1 queued row", run)
+	}
+	// The claimed send still goes out: the stale-claim reset
+	// re-queues it and dispatch sends it.
+	if _, err := env.bridge.store.ResetStaleSending(fakeNow.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := env.bridge.MailMerge_SendUnsent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Sent != 1 {
+		t.Fatalf("dispatch after refused cancel %+v, want 1 sent", res)
+	}
+	run, err = env.bridge.MailMerge_GetRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.SentCount != 1 || run.QueuedCount != 0 {
+		t.Fatalf("run after dispatch %+v, want sent 1", run)
+	}
+}
+
+// TestQueueCancelRunLeavesInFlightItem is the finding-15 run-level
+// case: cancelling a whole run deletes its queued items but leaves
+// an in-flight ('sending') item alone — its send proceeds and its
+// log row records the real outcome.
+func TestQueueCancelRunLeavesInFlightItem(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	fakeNow := time.Now().UTC().Truncate(time.Second)
+	env.bridge.nowFunc = func() time.Time { return fakeNow }
+
+	runID := startLaterRun(t, env, testBridgeRows()[:2])
+	items, err := env.bridge.MailMerge_ListQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("queue items %d, want 2", len(items))
+	}
+	claimed, err := env.bridge.store.ClaimItem(items[0].ID, fakeNow)
+	if err != nil || !claimed {
+		t.Fatalf("claim %v %v", claimed, err)
+	}
+	if err := env.bridge.MailMerge_CancelQueuedRun(runID); err != nil {
+		t.Fatal(err)
+	}
+	// The queued item is gone and skipped in the log; the in-flight
+	// item is untouched.
+	got, err := env.bridge.store.GetQueueItem(items[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Status != QueueStatusSending {
+		t.Fatalf("in-flight item after run cancel %+v, want sending", got)
+	}
+	if gone, err := env.bridge.store.GetQueueItem(items[1].ID); err != nil || gone != nil {
+		t.Fatalf("queued item after run cancel %+v err %v, want gone", gone, err)
+	}
+	run, err := env.bridge.MailMerge_GetRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.SkippedCount != 1 || run.QueuedCount != 1 {
+		t.Fatalf("run after run cancel %+v, want 1 skipped / 1 queued", run)
+	}
+	// The in-flight send still goes out.
+	if _, err := env.bridge.store.ResetStaleSending(fakeNow.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := env.bridge.MailMerge_SendUnsent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Sent != 1 {
+		t.Fatalf("dispatch after run cancel %+v, want 1 sent", res)
+	}
+	run, err = env.bridge.MailMerge_GetRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.SentCount != 1 || run.SkippedCount != 1 {
+		t.Fatalf("run after dispatch %+v, want sent 1 / skipped 1", run)
+	}
+}
+
 func TestQueueRetryFailedAndMaxAttempts(t *testing.T) {
 	env := newBridgeTestEnv(t)
 	fakeNow := time.Now().UTC().Truncate(time.Second)

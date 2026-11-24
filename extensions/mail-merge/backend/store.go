@@ -653,7 +653,7 @@ func (s *Store) ClaimItem(id string, now time.Time) (bool, error) {
 
 // MarkItemSent marks a claimed item sent. It is only the fallback
 // when deleting the row fails (a sent mail must never be re-queued):
-// the normal path deletes the row — see DeleteQueueItem.
+// the normal path deletes the row — see DeleteSendingQueueItem.
 func (s *Store) MarkItemSent(id string, sentAt time.Time) error {
 	_, err := s.DB().Exec(`
 		UPDATE mailmerge_queue_items
@@ -666,13 +666,17 @@ func (s *Store) MarkItemSent(id string, sentAt time.Time) error {
 	return nil
 }
 
-// DeleteQueueItem deletes one queued/sending item — the normal
-// outcome of a successful send or a cancel. Returns false when the
-// item is already sent/failed (or gone).
+// DeleteQueueItem deletes one QUEUED item — the normal outcome of a
+// cancel. It never deletes a 'sending' item: a claimed send proceeds
+// regardless of the delete, so deleting it would let the send
+// complete and then upsert a RowSent log over the skipped row. The
+// dispatch path deletes its own claimed rows via
+// DeleteSendingQueueItem after a successful send. Returns false when
+// the item is already sent/failed (or gone).
 func (s *Store) DeleteQueueItem(id string) (bool, error) {
 	res, err := s.DB().Exec(`
 		DELETE FROM mailmerge_queue_items
-		WHERE id = ? AND status IN ('queued', 'sending')
+		WHERE id = ? AND status = 'queued'
 	`, id)
 	if err != nil {
 		return false, fmt.Errorf("mail-merge: delete queue item: %w", err)
@@ -684,12 +688,32 @@ func (s *Store) DeleteQueueItem(id string) (bool, error) {
 	return n == 1, nil
 }
 
-// DeleteRunQueueItems deletes every queued/sending item of a run.
-// Returns the deleted count.
+// DeleteSendingQueueItem deletes one item the dispatcher claimed
+// ('sending') after its send succeeded. Only the dispatch path uses
+// it — cancel paths must never touch a claimed row.
+func (s *Store) DeleteSendingQueueItem(id string) (bool, error) {
+	res, err := s.DB().Exec(`
+		DELETE FROM mailmerge_queue_items
+		WHERE id = ? AND status = 'sending'
+	`, id)
+	if err != nil {
+		return false, fmt.Errorf("mail-merge: delete sending queue item: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mail-merge: delete sending queue item rows: %w", err)
+	}
+	return n == 1, nil
+}
+
+// DeleteRunQueueItems deletes every QUEUED item of a run (the cancel
+// path). In-flight ('sending') items are left alone: their send
+// proceeds and their log rows record the real outcome. Returns the
+// deleted count.
 func (s *Store) DeleteRunQueueItems(runID string) (int, error) {
 	res, err := s.DB().Exec(`
 		DELETE FROM mailmerge_queue_items
-		WHERE run_id = ? AND status IN ('queued', 'sending')
+		WHERE run_id = ? AND status = 'queued'
 	`, runID)
 	if err != nil {
 		return 0, fmt.Errorf("mail-merge: delete run queue items: %w", err)
