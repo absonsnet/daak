@@ -579,6 +579,89 @@ func (s *Store) DeleteRecordsForAddressbook(addressbookID string) error {
 	return nil
 }
 
+// ReplaceRecordsForAddressbook atomically replaces every record held by an
+// addressbook with entries, then advances the addressbook's sync token —
+// delete, upserts, state rows, and token update all in one transaction.
+//
+// The previous full-sync path deleted first and upserted afterwards in
+// separate calls, swallowing upsert failures: one transient DB failure
+// silently lost the whole addressbook locally and still advanced the token,
+// so the next (incremental) sync never re-fetched the deleted contacts.
+// Here any failure — the delete, any single upsert, a state row, or the
+// token update — rolls the whole transaction back, so the old contacts and
+// the old token survive and the next sync retries the full sync.
+func (s *Store) ReplaceRecordsForAddressbook(addressbookID string, entries []RecordSyncEntry, syncToken string) error {
+	if addressbookID == "" {
+		return fmt.Errorf("replace records: addressbook id is required")
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Delete the addressbook's current records. The FK cascade on
+	// carddav_record_state removes the state rows with them.
+	if _, err := tx.Exec(`
+		DELETE FROM contact_records
+		WHERE id IN (SELECT record_id FROM carddav_record_state WHERE addressbook_id = ?)
+	`, addressbookID); err != nil {
+		return fmt.Errorf("delete records for addressbook: %w", err)
+	}
+
+	now := time.Now()
+	for _, e := range entries {
+		if e.Record == nil {
+			return fmt.Errorf("replace records: nil record for href %q", e.Href)
+		}
+		if e.Href == "" {
+			return fmt.Errorf("replace records: record href is required")
+		}
+		if e.AddressbookID != "" && e.AddressbookID != addressbookID {
+			return fmt.Errorf("replace records: entry addressbook %q does not match %q", e.AddressbookID, addressbookID)
+		}
+		if e.Record.ID == "" {
+			e.Record.ID = uuid.New().String()
+		}
+		e.Record.Source = "carddav"
+		e.Record.SourceRef = addressbookID
+
+		// Strict: unlike UpsertRecordsBatch, a failed record fails the
+		// whole replace — swallowing it here would silently drop that
+		// contact while still advancing the token.
+		if err := contact.UpsertRecordTx(tx, e.Record); err != nil {
+			return fmt.Errorf("upsert record %s: %w", e.Href, err)
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO carddav_record_state (record_id, addressbook_id, href, etag, synced_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(record_id) DO UPDATE SET
+				addressbook_id = excluded.addressbook_id,
+				href = excluded.href,
+				etag = excluded.etag,
+				synced_at = excluded.synced_at
+		`, e.Record.ID, addressbookID, e.Href, e.ETag, now); err != nil {
+			return fmt.Errorf("upsert record state %s: %w", e.Href, err)
+		}
+	}
+
+	// Advance the token only as part of the same transaction, so a failed
+	// replace leaves the old token in place and the next sync retries.
+	if _, err := tx.Exec(`
+		UPDATE contact_source_addressbooks
+		SET sync_token = ?, last_synced_at = ?
+		WHERE id = ?
+	`, syncToken, now, addressbookID); err != nil {
+		return fmt.Errorf("update addressbook sync token: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit replace records: %w", err)
+	}
+	return nil
+}
+
 // ============================================================================
 // Contact CRUD — Phase 2b.2.a
 //
