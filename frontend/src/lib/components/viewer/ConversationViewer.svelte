@@ -324,15 +324,28 @@
 
     cleanupFunctions.push(
       EventsOn('messages:updated', (data: { accountId: string; folderId: string }) => {
-        if (threadId && folderId && accountId && data.accountId === accountId && data.folderId === folderId) {
-          scheduleRefresh(threadId, folderId)
+        if (threadId && folderId && accountId && data.accountId === accountId) {
+          if (data.folderId === folderId) {
+            scheduleRefresh(threadId, folderId)
+          } else {
+            // A reaction email lands in the Inbox while the reacted-to
+            // message may live in Sent (or another folder): the open
+            // thread is unaffected, but its pills may have changed.
+            loadReactionsForExpanded()
+          }
         }
       })
     )
 
     cleanupFunctions.push(
       EventsOn('folder:synced', (data: { accountId: string; folderId: string }) => {
-        if (threadId && folderId && accountId && data.accountId === accountId && data.folderId === folderId) {
+        if (threadId && folderId && accountId && data.accountId === accountId) {
+          if (data.folderId !== folderId) {
+            // Same-account, other-folder sync (see messages:updated above):
+            // only the pills may have changed.
+            loadReactionsForExpanded()
+            return
+          }
           // If conversation hasn't loaded yet or errored, do a full load
           if (!conversation || error) {
             loadConversation(threadId, folderId)
@@ -498,7 +511,14 @@
       if (updated.messages.length === conversation.messages.length) {
         const currentLatestId = conversation.messages[conversation.messages.length - 1]?.id
         const updatedLatestId = updated.messages[updated.messages.length - 1]?.id
-        if (currentLatestId === updatedLatestId) return
+        if (currentLatestId === updatedLatestId) {
+          // A reaction recorded against an open message changes neither
+          // the count nor the latest id — reload reactions anyway so a
+          // pill that arrived while the thread is open still appears
+          // without reopening the conversation.
+          loadReactionsForExpanded()
+          return
+        }
       }
 
       // Something changed — update conversation, preserving scroll position
