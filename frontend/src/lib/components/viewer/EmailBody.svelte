@@ -132,7 +132,7 @@
 
   // Returns the chrome bg as `hsl(...)` for the iframe element's outer
   // background, matching the rendered dark-mail surface so the rounded
-  // corner clip has no color seam.
+  // corner clip blends with no visible edge.
   function getChromeBgHsl(): string {
     const styles = getComputedStyle(document.documentElement)
     const bg = styles.getPropertyValue('--background').trim()
