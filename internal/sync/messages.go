@@ -31,6 +31,47 @@ import (
 // IDLE-triggered inbox sync (new-mail + cross-client deletions), which needs to be
 // light; the scheduled sync passes false so it stays the authoritative full
 // reconciliation. Deletion detection (the UID diff below) is unaffected either way.
+// reconcileUIDs compares local and remote UID sets for one folder sync and
+// reports which UIDs are new on the server, which local UIDs are missing
+// from the server listing, and whether the missing set must NOT be deleted.
+//   - emptyRemote is set when the server listed nothing while local mail
+//     exists: an empty SEARCH result cannot distinguish a transient failure
+//     (or, with a sync period, mail that merely arrived before the SINCE
+//     window) from a real wipe.
+//   - massDelete is set when more than half the folder (over 10 messages)
+//     is missing: a transient partial listing looks identical.
+//
+// In both cases the safe side is to keep the local copies; small deletions
+// (the normal expunge path) are unaffected, so legitimate deletes still
+// propagate immediately.
+func reconcileUIDs(localUIDs, remoteUIDs []uint32) (newUIDs, deletedUIDs []uint32, emptyRemote, massDelete bool) {
+	remoteSet := make(map[uint32]bool, len(remoteUIDs))
+	for _, uid := range remoteUIDs {
+		remoteSet[uid] = true
+	}
+	localSet := make(map[uint32]bool, len(localUIDs))
+	for _, uid := range localUIDs {
+		localSet[uid] = true
+	}
+	for uid := range remoteSet {
+		if !localSet[uid] {
+			newUIDs = append(newUIDs, uid)
+		}
+	}
+	for uid := range localSet {
+		if !remoteSet[uid] {
+			deletedUIDs = append(deletedUIDs, uid)
+		}
+	}
+	if len(remoteUIDs) == 0 && len(localUIDs) > 0 {
+		emptyRemote = true
+	}
+	if len(localUIDs) > 10 && len(deletedUIDs) > len(localUIDs)/2 {
+		massDelete = true
+	}
+	return newUIDs, deletedUIDs, emptyRemote, massDelete
+}
+
 func (e *Engine) SyncMessages(ctx context.Context, accountID, folderID string, syncPeriodDays int, preferIncremental bool) error {
 	// Check context at start
 	if ctx.Err() != nil {
@@ -174,10 +215,24 @@ func (e *Engine) SyncMessages(ctx context.Context, accountID, folderID string, s
 		Dur("lockWait", lockWait).
 		Msg("UID comparison")
 
+	// Compare UID sets. reconcileUIDs also applies the mass-delete
+	// safeguards: an empty remote listing, or more than half the folder
+	// missing, is unconfirmed (a transient empty/partial SEARCH result —
+	// or, with a sync period, mail that merely arrived before the SINCE
+	// window — looks identical), so nothing is deleted in those cases.
+	newUIDs, deletedUIDs, emptyRemote, massDelete := reconcileUIDs(localUIDs, remoteUIDs)
+
 	// SAFEGUARD: If remote returns empty but we have local messages, something is wrong
-	// This could be a network issue, server error, or connection problem
-	// Do NOT delete local messages in this case (unless we're using date filtering)
-	if len(remoteUIDs) == 0 && len(localUIDs) > 0 && syncPeriodDays == 0 {
+	// This could be a network issue, server error, or connection problem.
+	// Do NOT delete local messages in this case: an empty SEARCH result
+	// cannot distinguish "everything was expunged" from a transient
+	// failure, and with a sync period it can also mean every local message
+	// merely arrived before the SINCE window while the server still holds
+	// them. This guard used to be disabled exactly when a sync period was
+	// in use (the default 30 days), so a transient empty result deleted
+	// the whole folder. Local copies linger until the sync-period purge
+	// ages them out; that is safe, mass deletion is not.
+	if emptyRemote {
 		e.log.Warn().
 			Str("folder", f.Path).
 			Int("localCount", len(localUIDs)).
@@ -196,30 +251,22 @@ func (e *Engine) SyncMessages(ctx context.Context, accountID, folderID string, s
 		remoteUIDSet[uid] = true
 	}
 
-	// Find new UIDs (on server but not local)
-	var newUIDs []uint32
-	for uid := range remoteUIDSet {
-		if !localUIDSet[uid] {
-			newUIDs = append(newUIDs, uid)
-		}
-	}
-
-	// Find deleted UIDs (local but not on server within sync period)
-	var deletedUIDs []uint32
-	for uid := range localUIDSet {
-		if !remoteUIDSet[uid] {
-			deletedUIDs = append(deletedUIDs, uid)
-		}
-	}
-
-	// SAFEGUARD: Warn if we're about to delete a large percentage of messages
-	// This could indicate a problem with the sync rather than actual deletions
-	if len(localUIDs) > 10 && len(deletedUIDs) > len(localUIDs)/2 && syncPeriodDays == 0 {
+	// SAFEGUARD: Refuse to delete more than half of the local messages in
+	// one sync. A mass disappearance usually means a transient partial
+	// listing — or, with a sync period, messages that merely arrived before
+	// the SINCE window — not a real mass expunge, and deleting them destroys
+	// local state the server still holds. Individual expunges (at or below
+	// half) still delete normally in the loop below. A genuine mass delete
+	// lingers locally until the sync-period purge ages it out (or manual
+	// deletion, with no sync period).
+	if massDelete {
 		e.log.Warn().
 			Str("folder", f.Path).
 			Int("localCount", len(localUIDs)).
 			Int("deletedCount", len(deletedUIDs)).
-			Msg("About to delete more than 50% of local messages - this may indicate a sync issue")
+			Msg("Refusing to delete more than 50% of local messages - keeping local copies")
+		// Clearing the list skips the delete loop below.
+		deletedUIDs = nil
 	}
 
 	// Check if this is a Gmail account — messages hidden by Trash/Spam label
