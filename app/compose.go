@@ -79,6 +79,34 @@ type composeOps struct {
 	// contacts source IDs (see microsoftContactsSourceForAccount).
 	msContactsSourceCache   map[string]string
 	msContactsSourceCacheMu sync.Mutex
+
+	// oauthRefreshLocksMu guards oauthRefreshLocks. oauthRefreshLocks
+	// serialises token refreshes per account (audit finding 23):
+	// getValidOAuthToken is called concurrently from IMAP sync, the
+	// send-queue worker, CardDAV and contacts auto-add, and with rotating
+	// refresh tokens two concurrent refreshes can make the second fail
+	// invalid_grant even though a valid token was just stored. Holding
+	// the per-account lock across the refresh and re-reading the stored
+	// tokens after acquiring it means only one refresh runs per account
+	// and every other caller reuses the fresh tokens.
+	oauthRefreshLocksMu sync.Mutex
+	oauthRefreshLocks   map[string]*sync.Mutex
+}
+
+// oauthRefreshLock returns the refresh mutex for an account, creating it
+// on first use.
+func (ops *composeOps) oauthRefreshLock(accountID string) *sync.Mutex {
+	ops.oauthRefreshLocksMu.Lock()
+	defer ops.oauthRefreshLocksMu.Unlock()
+	if ops.oauthRefreshLocks == nil {
+		ops.oauthRefreshLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := ops.oauthRefreshLocks[accountID]
+	if !ok {
+		mu = &sync.Mutex{}
+		ops.oauthRefreshLocks[accountID] = mu
+	}
+	return mu
 }
 
 // getValidOAuthToken returns a valid OAuth token, refreshing if needed.
@@ -92,6 +120,26 @@ func (ops *composeOps) getValidOAuthToken(ctx context.Context, accountID string)
 	}
 
 	// Check if token expires within 5 minutes
+	if !tokens.IsExpiringSoon(5 * time.Minute) {
+		return tokens, nil
+	}
+
+	// Serialize refreshes for this account: without the lock, two
+	// concurrent callers both read the same expiring tokens and both
+	// refresh, and with rotating refresh tokens the second refresh fails
+	// invalid_grant on the already-rotated token. Other accounts refresh
+	// independently — the lock is per account, not global.
+	mu := ops.oauthRefreshLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Re-read after acquiring the lock: a caller that held the lock
+	// before us may have just refreshed and stored fresh tokens, in
+	// which case there is nothing left to refresh.
+	tokens, err = ops.credStore.GetOAuthTokens(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get OAuth tokens: %w", err)
+	}
 	if !tokens.IsExpiringSoon(5 * time.Minute) {
 		return tokens, nil
 	}

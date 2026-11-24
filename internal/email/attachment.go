@@ -3,17 +3,15 @@ package email
 
 import (
 	"bytes"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"mime"
-	"mime/quotedprintable"
 	"path/filepath"
 	"strings"
 
+	"github.com/absonsnet/daak/internal/message"
 	gomessage "github.com/emersion/go-message"
 	"github.com/google/uuid"
-	"github.com/absonsnet/daak/internal/message"
 	"github.com/teamwork/tnef"
 )
 
@@ -67,14 +65,82 @@ func (e *AttachmentExtractor) ExtractAttachments(messageID string, raw []byte) (
 		return nil, fmt.Errorf("failed to parse message: %w", err)
 	}
 
-	var attachments []*AttachmentData
-
 	// Check if it's a multipart message
 	if mr := entity.MultipartReader(); mr != nil {
-		attachments = e.extractFromMultipart(messageID, mr)
+		return e.extractFromMultipart(messageID, mr), nil
 	}
 
-	return attachments, nil
+	// Single-part message: the whole entity may itself be the attachment
+	// (e.g. a DMARC report whose body is application/zip). Without this
+	// branch a single-part attachment lists no downloadable rows.
+	return e.extractFromSinglePart(messageID, entity), nil
+}
+
+// extractFromSinglePart classifies a single-part entity as an attachment,
+// mirroring the sync parser's parseSinglePartBody classification so the two
+// paths agree on what counts: an explicit attachment disposition, or a
+// non-text body that is not a signature part.
+func (e *AttachmentExtractor) extractFromSinglePart(messageID string, entity *gomessage.Entity) []*AttachmentData {
+	contentType, params, _ := mime.ParseMediaType(entity.Header.Get("Content-Type"))
+	disposition, dispParams, _ := mime.ParseMediaType(entity.Header.Get("Content-Disposition"))
+	contentID := strings.Trim(entity.Header.Get("Content-ID"), "<>")
+
+	// Signature parts are never downloadable attachments.
+	if isSignaturePart(contentType) {
+		return nil
+	}
+
+	isNonTextBody := contentType != "" && !strings.HasPrefix(contentType, "text/") &&
+		!isSignaturePart(contentType)
+	if disposition != "attachment" && !isNonTextBody {
+		return nil
+	}
+
+	filename := dispParams["filename"]
+	if filename == "" {
+		filename = params["name"]
+	}
+	if filename == "" {
+		filename = FallbackFilename(contentType)
+	}
+	if decodedFilename, err := decodeRFC2047(filename); err == nil {
+		filename = decodedFilename
+	}
+
+	// entity.Body is already transfer-decoded by go-message.
+	content, err := io.ReadAll(entity.Body)
+	if err != nil {
+		return nil
+	}
+
+	isInline := disposition == "inline" || contentID != ""
+	att := &message.Attachment{
+		ID:          uuid.New().String(),
+		MessageID:   messageID,
+		Filename:    filename,
+		ContentType: contentType,
+		Size:        len(content),
+		ContentID:   contentID,
+		IsInline:    isInline && contentID != "",
+	}
+
+	return []*AttachmentData{{Attachment: att, Content: content}}
+}
+
+// isSignaturePart returns true for S/MIME and PGP signature content types
+// that should not be exposed as downloadable attachments. Must mirror
+// isSignaturePart in internal/sync/parse.go — the two cannot share one
+// (sync imports this package, so the reverse import would be a cycle).
+// The sync parser never sees these parts (signed messages are unwrapped
+// before its walk) but this extractor walks raw bytes, so the exclusion
+// has to live here too.
+func isSignaturePart(contentType string) bool {
+	switch contentType {
+	case "application/pkcs7-signature", "application/x-pkcs7-signature",
+		"application/pgp-signature":
+		return true
+	}
+	return false
 }
 
 // extractFromMultipart extracts attachments from a multipart message
@@ -111,6 +177,12 @@ func (e *AttachmentExtractor) extractFromMultipart(messageID string, mr gomessag
 			continue
 		}
 
+		// Signature parts (S/MIME, PGP) are not downloadable attachments:
+		// without this a signed message gains spurious signature files.
+		if isSignaturePart(contentType) {
+			continue
+		}
+
 		// Determine if this is an attachment
 		isAttachment := disposition == "attachment"
 		isInline := disposition == "inline" || contentID != ""
@@ -137,29 +209,27 @@ func (e *AttachmentExtractor) extractFromMultipart(messageID string, mr gomessag
 				filename = decodedFilename
 			}
 
-			// Read content
+			// Read content (already transfer-decoded by go-message — do not
+			// decode again: decoded content that happens to be valid base64
+			// would silently come back as shorter garbage bytes).
 			content, err := io.ReadAll(part.Body)
 			if err != nil {
 				continue
 			}
-
-			// Decode content if transfer-encoded
-			transferEncoding := strings.ToLower(part.Header.Get("Content-Transfer-Encoding"))
-			decodedContent := decodeContent(content, transferEncoding)
 
 			att := &message.Attachment{
 				ID:          uuid.New().String(),
 				MessageID:   messageID,
 				Filename:    filename,
 				ContentType: contentType,
-				Size:        len(decodedContent),
+				Size:        len(content),
 				ContentID:   contentID,
 				IsInline:    isInline && contentID != "",
 			}
 
 			attachments = append(attachments, &AttachmentData{
 				Attachment: att,
-				Content:    decodedContent,
+				Content:    content,
 			})
 		}
 	}
@@ -233,31 +303,8 @@ func (e *AttachmentExtractor) extractFromTNEF(messageID string, reader io.Reader
 	return attachments
 }
 
-// decodeContent decodes content based on transfer encoding
-func decodeContent(content []byte, encoding string) []byte {
-	switch encoding {
-	case "base64":
-		decoded := make([]byte, base64.StdEncoding.DecodedLen(len(content)))
-		n, err := base64.StdEncoding.Decode(decoded, content)
-		if err != nil {
-			return content
-		}
-		return decoded[:n]
-	case "quoted-printable":
-		reader := quotedprintable.NewReader(bytes.NewReader(content))
-		decoded, err := io.ReadAll(reader)
-		if err != nil {
-			return content
-		}
-		return decoded
-	default:
-		return content
-	}
-}
-
 // decodeRFC2047 decodes RFC 2047 encoded strings (like filenames)
 func decodeRFC2047(s string) (string, error) {
 	dec := new(mime.WordDecoder)
 	return dec.DecodeHeader(s)
 }
-

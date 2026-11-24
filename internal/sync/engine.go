@@ -60,6 +60,12 @@ type ParsedBody struct {
 	PGPRawBody     []byte                 // Raw PGP body for on-view processing
 	PGPEncrypted   bool                   // Whether the message is PGP encrypted
 	UnsafeContent  bool                   // True if message has non-compliant encoding
+	// Truncated is set when the stored body is only the first part of the
+	// message: a MIME part hit the 10 MB cap or the whole message hit the
+	// 50 MB cap (audit finding 26). The partial body is still stored
+	// (with body_fetched=1 — a re-fetch would hit the same cap), but the
+	// flag is persisted as body_truncated so the viewer can disclose it.
+	Truncated bool
 	// Reaction is set when the message is an email reaction (Gmail's
 	// text/vnd.google.email-reaction+json part or an RFC 9078
 	// Content-Disposition: reaction part). Nil for regular messages.

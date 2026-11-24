@@ -305,21 +305,29 @@ func (a *App) GetAutostart() (bool, error) {
 
 // SetAutostart sets whether Daak starts on login.
 // Manages the XDG autostart .desktop file or Flatpak Background portal.
+//
+// The OS effect runs FIRST and the setting is persisted only after it
+// succeeds: a failed Enable/Disable (e.g. a Flatpak portal D-Bus
+// failure) leaves the stored value untouched, so the Settings toggle
+// never reports a state that isn't real. A no-op (already at the
+// requested value) skips the OS call entirely, as before.
 func (a *App) SetAutostart(enabled bool) error {
 	// Check current value to avoid unnecessary OS-level changes
 	// (e.g., Flatpak Background portal D-Bus calls that may fail)
 	current, _ := a.settingsStore.GetAutostart()
 
-	if err := a.settingsStore.SetAutostart(enabled); err != nil {
-		return err
+	if a.autostartMgr != nil && current != enabled {
+		var err error
+		if enabled {
+			err = a.autostartMgr.Enable()
+		} else {
+			err = a.autostartMgr.Disable()
+		}
+		if err != nil {
+			return err
+		}
 	}
-	if a.autostartMgr == nil || current == enabled {
-		return nil
-	}
-	if enabled {
-		return a.autostartMgr.Enable()
-	}
-	return a.autostartMgr.Disable()
+	return a.settingsStore.SetAutostart(enabled)
 }
 
 // GetSpellcheckEnabled returns whether composer spellcheck is on (defaults on)

@@ -46,10 +46,11 @@ type Message struct {
 	HasAttachments bool `json:"hasAttachments"`
 
 	// Body (may be empty until fetched)
-	BodyText    string `json:"bodyText,omitempty"`
-	BodyHTML    string `json:"bodyHtml,omitempty"`
-	BodyFetched bool   `json:"bodyFetched"` // Whether full body has been downloaded
-	BodyFailed  bool   `json:"-"`           // Set when fetch+parse produced no usable content; excludes from body-fetch queue (server-internal; not exposed to frontend)
+	BodyText      string `json:"bodyText,omitempty"`
+	BodyHTML      string `json:"bodyHtml,omitempty"`
+	BodyFetched   bool   `json:"bodyFetched"`             // Whether full body has been downloaded
+	BodyTruncated bool   `json:"bodyTruncated,omitempty"` // Stored body is only the first part: the message (or a part) hit Daak's 10 MB part / 50 MB message cap, so the rest was never stored. Exposed so the viewer can say so; a re-fetch would hit the same cap.
+	BodyFailed    bool   `json:"-"`                       // Set when fetch+parse produced no usable content; excludes from body-fetch queue (server-internal; not exposed to frontend)
 
 	// Sync-time enrichment (Phase A; see internal/enrich). ExtractValue
 	// holds a one-time code or a booking reference: never log it.

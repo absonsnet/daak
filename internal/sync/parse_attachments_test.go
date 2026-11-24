@@ -77,3 +77,94 @@ func TestParseAttachments_FiveFilesNotDoubled(t *testing.T) {
 		}
 	}
 }
+
+// Audit finding 22: these pin the LEGACY parseMessageBody path — the one
+// buildMessageFromStreamedData (via FetchServerMessage) uses to set
+// HasAttachments, which gates whether the extractor runs at all. The modern
+// parser already classified these correctly; the legacy path did not.
+
+// A single-part body that is itself an attachment must set hasAttachments
+// (and must not dump the raw attachment bytes into the body text).
+func TestParseMessageBody_SinglePartAttachment(t *testing.T) {
+	raw := "From: a@example.com\r\n" +
+		"To: b@example.com\r\n" +
+		"Subject: Report\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: application/zip; name=\"report.zip\"\r\n" +
+		"Content-Disposition: attachment; filename=\"report.zip\"\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"UEsDBAoAAAAA\r\n"
+
+	bodyText, _, hasAttachments, _ := testEngine().parseMessageBody([]byte(raw))
+	if !hasAttachments {
+		t.Fatalf("hasAttachments = false, want true for single-part attachment")
+	}
+	if bodyText != "" {
+		t.Errorf("bodyText = %q, want empty (attachment bytes are not body text)", bodyText)
+	}
+}
+
+// A plain single-part text message is body text, not an attachment.
+func TestParseMessageBody_SinglePartTextNotAttachment(t *testing.T) {
+	raw := "From: a@example.com\r\n" +
+		"To: b@example.com\r\n" +
+		"Subject: Hi\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"Hello there\r\n"
+
+	bodyText, _, hasAttachments, _ := testEngine().parseMessageBody([]byte(raw))
+	if hasAttachments {
+		t.Fatalf("hasAttachments = true, want false for single-part text")
+	}
+	if strings.TrimSpace(bodyText) != "Hello there" {
+		t.Errorf("bodyText = %q, want %q", bodyText, "Hello there")
+	}
+}
+
+// A signed message's signature part must not set hasAttachments on its own:
+// otherwise the message shows a paperclip with no downloadable rows (the
+// extractor now correctly returns zero attachments for it).
+func TestParseMessageBody_SignedMultipartNoAttachments(t *testing.T) {
+	raw := "From: a@example.com\r\n" +
+		"To: b@example.com\r\n" +
+		"Subject: Signed\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/signed; boundary=\"SIG\"; protocol=\"application/pkcs7-signature\"\r\n" +
+		"\r\n" +
+		"--SIG\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"Signed body\r\n" +
+		"--SIG\r\n" +
+		"Content-Type: application/pkcs7-signature; name=\"smime.p7s\"\r\n" +
+		"Content-Disposition: attachment; filename=\"smime.p7s\"\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"AAECAwQFBgc=\r\n" +
+		"--SIG--\r\n"
+
+	_, _, hasAttachments, _ := testEngine().parseMessageBody([]byte(raw))
+	if hasAttachments {
+		t.Fatalf("hasAttachments = true, want false (signature part only)")
+	}
+}
+
+// A message whose whole body is a signature part is not an attachment.
+func TestParseMessageBody_SinglePartSignatureNotAttachment(t *testing.T) {
+	raw := "From: a@example.com\r\n" +
+		"To: b@example.com\r\n" +
+		"Subject: Sig\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: application/pkcs7-signature; name=\"smime.p7s\"\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"AAECAwQFBgc=\r\n"
+
+	_, _, hasAttachments, _ := testEngine().parseMessageBody([]byte(raw))
+	if hasAttachments {
+		t.Fatalf("hasAttachments = true, want false for single-part signature")
+	}
+}
