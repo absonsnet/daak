@@ -404,7 +404,7 @@ func TestServiceSigningWithoutKeyFailsBeforeSending(t *testing.T) {
 		Rows:        testRows(),
 		DeliverMode: "later",
 		AccountID:   testSigningAccount,
-	}, func(QueuedMessage) { queued++ }, nil)
+	}, func(QueuedMessage) error { queued++; return nil }, nil)
 	if err == nil {
 		t.Fatal("expected RenderForQueue to fail with no signer configured")
 	}
@@ -508,7 +508,7 @@ func TestServiceQueueSignsAtRenderTime(t *testing.T) {
 		Rows:        testRows(),
 		DeliverMode: "later",
 		AccountID:   testSigningAccount,
-	}, func(qm QueuedMessage) { queued = append(queued, qm) }, nil)
+	}, func(qm QueuedMessage) error { queued = append(queued, qm); return nil }, nil)
 	if err != nil {
 		t.Fatalf("RenderForQueue: %v", err)
 	}

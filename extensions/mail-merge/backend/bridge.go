@@ -891,10 +891,10 @@ func (b *MailMergeBridge) launchQueueExecution(run *hostmm.Run, req hostmm.RunRe
 		}
 		now := b.queueNow()
 		outcome, err := b.deps.Service.RenderForQueue(ctx, req,
-			func(qm hostmm.QueuedMessage) {
+			func(qm hostmm.QueuedMessage) error {
 				if indexMap != nil {
 					if qm.RowIndex < 0 || qm.RowIndex >= len(indexMap) {
-						return
+						return nil
 					}
 					qm.RowIndex = indexMap[qm.RowIndex]
 				}
@@ -914,7 +914,10 @@ func (b *MailMergeBridge) launchQueueExecution(run *hostmm.Run, req hostmm.RunRe
 					NextAttemptAt: now,
 					CreatedAt:     now,
 				}
-				_ = b.store.EnqueueItem(item)
+				// An enqueue failure is returned so the service
+				// records the row failed (not queued) and does not
+				// mark the address seen — see finding 17.
+				return b.store.EnqueueItem(item)
 			},
 			func(r hostmm.RowResult) {
 				if indexMap != nil {
