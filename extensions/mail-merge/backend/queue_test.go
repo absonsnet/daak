@@ -143,6 +143,57 @@ func TestQueueLaterRunEnqueueSendUnsent(t *testing.T) {
 	}
 }
 
+// TestBridgeLaterRunEnqueueFailureSurfacesFailedRow is the
+// finding-17 regression test: when persisting a rendered row to the
+// outbox queue fails, the row is recorded failed — never "queued"
+// for a message that is not in the queue — and the failure is
+// visible on the run.
+func TestBridgeLaterRunEnqueueFailureSurfacesFailedRow(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	// Force init so the store exists, then break enqueueing by
+	// dropping the queue table: EnqueueItem fails, while the run
+	// log (a different table) still works.
+	if _, err := env.bridge.MailMerge_ListRuns(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.bridge.store.DB().Exec("DROP TABLE mailmerge_queue_items"); err != nil {
+		t.Fatal(err)
+	}
+	runID, err := env.bridge.MailMerge_StartRun(hostmm.RunRequest{
+		Template: testBridgeTemplate(), Rows: testBridgeRows(),
+		DeliverMode: "later", AccountID: "acc1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRun(t, env.bridge, runID)
+	if run.Status != hostmm.RunDone {
+		t.Fatalf("run status %q, want done (rows failed, none queued)", run.Status)
+	}
+	if run.FailedCount != 3 || len(run.Rows) != 3 || run.QueuedCount != 0 {
+		t.Fatalf("run %+v, want 3 failed rows, 0 queued", run)
+	}
+	for i, r := range run.Rows {
+		if r.Status != hostmm.RowFailed || r.Index != i || !strings.Contains(r.Error, "enqueue") {
+			t.Fatalf("row %d %+v, want failed with an enqueue error", i, r)
+		}
+	}
+	if len(env.sender.sent) != 0 {
+		t.Fatalf("nothing must be sent: %v", env.sender.sent)
+	}
+	// The failed rows are resumable: the queue table is still
+	// missing, so the resumed run fails the same way — but Resume
+	// proceeds instead of erroring with "no failed rows".
+	newID, err := env.bridge.MailMerge_ResumeRun(runID)
+	if err != nil {
+		t.Fatalf("resume from enqueue-failed rows must proceed: %v", err)
+	}
+	newRun := waitForRun(t, env.bridge, newID)
+	if newRun.FailedCount != 3 {
+		t.Fatalf("resumed run %+v, want 3 failed rows", newRun)
+	}
+}
+
 func TestQueuePerHourCap(t *testing.T) {
 	env := newBridgeTestEnv(t)
 	fakeNow := time.Now().UTC().Truncate(time.Second)
