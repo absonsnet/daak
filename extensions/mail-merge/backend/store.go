@@ -89,6 +89,17 @@ ALTER TABLE mailmerge_runs ADD COLUMN queued_count INTEGER NOT NULL DEFAULT 0;
 DELETE FROM mailmerge_queue_items WHERE status IN ('sent', 'cancelled');
 `,
 	},
+	{
+		// v4 (v0.7.38, audit 16): a whole-run failure gets its own
+		// terminal status ('failed', distinct from 'cancelled') and
+		// the error that ended the run, so the run is resumable and
+		// the failure is visible instead of recorded as cancelled
+		// with an empty log.
+		Version: 4,
+		SQL: `
+ALTER TABLE mailmerge_runs ADD COLUMN error TEXT NOT NULL DEFAULT '';
+`,
+	},
 }
 
 // Store wraps the per-extension DB for the Mail Merge extension. Lives
@@ -165,11 +176,11 @@ func (s *Store) SaveRun(run *hostmm.Run, req hostmm.RunRequest) error {
 	_, err = s.DB().Exec(`
 		INSERT INTO mailmerge_runs
 			(id, account_id, deliver_mode, status, source_kind, total_rows,
-			 sent_count, failed_count, skipped_count, held_count, queued_count, request_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 sent_count, failed_count, skipped_count, held_count, queued_count, error, request_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, run.ID, run.AccountID, run.DeliverMode, run.Status, req.SourceKind,
 		run.TotalRows, run.SentCount, run.FailedCount, run.SkippedCount, run.HeldCount,
-		run.QueuedCount,
+		run.QueuedCount, run.Error,
 		string(raw), run.CreatedAt.UTC().Format(time.RFC3339Nano), run.CreatedAt.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("mail-merge: save run: %w", err)
@@ -178,16 +189,17 @@ func (s *Store) SaveRun(run *hostmm.Run, req hostmm.RunRequest) error {
 }
 
 // UpdateRunStatusAndCounts rewrites a run's status + counts from the
-// in-memory Run (after progress or completion).
+// in-memory Run (after progress or completion), including the
+// whole-run error (RunFailed only; "" otherwise).
 func (s *Store) UpdateRunStatusAndCounts(run *hostmm.Run) error {
 	_, err := s.DB().Exec(`
 		UPDATE mailmerge_runs
 		SET status = ?, sent_count = ?, failed_count = ?, skipped_count = ?,
-			held_count = ?, queued_count = ?, total_rows = ?, updated_at = ?
+			held_count = ?, queued_count = ?, total_rows = ?, error = ?, updated_at = ?
 		WHERE id = ?
 	`, run.Status, run.SentCount, run.FailedCount, run.SkippedCount, run.HeldCount,
 		run.QueuedCount,
-		run.TotalRows, time.Now().UTC().Format(time.RFC3339Nano), run.ID)
+		run.TotalRows, run.Error, time.Now().UTC().Format(time.RFC3339Nano), run.ID)
 	if err != nil {
 		return fmt.Errorf("mail-merge: update run: %w", err)
 	}
@@ -217,11 +229,11 @@ func (s *Store) GetRun(runID string) (*hostmm.Run, error) {
 	var createdAt, updatedAt string
 	err := s.DB().QueryRow(`
 		SELECT id, account_id, deliver_mode, status, total_rows,
-			sent_count, failed_count, skipped_count, held_count, queued_count, created_at, updated_at
+			sent_count, failed_count, skipped_count, held_count, queued_count, error, created_at, updated_at
 		FROM mailmerge_runs WHERE id = ?
 	`, runID).Scan(&run.ID, &run.AccountID, &run.DeliverMode, &run.Status,
 		&run.TotalRows, &run.SentCount, &run.FailedCount, &run.SkippedCount,
-		&run.HeldCount, &run.QueuedCount, &createdAt, &updatedAt)
+		&run.HeldCount, &run.QueuedCount, &run.Error, &createdAt, &updatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -282,7 +294,7 @@ func (s *Store) GetRunRequest(runID string) (hostmm.RunRequest, error) {
 func (s *Store) ListRuns() ([]hostmm.RunSummary, error) {
 	rows, err := s.DB().Query(`
 		SELECT id, account_id, deliver_mode, status, total_rows,
-			sent_count, failed_count, skipped_count, held_count, queued_count, created_at
+			sent_count, failed_count, skipped_count, held_count, queued_count, error, created_at
 		FROM mailmerge_runs ORDER BY created_at DESC, id DESC
 	`)
 	if err != nil {
@@ -295,7 +307,7 @@ func (s *Store) ListRuns() ([]hostmm.RunSummary, error) {
 		var createdAt string
 		if err := rows.Scan(&sum.ID, &sum.AccountID, &sum.DeliverMode, &sum.Status,
 			&sum.TotalRows, &sum.SentCount, &sum.FailedCount, &sum.SkippedCount,
-			&sum.HeldCount, &sum.QueuedCount, &createdAt); err != nil {
+			&sum.HeldCount, &sum.QueuedCount, &sum.Error, &createdAt); err != nil {
 			return nil, fmt.Errorf("mail-merge: scan run: %w", err)
 		}
 		if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {

@@ -94,6 +94,13 @@ const (
 	// outbox queue: the run itself finished, but nothing was sent yet.
 	// The queue runner (or Send Unsent) moves the rows to sent.
 	RunQueued = "queued"
+	// RunFailed is a run that failed before/without per-row results
+	// (e.g. SMTP connect failed, signing pre-flight failed, bad
+	// base64 attachment): no row was delivered. It is distinct from
+	// RunCancelled — a failed run carries the error and every
+	// unprocessed row is recorded RowFailed, so ResumeRun can
+	// re-run it.
+	RunFailed = "failed"
 )
 
 // Run is a persisted merge run with its per-row log.
@@ -102,7 +109,7 @@ type Run struct {
 	CreatedAt    time.Time   `json:"createdAt"`
 	AccountID    string      `json:"accountId"`
 	DeliverMode  string      `json:"deliverMode"`
-	Status       string      `json:"status"` // running | done | cancelled | held | queued
+	Status       string      `json:"status"` // running | done | cancelled | held | queued | failed
 	TotalRows    int         `json:"totalRows"`
 	SentCount    int         `json:"sentCount"`
 	FailedCount  int         `json:"failedCount"`
@@ -110,6 +117,9 @@ type Run struct {
 	HeldCount    int         `json:"heldCount"`
 	QueuedCount  int         `json:"queuedCount"`
 	Rows         []RowResult `json:"rows"`
+	// Error is the whole-run failure that ended the run (RunFailed
+	// only): e.g. the SMTP connect error. "" otherwise.
+	Error string `json:"error,omitempty"`
 }
 
 // RunSummary is Run without the per-row log, for list views.
@@ -125,6 +135,8 @@ type RunSummary struct {
 	SkippedCount int       `json:"skippedCount"`
 	HeldCount    int       `json:"heldCount"`
 	QueuedCount  int       `json:"queuedCount"`
+	// Error is the whole-run failure (RunFailed only); see Run.Error.
+	Error string `json:"error,omitempty"`
 }
 
 // Summary derives a RunSummary from a Run.
@@ -134,7 +146,7 @@ func (r *Run) Summary() RunSummary {
 		DeliverMode: r.DeliverMode, Status: r.Status, TotalRows: r.TotalRows,
 		SentCount: r.SentCount, FailedCount: r.FailedCount,
 		SkippedCount: r.SkippedCount, HeldCount: r.HeldCount,
-		QueuedCount: r.QueuedCount,
+		QueuedCount: r.QueuedCount, Error: r.Error,
 	}
 }
 
@@ -163,7 +175,7 @@ func (r *Run) RecomputeCounts() {
 // available) so the dialog can point at the account's Security tab.
 type SigningInfo struct {
 	Available   bool   `json:"available"`
-	Kind        string `json:"kind"` // "smime" | "pgp" | ""
+	Kind        string `json:"kind"`        // "smime" | "pgp" | ""
 	DefaultSign bool   `json:"defaultSign"` // the composer's sign policy is "always" for the resolved kind
 	Reason      string `json:"reason,omitempty"`
 }
