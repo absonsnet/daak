@@ -98,21 +98,27 @@ type unsubscribeDeps struct {
 }
 
 // statusForMessage derives one message's unsubscribe status. Folder
-// eligibility is Inbox or Spam only; a missing folder degrades to
-// unavailable rather than failing the whole call.
+// eligibility is Inbox or Spam only. A folder that cannot be resolved
+// (empty FolderID, lookup error, deleted folder) defaults to unavailable
+// and returns early — it must never fall through to the header check,
+// which would offer unsubscribe on Sent/Drafts mail whose folder row
+// is gone.
 func (d *unsubscribeDeps) statusForMessage(msg *message.Message) *UnsubscribeStatus {
 	st := &UnsubscribeStatus{
 		MessageID:   msg.ID,
 		SenderEmail: msg.FromEmail,
 		SenderName:  msg.FromName,
 	}
-	if msg.FolderID != "" {
-		if f, err := d.folderStore.Get(msg.FolderID); err == nil && f != nil {
-			st.IsSpam = f.Type == folder.TypeSpam
-			if f.Type != folder.TypeInbox && f.Type != folder.TypeSpam {
-				return st
-			}
-		}
+	if msg.FolderID == "" {
+		return st
+	}
+	f, err := d.folderStore.Get(msg.FolderID)
+	if err != nil || f == nil {
+		return st
+	}
+	st.IsSpam = f.Type == folder.TypeSpam
+	if f.Type != folder.TypeInbox && f.Type != folder.TypeSpam {
+		return st
 	}
 	if strings.TrimSpace(msg.ListUnsubscribe) == "" {
 		return st
