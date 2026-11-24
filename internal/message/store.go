@@ -1393,10 +1393,23 @@ func (s *Store) CountByFolder(folderID string) (int, error) {
 
 // DeleteOlderThan deletes messages older than the specified time for an account
 // Returns the number of messages deleted
-func (s *Store) DeleteOlderThan(accountID string, before time.Time) (int, error) {
+// DeleteOlderThan deletes messages in one folder whose first-seen time is
+// older than the given cutoff (the sync-period purge). The retention clock
+// is received_at — when Daak first saw the message, which for promptly
+// synced mail is effectively the arrival time — NOT the header Date: a
+// missing/invalid Date stores as zero (below every cutoff) and an old Date
+// on a recently arrived message would otherwise be deleted on every sync
+// and re-fetched forever (bodies re-downloaded, unread counts flickering,
+// the message never settling). Rows with a zero/NULL received_at are never
+// purged here, and the purge is scoped to the folder being synced, so old
+// mail in other folders is untouched.
+func (s *Store) DeleteOlderThan(accountID, folderID string, before time.Time) (int, error) {
 	result, err := s.db.Exec(
-		"DELETE FROM messages WHERE account_id = ? AND date < ?",
-		accountID, before,
+		`DELETE FROM messages
+		 WHERE account_id = ? AND folder_id = ?
+		   AND received_at IS NOT NULL AND received_at > '1970-01-01'
+		   AND received_at < ?`,
+		accountID, folderID, before,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete old messages: %w", err)

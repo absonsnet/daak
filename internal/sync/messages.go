@@ -126,7 +126,7 @@ func (e *Engine) SyncMessages(ctx context.Context, accountID, folderID string, s
 			Msg("Using date-based sync filter")
 
 		// Delete local messages older than sync period
-		deleted, err := e.messageStore.DeleteOlderThan(accountID, sinceDate)
+		deleted, err := e.messageStore.DeleteOlderThan(accountID, folderID, sinceDate)
 		if err != nil {
 			e.log.Warn().Err(err).Msg("Failed to delete old messages")
 		} else if deleted > 0 {
@@ -740,6 +740,19 @@ func (e *Engine) fetchAllUIDs(ctx context.Context, client *imapclient.Client) ([
 	}
 }
 
+// effectiveHeaderDate returns the Date to store for a synced header: the
+// envelope Date, falling back to the IMAP internal date (the server's
+// record of arrival time) when the header has no usable Date. Without the
+// fallback a dateless message stores a zero date, which sorts wrong and
+// used to be purged on every period sync. Shared by the primary header
+// fetch and the no-ENVELOPE recovery.
+func effectiveHeaderDate(headerDate, internalDate time.Time) time.Time {
+	if headerDate.IsZero() && !internalDate.IsZero() {
+		return internalDate.UTC()
+	}
+	return headerDate
+}
+
 // fetchMessageHeaders fetches only headers (envelope, flags) for the given UIDs.
 // Messages are saved with BodyFetched=false, bodies to be fetched later.
 func (e *Engine) fetchMessageHeaders(ctx context.Context, client *imapclient.Client, accountID, folderID string, uids []uint32) error {
@@ -808,6 +821,7 @@ func (e *Engine) fetchMessageHeaders(ctx context.Context, client *imapclient.Cli
 		var flags []imap.Flag
 		var rfc822Size int64
 		var headerBytes []byte
+		var internalDate time.Time
 
 		for {
 			item := msg.Next()
@@ -824,6 +838,8 @@ func (e *Engine) fetchMessageHeaders(ctx context.Context, client *imapclient.Cli
 				flags = data.Flags
 			case imapclient.FetchItemDataRFC822Size:
 				rfc822Size = data.Size
+			case imapclient.FetchItemDataInternalDate:
+				internalDate = data.Time
 			case imapclient.FetchItemDataBodySection:
 				// Read header bytes from literal reader
 				if data.Literal != nil {
@@ -863,6 +879,11 @@ func (e *Engine) fetchMessageHeaders(ctx context.Context, client *imapclient.Cli
 
 		// Parse envelope using shared helper
 		applyEnvelopeToMessage(m, envelope)
+
+		// Fall back to the server's arrival time when the message has no
+		// Date header, so it is not stored with a zero date (same fallback
+		// as the recovery path).
+		m.Date = effectiveHeaderDate(m.Date, internalDate)
 
 		// Extract References and read receipt header from header bytes
 		var references []string
