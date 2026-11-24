@@ -60,13 +60,15 @@
       </div>
 
       <div class="space-y-4 max-h-[60vh] overflow-y-auto text-sm">
-        <p>🚀 Welcome to {APP_NAME} v0.7.36!</p>
+        <p>🚀 Welcome to {APP_NAME} v0.7.37!</p>
 
-        <p>v0.7.36 fixes received reactions and the list highlight:</p>
+        <p>v0.7.37 fixes ten reliability issues found in the whole-app audit:</p>
 
         <ul class="list-disc pl-6 space-y-1">
-          <li>👍 Outlook reaction emails now show as pills on the original message, and a reaction arriving while its thread is open appears without reopening the conversation</li>
-          <li>🎯 The highlighted row now always matches the message open in the preview pane — including on launch, when the list used to highlight the first message while the preview showed the restored one</li>
+          <li>🔒 Encrypted messages stay decryptable when opened before the background body fetch, and a header re-sync no longer wipes an already-fetched body</li>
+          <li>🛡 An empty server reply or a mass disappearance no longer deletes local mail, and an empty body fetch no longer deletes the local message — including just-moved messages</li>
+          <li>📅 A CalDAV conflict now shows a clear error naming the event instead of silently overwriting the server copy, and Empty Spam/Trash now verify the folder before deleting anything</li>
+          <li>✉️ Sends are crash-safe with one stable Message-ID per mail, and a queued draft can't be re-sent during the undo window — edits made in the window survive</li>
         </ul>
 
         <p>🏷 See the full change log here:</p>

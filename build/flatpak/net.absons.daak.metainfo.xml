@@ -375,6 +375,13 @@
   </provides>
 
   <releases>
+    <release version="0.7.37" date="2026-11-24">
+      <description>
+        <ul>
+          <li>Ten audit fixes: encrypted messages stay decryptable, CardDAV sync is atomic, empty-server and mass-delete safeguards, no more ghost deletions, CalDAV conflicts surface instead of overwriting, sync-period purge fixed, Empty Spam/Trash guarded, crash-safe sends with a stable Message-ID, queued drafts locked during undo, and header sync no longer wipes fetched bodies</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.36" date="2026-11-24">
       <description>
         <ul>

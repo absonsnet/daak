@@ -1,5 +1,19 @@
 # CHANGELOG
 
+**v0.7.37 - 24-11-2026**
+---
+
+- An encrypted message opened before the background body fetch runs no longer loses its raw body: the on-demand fetch and the server-message fetch now persist the raw S/MIME/PGP bodies, so the message stays decryptable, and an encrypted message whose raw body wasn't captured is left unfetched instead of being marked fetched-but-blank
+- CardDAV full sync is now atomic: the delete, re-insert and sync-token advance happen in one transaction, so a failed re-insert keeps the old contacts and the old token and the next sync retries the full sync
+- An empty server reply no longer deletes local mail, whether or not a sync period is in use, and a disappearance of more than half a folder is now refused instead of only warned about — small deletions (the normal expunge path) still delete immediately
+- An empty body fetch no longer deletes the local message, and a just-moved message (negative placeholder UID) is no longer fetched under a bogus UID and deleted as a ghost — the placeholder is refused until the destination sync resolves it
+- A CalDAV 412 now surfaces a conflict naming the event instead of silently overwriting the server copy: the server version is kept and re-fetched, and an unconditional retry happens only after a re-fetch proves the server copy unchanged
+- The sync-period purge no longer deletes dateless or old-dated-but-recently-arrived mail: it now compares first-seen time instead of the header Date, is scoped to the folder being synced, and never purges zero-date rows — and the header path falls back to the server's internal date when a message has no Date header
+- Empty Spam and Empty Trash now verify the folder belongs to the account and is the right type (spam/trash) before deleting anything — a wrong or stale folder ID is rejected
+- Sends are now crash-safe: one Message-ID is assigned at queue time and reused on every rebuild/retry, and the queue row is cleared the moment SMTP accepts, before the Sent-folder save — so a crash mid-send cannot re-send the mail. Mail Merge deletes its queue row before writing the run-log row
+- A queued draft can no longer be re-sent during the undo window (QueueSend rejects a draft that already has a live queue row), and edits made during the window survive: dispatch sends the queued snapshot, Undo restores the snapshot, and an edited draft is kept after dispatch instead of being deleted
+- A header re-sync no longer wipes an already-fetched body or changes the message's id: the header Upsert now updates header/flag/enrichment columns only, reuses the stored id on conflict, and received_at is first-seen time
+
 **v0.7.36 - 24-11-2026**
 ---
 
