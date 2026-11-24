@@ -71,10 +71,14 @@ func (s *CallbackServer) Start(ctx context.Context) (int, error) {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	// Start server in background
+	// Start server in background. Capture the server in a local: Stop
+	// nils s.server under mu, and the goroutine must not race that read
+	// (a fast cancel right after Start used to panic here on a nil
+	// *http.Server).
+	srv := s.server
 	go func() {
 		s.log.Info().Int("port", port).Msg("Starting OAuth callback server")
-		if err := s.server.Serve(listener); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			s.log.Error().Err(err).Msg("Callback server error")
 		}
 	}()
