@@ -1,5 +1,28 @@
 # CHANGELOG
 
+**v0.7.38 - 24-11-2026**
+---
+
+- A message whose body failed to download once is no longer stuck forever: Force Resync now retries it, attachment-only messages are never marked failed, and a reaction in a previously failed message is detected once the body is re-fetched
+- The Unsubscribe mailto subject and sender name are now stripped of line breaks before sending, so a crafted List-Unsubscribe header can no longer inject extra headers into mail sent from your account
+- One-click unsubscribe no longer reports success when the endpoint never received the request: redirects that would turn the POST into a GET (301/302/303) and https-to-http downgrades are refused; 307/308 redirects re-send the POST over https only
+- A failed Mail Merge row no longer poisons duplicate suppression: an address is only marked seen after its row actually succeeds, so later rows to the same address send normally and failed rows can be resumed
+- Cancelling a Mail Merge run no longer deletes in-flight sending rows: only queued rows are cancelled; an in-flight row reports "already sending" and still sends, with its log row intact
+- A Mail Merge run that fails before any row is sent is now recorded as failed (with the error), not as user-cancelled — and Resume works from it
+- Mail Merge run-log failures are no longer swallowed: a failed queue save marks the row failed instead of logging it as queued, and failed result saves surface as a run error at completion
+- The Undo countdown toast now reliably appears: a failed handoff from the detached composer/viewer keeps the window open with a message instead of silently dropping the toast, and on startup pending rows re-show their remaining countdown instead of sending immediately
+- Closing the window can no longer strand Daak invisible with no tray icon: the window only hides when background mode is on AND the tray is actually running; enabling background mode refuses to save if the tray fails to start
+- Message-ID lookups no longer miss because of angle brackets: the Trash/Spam guard, bulk actions and Undo destination lookups now compare IDs with brackets stripped on both sides
+- Saving an attachment no longer double-decodes it: the downloaded file is now byte-identical to the attachment shown
+- Opening a message from server search now lists its single-part attachments for download, and signed messages no longer gain spurious downloadable signature files
+- Signing in is no longer tripped up by concurrent token refreshes: refreshes for one account are now serialised, so a second refresh can't fail with a spurious re-authorization prompt
+- Starting a second sign-in while one is in progress is now refused with a clear message instead of killing the first one, and a failed sign-in no longer leaves a stale session behind
+- The new-mail count now counts emails that actually arrived, instead of the change in the total — arrivals are no longer masked by deletions in the same sync
+- Very large messages are no longer stored as if complete: over-cap messages are flagged as truncated with a banner in the viewer, and attachment sizes are now the true decoded size
+- Saving a new contact now checks all address books of the sending account's linked CardDAV source before creating, so a person already in a second book no longer gets a duplicate in the first. Contacts are never checked or saved in another account's books
+- The Unsubscribe button no longer appears on Sent/Drafts mail when the folder can't be worked out — it defaults to hidden
+- The autostart setting is now only saved after the system change succeeds — a failed change leaves the stored setting untouched, so the screen no longer shows a state that isn't real
+
 **v0.7.37 - 24-11-2026**
 ---
 

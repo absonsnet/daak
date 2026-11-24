@@ -375,6 +375,13 @@
   </provides>
 
   <releases>
+    <release version="0.7.38" date="2026-11-24">
+      <description>
+        <ul>
+          <li>Nineteen audit fixes: failed body downloads retry on Force Resync, Unsubscribe header injection closed and one-click unsubscribe verified, Mail Merge duplicate suppression, cancel and failure recording fixed, Undo toast reliable, window can no longer hide without a tray, Message-ID lookups bracket-insensitive, attachments save byte-identical, server-search attachments fixed, new-mail counts real arrivals, large messages flagged truncated, contacts checked across the sending account's address books, and sign-in refreshes serialised</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.37" date="2026-11-24">
       <description>
         <ul>
