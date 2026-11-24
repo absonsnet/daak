@@ -1142,13 +1142,17 @@ func (s *Store) DeleteByFolder(folderID string) error {
 
 // ExistsInFolder checks if a message with the given RFC 822 Message-ID exists
 // in a folder of the specified type (e.g., "trash", "spam") for the account.
+// The comparison ignores surrounding angle brackets: rows stored by the
+// header-recovery path (and the IMAP envelope path, via go-message) carry no
+// brackets, while locally created rows (e.g. sent mail, `<uuid@daak>`) and
+// legacy rows do, so an exact match would miss the other form.
 func (s *Store) ExistsInFolder(messageID string, folderType string, accountID string) (bool, error) {
 	var count int
 	err := s.db.QueryRow(`
 		SELECT COUNT(*) FROM messages m
 		JOIN folders f ON m.folder_id = f.id
-		WHERE m.message_id = ? AND f.folder_type = ? AND m.account_id = ?
-	`, messageID, folderType, accountID).Scan(&count)
+		WHERE REPLACE(REPLACE(m.message_id, '<', ''), '>', '') = ? AND f.folder_type = ? AND m.account_id = ?
+	`, normalizeMessageID(messageID), folderType, accountID).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("failed to check message in folder type: %w", err)
 	}
@@ -1158,13 +1162,14 @@ func (s *Store) ExistsInFolder(messageID string, folderType string, accountID st
 // HasCopiesInOtherFolders checks if a message with the same RFC 822 Message-ID
 // exists in any other folder (excluding the specified folder) for the account.
 // Used by Gmail-aware permanent delete to avoid destroying the underlying message
-// when it's still visible in other labels.
+// when it's still visible in other labels. The comparison ignores surrounding
+// angle brackets, same as ExistsInFolder: stored rows carry both forms.
 func (s *Store) HasCopiesInOtherFolders(messageIDHeader string, excludeFolderID string, accountID string) (bool, error) {
 	var count int
 	err := s.db.QueryRow(`
 		SELECT COUNT(*) FROM messages
-		WHERE message_id = ? AND folder_id != ? AND account_id = ? AND uid > 0
-	`, messageIDHeader, excludeFolderID, accountID).Scan(&count)
+		WHERE REPLACE(REPLACE(message_id, '<', ''), '>', '') = ? AND folder_id != ? AND account_id = ? AND uid > 0
+	`, normalizeMessageID(messageIDHeader), excludeFolderID, accountID).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("failed to check for copies: %w", err)
 	}
@@ -3000,11 +3005,13 @@ func (s *Store) GetConversation(threadID, folderID string) (*Conversation, error
 	return c, nil
 }
 
-// normalizeMessageID strips angle brackets from Message-IDs for consistent comparison
+// normalizeMessageID strips angle brackets from Message-IDs for consistent comparison.
+// It trims every surrounding bracket, matching the SQL-side bracket-stripping
+// REPLACE used in the lookups and the recovery path's strings.Trim(..., "<>"),
+// so the Go and SQL forms agree even on a malformed multi-bracket value.
 func normalizeMessageID(msgID string) string {
 	msgID = strings.TrimSpace(msgID)
-	msgID = strings.TrimPrefix(msgID, "<")
-	msgID = strings.TrimSuffix(msgID, ">")
+	msgID = strings.Trim(msgID, "<>")
 	return msgID
 }
 
@@ -3351,9 +3358,9 @@ func (s *Store) ExpandToFolderCopies(ids []string) ([]string, error) {
 		JOIN messages m2
 		  ON m2.account_id = m1.account_id
 		 AND m2.folder_id = m1.folder_id
-		 AND m2.message_id = m1.message_id
+		 AND REPLACE(REPLACE(m2.message_id, '<', ''), '>', '') = REPLACE(REPLACE(m1.message_id, '<', ''), '>', '')
 		WHERE m1.id IN (%s)
-		  AND m1.message_id <> ''
+		  AND REPLACE(REPLACE(m1.message_id, '<', ''), '>', '') <> ''
 		  AND m2.uid > 0
 		  AND m2.id NOT IN (%s)`, in, in)
 
@@ -3375,6 +3382,9 @@ func (s *Store) ExpandToFolderCopies(ids []string) ([]string, error) {
 }
 
 // GetIDsByMessageIDs finds local DB message IDs by RFC822 Message-ID header and folder.
+// The comparison ignores surrounding angle brackets: the caller may pass the
+// ID as stored on a locally created row (`<uuid@daak>`) while the destination
+// row was synced via the envelope path (no brackets), or vice versa.
 // It deliberately includes rows with negative placeholder UIDs: MoveMessages
 // stamps just-moved rows uid = -rowid until the destination sync replaces
 // them with server-assigned UIDs, and this lookup exists for the undo path,
@@ -3391,11 +3401,11 @@ func (s *Store) GetIDsByMessageIDs(accountID, folderID string, rfc822MessageIDs 
 	args := []interface{}{accountID, folderID}
 	for i, mid := range rfc822MessageIDs {
 		placeholders[i] = "?"
-		args = append(args, mid)
+		args = append(args, normalizeMessageID(mid))
 	}
 
 	query := fmt.Sprintf(
-		"SELECT id FROM messages WHERE account_id = ? AND folder_id = ? AND message_id IN (%s)",
+		"SELECT id FROM messages WHERE account_id = ? AND folder_id = ? AND REPLACE(REPLACE(message_id, '<', ''), '>', '') IN (%s)",
 		strings.Join(placeholders, ", "),
 	)
 
