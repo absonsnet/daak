@@ -163,6 +163,12 @@ func (e *Engine) parseMessageBodyInternal(raw []byte, messageID string) *ParsedB
 		if result.BodyText == "" {
 			result.BodyText = reaction.Emoji
 		}
+	} else if fb := detectOutlookFallbackReaction(outlookFallbackText(result)); fb != nil {
+		// Outlook's fallback reaction email carries no machine-readable
+		// reaction part — only the banner line plus the quoted original —
+		// so it is recognised from the body text instead. Linking and
+		// hiding then work exactly as for the MIME formats.
+		result.Reaction = fb
 	}
 
 	e.log.Debug().

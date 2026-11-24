@@ -48,6 +48,10 @@
     // Select-only mode (preview pane off): a single click only highlights
     // the row; opening needs a double-click or Enter via onConversationOpen.
     selectOnly?: boolean
+    // The thread the parent currently shows in the preview pane (classic
+    // mode only; null in tab mode). The list highlight follows this value,
+    // so the highlighted row always matches the open message.
+    openThreadId?: string | null
     onReply?: (mode: 'reply' | 'reply-all' | 'forward', messageId: string) => void
     onRowActionComplete?: () => void
     // Undo Send: the Outbox Undo button on a normal-send row. The
@@ -68,6 +72,7 @@
     onConversationSelect,
     onConversationOpen,
     selectOnly = false,
+    openThreadId = null,
     onReply,
     onRowActionComplete,
     onUndoSend,
@@ -76,6 +81,44 @@
     showFolderToggle = false,
     onToggleSidebar,
   }: Props = $props()
+
+  // The open message is owned by the parent (App.svelte) in classic mode:
+  // the parent passes its selectedThreadId as openThreadId and this list's
+  // highlight follows it, so the highlighted row can never disagree with
+  // the message shown in the preview pane. In tab mode openThreadId is
+  // null and this list's internal selection stays an independent
+  // keyboard/selection anchor by design (a tab, not the preview, holds
+  // the open message).
+  //
+  // The effect reacts ONLY to the parent's open thread and to list
+  // reloads — never to the internal selection itself — so anchor-only
+  // moves (Shift+j/k bulk selection, server search) are not snapped back.
+  // The early return keeps it from re-running when the internal selection
+  // is the only thing that changed.
+  let lastSyncedOpenThreadId: string | null | undefined = undefined
+  let lastSyncedList: message.Conversation[] | undefined = undefined
+  $effect(() => {
+    if (selectOnly) return
+    const target = openThreadId
+    const list = conversations
+    const targetChanged = target !== lastSyncedOpenThreadId
+    const listChanged = list !== lastSyncedList
+    lastSyncedOpenThreadId = target
+    lastSyncedList = list
+    if (!targetChanged && !listChanged) return
+    if (target == null) {
+      // The parent closed the preview (e.g. folder change cleared its
+      // selection): nothing is open, so nothing is highlighted.
+      selectedThreadId = null
+      return
+    }
+    const idx = list.findIndex((c) => c.threadId === target)
+    if (idx >= 0 && selectedThreadId !== target) {
+      selectedThreadId = target
+      lastClickedIndex = idx
+      scrollToIndex(idx)
+    }
+  })
 
   // State
   let attentionStripRef = $state<{ refresh: () => Promise<void> } | undefined>()
@@ -785,12 +828,24 @@
       // where the user left off instead of the auto-selected first row —
       // only if the thread still exists in the reloaded window.
       // An external selection (notification click) wins over the restore.
+      // In classic mode the restore OPENS the remembered thread when the
+      // parent has no message open; when the parent already restored one,
+      // the parent wins and the remembered row is left alone.
       if (
         !pendingSelectThreadId &&
         remembered.selectedThreadId &&
         conversations.some((c) => c.threadId === remembered.selectedThreadId)
       ) {
-        selectedThreadId = remembered.selectedThreadId
+        if (selectOnly || openThreadId == null) {
+          selectedThreadId = remembered.selectedThreadId
+          lastClickedIndex = conversations.findIndex((c) => c.threadId === remembered.selectedThreadId)
+          if (!selectOnly) {
+            const conv = conversations[lastClickedIndex]
+            const realFolderId = (conv as any).folderId ? (conv as any).folderId : folderId
+            const realAccountId = (conv as any).accountId || accountId
+            onConversationSelect?.(remembered.selectedThreadId, realFolderId, realAccountId)
+          }
+        }
       }
       if (remembered.scrollTop > 0 && listContainerRef) {
         requestAnimationFrame(() => {
@@ -916,7 +971,6 @@
       const folderChanged = lastLoadedFolderId !== folderId
       lastLoadedFolderId = folderId
 
-      // Auto-select first message on folder navigation or initial load
       if (conversations.length === 0) {
         selectedThreadId = null
         totalCount = count
@@ -928,7 +982,11 @@
         pendingSelectThreadId = null
         scrollToIndex(conversations.findIndex(c => c.threadId === selectedThreadId))
       }
-      if (!pendingSelectThreadId && (folderChanged || !selectedThreadId)) {
+      // Auto-select the first conversation as the keyboard/selection anchor
+      // — tab mode only. In classic mode the highlight follows the parent's
+      // open message instead: when nothing is open, nothing is highlighted,
+      // rather than a first row the preview does not show.
+      if (!pendingSelectThreadId && selectOnly && (folderChanged || !selectedThreadId)) {
         selectedThreadId = conversations[0].threadId
       }
       totalCount = count
@@ -1145,9 +1203,10 @@
 
       searchResults = results || []
       searchTotalCount = count
-      // Auto-select first search result for keyboard navigation
+      // Auto-select first search result for keyboard navigation; in classic
+      // mode this also opens it in the preview pane (moveSelectionTo).
       if (searchResults.length > 0) {
-        selectedThreadId = searchResults[0].threadId
+        moveSelectionTo(0)
       }
     } catch (err) {
       console.error('Search failed:', err)
@@ -1262,6 +1321,9 @@
       serverSearchCount = items.length
       serverSearchTotalCount = response?.totalCount ?? items.length
       if (items.length > 0) {
+        // Anchor only, deliberately NOT opened: server results may not be
+        // synced locally yet (opening needs a fetch-first), so the
+        // highlight here is a keyboard anchor, not the open message.
         selectedThreadId = items[0].threadId
       }
     } catch (err) {
@@ -1783,8 +1845,24 @@
     return activeList.findIndex(c => c.threadId === selectedThreadId)
   }
 
+  // Keyboard navigation (j/k, g/G): move the highlight. In classic mode
+  // this also opens the message in the preview pane, so the highlight
+  // always matches the open message; in tab mode it only moves the
+  // anchor. Unlike selectConversation it never touches the checkboxes.
+  function moveSelectionTo(index: number) {
+    const conv = activeList[index]
+    if (!conv) return
+    selectedThreadId = conv.threadId
+    lastClickedIndex = index
+    if (!selectOnly) {
+      const c = conv as any
+      const realFolderId = (isUnifiedView || isSearchMode) && c.folderId ? c.folderId : folderId!
+      const realAccountId = (isUnifiedView || isSearchMode) && c.accountId ? c.accountId : accountId!
+      onConversationSelect?.(conv.threadId, realFolderId, realAccountId)
+    }
+  }
+
   // Select previous message (exposed for keyboard navigation)
-  // Just moves focus, doesn't clear checkboxes or open in viewer
   export function selectPrevious() {
     if (activeList.length === 0) return
 
@@ -1793,11 +1871,7 @@
 
     const conv = activeList[newIndex]
     if (conv) {
-      selectedThreadId = conv.threadId
-      // Keyboard focus moves the range anchor too, so a later Shift+click
-      // or Shift+checkbox ranges from the keyboard-focused row, not from
-      // a stale mouse click.
-      lastClickedIndex = newIndex
+      moveSelectionTo(newIndex)
       scrollToIndex(newIndex)
       // Blur any focused element so Enter key triggers openSelected() instead of the button
       ;(document.activeElement as HTMLElement)?.blur?.()
@@ -1805,7 +1879,6 @@
   }
 
   // Select next message (exposed for keyboard navigation)
-  // Just moves focus, doesn't clear checkboxes or open in viewer
   export function selectNext() {
     if (activeList.length === 0) return
 
@@ -1821,8 +1894,7 @@
 
     const conv = activeList[newIndex]
     if (conv) {
-      selectedThreadId = conv.threadId
-      lastClickedIndex = newIndex
+      moveSelectionTo(newIndex)
       scrollToIndex(newIndex)
       // Blur any focused element so Enter key triggers openSelected() instead of the button
       ;(document.activeElement as HTMLElement)?.blur?.()
@@ -1832,8 +1904,7 @@
   // Select + scroll to the first message (g)
   export function selectFirst() {
     if (activeList.length === 0) return
-    selectedThreadId = activeList[0].threadId
-    lastClickedIndex = 0
+    moveSelectionTo(0)
     scrollToIndex(0)
     // Blur any focused element so Enter key triggers openSelected() instead of the button
     ;(document.activeElement as HTMLElement)?.blur?.()
@@ -1844,8 +1915,7 @@
   export function selectLast() {
     if (activeList.length === 0) return
     const last = activeList.length - 1
-    selectedThreadId = activeList[last].threadId
-    lastClickedIndex = last
+    moveSelectionTo(last)
     scrollToIndex(last)
     // Blur any focused element so Enter key triggers openSelected() instead of the button
     ;(document.activeElement as HTMLElement)?.blur?.()

@@ -2097,6 +2097,7 @@
         onConversationSelect={handleConversationSelect}
         onConversationOpen={handleConversationSelect}
         selectOnly={tabMode}
+        openThreadId={tabMode ? null : selectedThreadId}
         onReply={handleReply}
         onRowActionComplete={() => viewerRef?.refreshFlags()}
         onUndoSend={handleOutboxUndoSend}
