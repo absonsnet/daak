@@ -96,18 +96,18 @@ func TestParseEmpty(t *testing.T) {
 func TestDomainMismatch(t *testing.T) {
 	cases := []struct {
 		sender, host string
-		want          bool
+		want         bool
 	}{
 		{"news@example.com", "example.com", false},
-		{"news@example.com", "news.example.com", false},       // subdomain of sender
-		{"news@example.com", "unsub.example.com", false},      // subdomain of sender
-		{"news@example.com", "other.com", true},               // unrelated
-		{"news@example.com", "links.sendgrid.net", false},     // known ESP
+		{"news@example.com", "news.example.com", false},             // subdomain of sender
+		{"news@example.com", "unsub.example.com", false},            // subdomain of sender
+		{"news@example.com", "other.com", true},                     // unrelated
+		{"news@example.com", "links.sendgrid.net", false},           // known ESP
 		{"news@example.com", "example.us10.list-manage.com", false}, // known ESP subdomain
 		{"news@example.com", "evil-sendgrid.net.evil.com", true},    // lookalike, not ESP
-		{"news@example.com", "", false},                       // nothing to compare
-		{"", "other.com", false},                              // no sender domain
-		{"NEWS@EXAMPLE.COM", "EXAMPLE.com", false},            // case-insensitive
+		{"news@example.com", "", false},                             // nothing to compare
+		{"", "other.com", false},                                    // no sender domain
+		{"NEWS@EXAMPLE.COM", "EXAMPLE.com", false},                  // case-insensitive
 	}
 	for _, c := range cases {
 		if got := DomainMismatch(c.sender, c.host); got != c.want {
@@ -215,5 +215,54 @@ func TestBuildMailtoMessageBadAddress(t *testing.T) {
 	}
 	if _, _, err := BuildMailtoMessage("Me", "not-an-address", "unsub@sender.example", "x"); err == nil {
 		t.Fatal("BuildMailtoMessage(bad from) succeeded, want error")
+	}
+}
+
+func TestParseMailtoSubjectStripsCRLF(t *testing.T) {
+	// Finding 12: a %0d%0a in the mailto subject must not survive
+	// into the parsed target — it would otherwise be written raw as
+	// a header line by BuildMailtoMessage.
+	got := Parse("<mailto:unsub@example.com?subject=hi%0d%0aBcc%3A%20victim%40example.com>", false)
+	if got.Method != MethodMailto {
+		t.Fatalf("Method = %q, want mailto", got.Method)
+	}
+	if strings.ContainsAny(got.MailtoSubject, "\r\n") {
+		t.Fatalf("MailtoSubject = %q, still contains CR/LF", got.MailtoSubject)
+	}
+	if got.MailtoSubject != "hiBcc: victim@example.com" {
+		t.Fatalf("MailtoSubject = %q, want the injected line folded into the subject text", got.MailtoSubject)
+	}
+}
+
+func TestBuildMailtoMessageStripsCRLFInjection(t *testing.T) {
+	// Finding 12: a crafted subject / display name carrying CRLF
+	// must not inject headers into the sent message.
+	raw, _, err := BuildMailtoMessage(
+		"Me\r\nBcc: injected@example.com",
+		"me@example.com",
+		"unsub@sender.example",
+		"hi\r\nBcc: victim@example.com",
+	)
+	if err != nil {
+		t.Fatalf("BuildMailtoMessage() error = %v", err)
+	}
+	msg, err := mail.ReadMessage(strings.NewReader(string(raw)))
+	if err != nil {
+		t.Fatalf("mail.ReadMessage() error = %v", err)
+	}
+	if got := msg.Header.Get("Bcc"); got != "" {
+		t.Errorf("Bcc = %q, want no injected Bcc header", got)
+	}
+	if got := msg.Header.Get("Subject"); got != "hiBcc: victim@example.com" {
+		t.Errorf("Subject = %q, want the injected line folded into the subject text", got)
+	}
+	if got := msg.Header.Get("From"); got != `"MeBcc: injected@example.com" <me@example.com>` {
+		t.Errorf("From = %q, want the injected line folded into a quoted display name", got)
+	}
+	// The raw bytes must contain no injected header line at all.
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		if strings.HasPrefix(line, "Bcc:") {
+			t.Errorf("raw message contains injected header line %q", line)
+		}
 	}
 }

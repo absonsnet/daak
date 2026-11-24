@@ -150,11 +150,23 @@ func parseMailto(uri string) (address, subject string) {
 	if address == "" {
 		return "", ""
 	}
-	subject = u.Query().Get("subject")
+	subject = stripCRLF(u.Query().Get("subject"))
 	if strings.TrimSpace(subject) == "" {
 		subject = "Unsubscribe"
 	}
 	return address, subject
+}
+
+// stripCRLF removes carriage returns and line feeds from s. Header
+// values decoded from the untrusted List-Unsubscribe header (e.g. a
+// percent-encoded %0d%0a in a mailto subject) must never reach a raw
+// header line, where they would inject arbitrary headers into mail
+// sent from the user's account.
+func stripCRLF(s string) string {
+	if !strings.ContainsAny(s, "\r\n") {
+		return s
+	}
+	return strings.NewReplacer("\r", "", "\n", "").Replace(s)
 }
 
 // knownESPHosts are email-service-provider domains an unsubscribe link
@@ -271,6 +283,12 @@ func PostOneClick(ctx context.Context, targetURL string, client *http.Client) er
 // from the header. It returns the raw bytes and the generated
 // Message-ID (angle-bracketed) so the caller can record the sent mail.
 func BuildMailtoMessage(fromName, fromEmail, to, subject string) ([]byte, string, error) {
+	// The subject and display name come from the untrusted
+	// List-Unsubscribe header: strip any CR/LF before either reaches
+	// a raw header line, where it would inject arbitrary headers
+	// (e.g. Bcc:) into mail sent from the user's account.
+	subject = stripCRLF(subject)
+	fromName = stripCRLF(fromName)
 	// Defensive: the caller passes the bare address from Parse, but a
 	// stray "?subject=..." suffix must never reach the To header.
 	if i := strings.Index(to, "?"); i >= 0 {
@@ -310,15 +328,24 @@ func BuildMailtoMessage(fromName, fromEmail, to, subject string) ([]byte, string
 	return buf.Bytes(), messageID, nil
 }
 
-// quoteName quotes a display name for a From header when it contains a
-// comma or quote; plain names pass through unchanged.
+// quoteName quotes a display name for a From header when it contains
+// anything outside a plain phrase of atoms (a comma, quote, colon,
+// and the like); plain names pass through unchanged. CR/LF are
+// stripped first so a crafted name can never break out of the header.
 func quoteName(name string) string {
-	name = strings.TrimSpace(name)
+	name = stripCRLF(strings.TrimSpace(name))
 	if name == "" {
 		return ""
 	}
-	if strings.ContainsAny(name, "\",") {
-		return `"` + strings.ReplaceAll(name, `"`, `\"`) + `"`
+	for _, r := range name {
+		if r == ' ' {
+			continue
+		}
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			strings.ContainsRune("!#$%&'*+-/=?^_`{|}~", r) {
+			continue
+		}
+		return `"` + strings.ReplaceAll(strings.ReplaceAll(name, `\`, `\\`), `"`, `\"`) + `"`
 	}
 	return name
 }
