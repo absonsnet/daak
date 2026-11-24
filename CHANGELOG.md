@@ -1,5 +1,11 @@
 # CHANGELOG
 
+**v0.7.36 - 24-11-2026**
+---
+
+- Reactions sent from Outlook now show as pills in Daak: Outlook's fallback reaction emails (a banner line plus the quoted original, with no machine-readable reaction part) are now detected, linked to the original message and hidden from the list, like Gmail and RFC 9078 reactions. The detector also handles senders that write the reaction headers in different case, and a reaction that arrives while its thread is open now appears without reopening the conversation
+- Fixed the launch mismatch where the message list highlighted the first message while the preview pane showed the restored one: the highlighted row now always follows the message actually open in the preview pane. Keyboard navigation (j/k, g/G) and local search now move the preview along with the highlight in classic mode
+
 **v0.7.35 - 23-11-2026**
 ---
 

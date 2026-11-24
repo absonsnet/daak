@@ -60,12 +60,13 @@
       </div>
 
       <div class="space-y-4 max-h-[60vh] overflow-y-auto text-sm">
-        <p>🚀 Welcome to {APP_NAME} v0.7.35!</p>
+        <p>🚀 Welcome to {APP_NAME} v0.7.36!</p>
 
-        <p>v0.7.35 polishes the reaction email:</p>
+        <p>v0.7.36 fixes received reactions and the list highlight:</p>
 
         <ul class="list-disc pl-6 space-y-1">
-          <li>👍 The reaction banner now renders as a pale-blue card with the sender's name in bold and a larger font, exactly like Outlook's fallback — the quoted original below it is unchanged</li>
+          <li>👍 Outlook reaction emails now show as pills on the original message, and a reaction arriving while its thread is open appears without reopening the conversation</li>
+          <li>🎯 The highlighted row now always matches the message open in the preview pane — including on launch, when the list used to highlight the first message while the preview showed the restored one</li>
         </ul>
 
         <p>🏷 See the full change log here:</p>

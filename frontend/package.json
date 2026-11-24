@@ -1,7 +1,7 @@
 {
   "name": "daak",
   "private": true,
-  "version": "0.7.35",
+  "version": "0.7.36",
   "type": "module",
   "scripts": {
     "predev": "node scripts/copy-dictionaries.mjs",
