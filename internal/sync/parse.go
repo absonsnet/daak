@@ -621,7 +621,7 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 			!isSignaturePart(contentType)
 		if disposition == "attachment" || isNonTextBody {
 			hasAttachments = true
-			return "", "", true
+			return "", "", true, false
 		}
 
 		// Read with size limit to prevent memory exhaustion

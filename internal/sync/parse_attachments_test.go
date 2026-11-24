@@ -96,7 +96,7 @@ func TestParseMessageBody_SinglePartAttachment(t *testing.T) {
 		"\r\n" +
 		"UEsDBAoAAAAA\r\n"
 
-	bodyText, _, hasAttachments := testEngine().parseMessageBody([]byte(raw))
+	bodyText, _, hasAttachments, _ := testEngine().parseMessageBody([]byte(raw))
 	if !hasAttachments {
 		t.Fatalf("hasAttachments = false, want true for single-part attachment")
 	}
@@ -115,7 +115,7 @@ func TestParseMessageBody_SinglePartTextNotAttachment(t *testing.T) {
 		"\r\n" +
 		"Hello there\r\n"
 
-	bodyText, _, hasAttachments := testEngine().parseMessageBody([]byte(raw))
+	bodyText, _, hasAttachments, _ := testEngine().parseMessageBody([]byte(raw))
 	if hasAttachments {
 		t.Fatalf("hasAttachments = true, want false for single-part text")
 	}
@@ -146,7 +146,7 @@ func TestParseMessageBody_SignedMultipartNoAttachments(t *testing.T) {
 		"AAECAwQFBgc=\r\n" +
 		"--SIG--\r\n"
 
-	_, _, hasAttachments := testEngine().parseMessageBody([]byte(raw))
+	_, _, hasAttachments, _ := testEngine().parseMessageBody([]byte(raw))
 	if hasAttachments {
 		t.Fatalf("hasAttachments = true, want false (signature part only)")
 	}
@@ -163,7 +163,7 @@ func TestParseMessageBody_SinglePartSignatureNotAttachment(t *testing.T) {
 		"\r\n" +
 		"AAECAwQFBgc=\r\n"
 
-	_, _, hasAttachments := testEngine().parseMessageBody([]byte(raw))
+	_, _, hasAttachments, _ := testEngine().parseMessageBody([]byte(raw))
 	if hasAttachments {
 		t.Fatalf("hasAttachments = true, want false for single-part signature")
 	}
