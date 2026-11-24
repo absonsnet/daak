@@ -13,6 +13,7 @@ import (
 	"github.com/absonsnet/daak/internal/contact"
 	"github.com/absonsnet/daak/internal/database"
 	"github.com/absonsnet/daak/internal/draft"
+	"github.com/absonsnet/daak/internal/folder"
 	"github.com/absonsnet/daak/internal/logging"
 	"github.com/absonsnet/daak/internal/pgp"
 	"github.com/absonsnet/daak/internal/sendqueue"
@@ -25,11 +26,20 @@ import (
 // temp DB: QueueSend validates and enqueues, dispatchDue re-runs
 // composeOps.sendMessage with rawSendOverride capturing the SMTP
 // bytes instead of reaching a server. No GUI, no network.
+//
+// Drafts are real rows (saveDraft writes through draftOps), so the
+// undo-window draft behaviour — duplicate-queue rejection, snapshot
+// restore on Undo, keeping an edited draft after dispatch — is
+// exercised against the same code the app uses. There are no folders
+// in the test DB, so draft cleanup after a send only touches the
+// local draft row (no IMAP leg).
 type sendQueueTestHarness struct {
-	svc     *sendQueueService
-	sent    [][]byte
-	sendErr error
-	now     time.Time
+	svc        *sendQueueService
+	db         *database.DB
+	draftStore *draft.Store
+	sent       [][]byte
+	sendErr    error
+	now        time.Time
 }
 
 func newSendQueueTestHarness(t *testing.T) *sendQueueTestHarness {
@@ -50,11 +60,18 @@ func newSendQueueTestHarness(t *testing.T) *sendQueueTestHarness {
 	h := &sendQueueTestHarness{now: time.Now().UTC().Truncate(time.Second)}
 	log := logging.WithComponent("test")
 	accountStore := account.NewStore(db)
+	draftStore := draft.NewStore(db)
+	dops := &draftOps{
+		accountStore: accountStore,
+		folderStore:  folder.NewStore(db),
+		draftStore:   draftStore,
+	}
 	ops := &composeOps{
 		accountStore: accountStore,
 		contactStore: contact.NewStore(db.DB),
 		smimeStore:   smime.NewStore(db.DB, log),
 		pgpStore:     pgp.NewStore(db.DB, log),
+		draftOps:     dops,
 		rawSendOverride: func(_ context.Context, _ string, _ []string, raw []byte) error {
 			if h.sendErr != nil {
 				return h.sendErr
@@ -64,15 +81,29 @@ func newSendQueueTestHarness(t *testing.T) *sendQueueTestHarness {
 		},
 		sentSaveOverride: func(_ context.Context, _ string, _ []byte) error { return nil },
 	}
+	h.db = db
+	h.draftStore = draftStore
 	h.svc = &sendQueueService{
 		store:      sendqueue.NewStore(db),
 		settings:   settings.NewStore(db),
 		ops:        ops,
-		draftStore: draft.NewStore(db),
+		draftStore: draftStore,
 		ctx:        context.Background(),
 		now:        func() time.Time { return h.now },
-		saveDraft: func(_ string, _ smtp.ComposeMessage, _ string) (string, error) {
-			return "draft-1", nil
+		saveDraft: func(accountID string, msg smtp.ComposeMessage, draftID string) (string, error) {
+			var existing *draft.Draft
+			if draftID != "" {
+				existing, _ = draftStore.Get(draftID)
+			}
+			enc, err := dops.encryptDraftBody(accountID, msg.From.Address, msg)
+			if err != nil {
+				return "", err
+			}
+			saved, err := dops.saveDraftToDB(accountID, existing, msg, enc)
+			if err != nil {
+				return "", err
+			}
+			return saved.ID, nil
 		},
 	}
 	return h
@@ -114,8 +145,8 @@ func TestQueueSendThenDispatch(t *testing.T) {
 	if res.DelaySeconds != settings.DefaultUndoSendDelay {
 		t.Fatalf("DelaySeconds = %d, want %d", res.DelaySeconds, settings.DefaultUndoSendDelay)
 	}
-	if res.DraftID != "draft-1" {
-		t.Fatalf("DraftID = %q, want draft-1", res.DraftID)
+	if res.DraftID == "" {
+		t.Fatalf("DraftID is empty, want a saved draft id")
 	}
 	item := h.mustItem(t, res.QueueID)
 	if item.Status != sendqueue.StatusPending {
@@ -163,8 +194,8 @@ func TestUndoSendCancelsAndDispatchSkips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UndoSend: %v", err)
 	}
-	if undone.DraftID != "draft-1" || undone.AccountID != "acc-1" {
-		t.Fatalf("UndoSend = %+v, want draft-1 / acc-1", undone)
+	if undone.DraftID != res.DraftID || undone.AccountID != "acc-1" {
+		t.Fatalf("UndoSend = %+v, want draft %q / acc-1", undone, res.DraftID)
 	}
 	// Undone rows are deleted, not kept as cancelled history.
 	if got, err := h.svc.store.Get(res.QueueID); err != nil || got != nil {
@@ -503,5 +534,154 @@ func TestRetriedSendReusesMessageID(t *testing.T) {
 	}
 	if len(transmitted) != 2 {
 		t.Fatalf("transmitted %d messages after success, want 2", len(transmitted))
+	}
+}
+
+// TestQueueSendRejectsDuplicateDraft is the finding-9 duplicate-send
+// regression test: the draft stays visible in Drafts during the undo
+// window, so opening it and hitting Send again must be rejected —
+// the first queued row already holds the snapshot that will send.
+func TestQueueSendRejectsDuplicateDraft(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
+
+	if _, err := h.svc.QueueSend("acc-1", testComposeMessage(), res.DraftID); err == nil || !strings.Contains(err.Error(), "already queued") {
+		t.Fatalf("second QueueSend for the same draft = %v, want an 'already queued' error", err)
+	}
+	items, err := h.svc.store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue rows = %d, want 1 (no second row enqueued)", len(items))
+	}
+
+	// The rejection lasts only while the first row is live: after
+	// Undo, the same draft can be queued again.
+	if _, err := h.svc.UndoSend(res.QueueID); err != nil {
+		t.Fatalf("UndoSend: %v", err)
+	}
+	if _, err := h.svc.QueueSend("acc-1", testComposeMessage(), res.DraftID); err != nil {
+		t.Fatalf("QueueSend after undo: %v, want success", err)
+	}
+}
+
+// editQueuedDraft rewrites the live draft row's body, as if the user
+// opened the draft from Drafts and edited it during the undo window.
+func (h *sendQueueTestHarness) editQueuedDraft(t *testing.T, draftID, body string) {
+	t.Helper()
+	d, err := h.draftStore.Get(draftID)
+	if err != nil || d == nil {
+		t.Fatalf("draft %q not found: %v", draftID, err)
+	}
+	d.BodyText = body
+	if err := h.draftStore.Update(d); err != nil {
+		t.Fatalf("updating draft: %v", err)
+	}
+}
+
+// TestUndoSendRestoresSnapshot: edits made to the live draft during
+// the undo window must not survive Undo — the reopened composer
+// shows the queued snapshot, the message that was about to send.
+func TestUndoSendRestoresSnapshot(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
+	h.editQueuedDraft(t, res.DraftID, "edited during the undo window")
+
+	undone, err := h.svc.UndoSend(res.QueueID)
+	if err != nil {
+		t.Fatalf("UndoSend: %v", err)
+	}
+	if undone.DraftID != res.DraftID {
+		t.Fatalf("UndoSend draft = %q, want %q", undone.DraftID, res.DraftID)
+	}
+	d, err := h.draftStore.Get(res.DraftID)
+	if err != nil || d == nil {
+		t.Fatalf("draft after undo not found: %v", err)
+	}
+	if d.BodyText != "hi there" {
+		t.Fatalf("draft body after undo = %q, want the queued snapshot %q", d.BodyText, "hi there")
+	}
+}
+
+// TestEditedDraftKeptAfterDispatch: edits made during the undo window
+// do not change what sends (the queued snapshot sends), and the
+// edited draft is not silently deleted by the post-send cleanup —
+// it stays in Drafts with the user's edits intact.
+func TestEditedDraftKeptAfterDispatch(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
+	h.editQueuedDraft(t, res.DraftID, "edited during the undo window")
+
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue = %d, %v, want 1, nil", n, err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(h.sent))
+	}
+	if sent := string(h.sent[0]); !strings.Contains(sent, "hi there") || strings.Contains(sent, "edited during the undo window") {
+		t.Fatalf("sent bytes do not match the queued snapshot: %q", sent)
+	}
+	d, err := h.draftStore.Get(res.DraftID)
+	if err != nil || d == nil {
+		t.Fatalf("edited draft was deleted by the send: %v", err)
+	}
+	if d.BodyText != "edited during the undo window" {
+		t.Fatalf("draft body after dispatch = %q, want the user's edit kept", d.BodyText)
+	}
+}
+
+// TestUneditedDraftDeletedAfterDispatch: the normal path is
+// unchanged — when the live draft still matches the queued snapshot,
+// dispatch deletes it, as before.
+func TestUneditedDraftDeletedAfterDispatch(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
+
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue = %d, %v, want 1, nil", n, err)
+	}
+	if d, err := h.draftStore.Get(res.DraftID); err != nil || d != nil {
+		t.Fatalf("draft after dispatch = %+v, %v, want nil, nil (deleted)", d, err)
+	}
+}
+
+func TestSameDraftContent(t *testing.T) {
+	a := testComposeMessage()
+	b := testComposeMessage()
+	if !sameDraftContent(&a, &b) {
+		t.Fatalf("identical messages compare as different")
+	}
+	if !sameDraftContent(nil, nil) {
+		t.Fatalf("nil messages compare as different")
+	}
+	if sameDraftContent(&a, nil) || sameDraftContent(nil, &b) {
+		t.Fatalf("nil vs non-nil compares as same")
+	}
+	changed := testComposeMessage()
+	changed.TextBody = "changed"
+	if sameDraftContent(&a, &changed) {
+		t.Fatalf("changed body compares as same")
+	}
+	changed = testComposeMessage()
+	changed.Subject = "other"
+	if sameDraftContent(&a, &changed) {
+		t.Fatalf("changed subject compares as same")
+	}
+	changed = testComposeMessage()
+	changed.To = []smtp.Address{{Address: "bob@example.com"}}
+	if sameDraftContent(&a, &changed) {
+		t.Fatalf("changed recipient compares as same")
+	}
+	// Fields the draft round-trip does not carry (From, Message-ID,
+	// References, read-receipt flag) must not count as edits.
+	changed = testComposeMessage()
+	changed.MessageID = "<queued@daak>"
+	changed.RequestReadReceipt = true
+	changed.References = []string{"<parent@daak>"}
+	if !sameDraftContent(&a, &changed) {
+		t.Fatalf("round-trip-only fields compare as different")
 	}
 }
