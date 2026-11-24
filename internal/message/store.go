@@ -559,7 +559,7 @@ func (s *Store) Get(id string) (*Message, error) {
 		SELECT id, account_id, folder_id, uid, message_id, in_reply_to, thread_id,
 		       subject, from_name, from_email, to_list, cc_list, bcc_list, reply_to, date,
 		       snippet, is_read, is_starred, is_answered, is_forwarded, is_draft, is_deleted,
-		       size, has_attachments, body_text, body_html, body_fetched,
+		       size, has_attachments, body_text, body_html, body_fetched, body_truncated,
 		       read_receipt_to, read_receipt_handled,
 		       smime_status, smime_signer_email, smime_signer_subject,
 		       smime_encrypted, (smime_raw_body IS NOT NULL) as has_smime,
@@ -584,7 +584,7 @@ func (s *Store) Get(id string) (*Message, error) {
 		&m.ID, &m.AccountID, &m.FolderID, &uidI64, &messageID, &inReplyTo, &threadID,
 		&m.Subject, &m.FromName, &m.FromEmail, &toList, &ccList, &bccList, &replyTo, &dateStr,
 		&snippet, &m.IsRead, &m.IsStarred, &m.IsAnswered, &m.IsForwarded, &m.IsDraft, &m.IsDeleted,
-		&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched,
+		&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated,
 		&readReceiptTo, &m.ReadReceiptHandled,
 		&smimeStatus, &smimeSignerEmail, &smimeSignerSubject,
 		&m.SMIMEEncrypted, &m.HasSMIME,
@@ -687,7 +687,7 @@ func (s *Store) GetByUID(folderID string, uid uint32) (*Message, error) {
 		SELECT id, account_id, folder_id, uid, message_id, in_reply_to, thread_id,
 		       subject, from_name, from_email, to_list, cc_list, bcc_list, reply_to, date,
 		       snippet, is_read, is_starred, is_answered, is_forwarded, is_draft, is_deleted,
-		       size, has_attachments, body_text, body_html, body_fetched,
+		       size, has_attachments, body_text, body_html, body_fetched, body_truncated,
 		       read_receipt_to, read_receipt_handled,
 		       smime_status, smime_signer_email, smime_signer_subject,
 		       smime_encrypted, (smime_raw_body IS NOT NULL) as has_smime,
@@ -712,7 +712,7 @@ func (s *Store) GetByUID(folderID string, uid uint32) (*Message, error) {
 		&m.ID, &m.AccountID, &m.FolderID, &uidI64, &messageID, &inReplyTo, &threadID,
 		&m.Subject, &m.FromName, &m.FromEmail, &toList, &ccList, &bccList, &replyTo, &dateStr,
 		&snippet, &m.IsRead, &m.IsStarred, &m.IsAnswered, &m.IsForwarded, &m.IsDraft, &m.IsDeleted,
-		&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched,
+		&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated,
 		&readReceiptTo, &m.ReadReceiptHandled,
 		&smimeStatus, &smimeSignerEmail, &smimeSignerSubject,
 		&m.SMIMEEncrypted, &m.HasSMIME,
@@ -1229,6 +1229,7 @@ func (s *Store) UpdateBody(u BodyUpdate) error {
 	query := `
 		UPDATE messages
 		SET body_html = ?, body_text = ?, snippet = ?, body_fetched = 1, has_attachments = ?,
+		    body_truncated = ?,
 		    body_failed = CASE WHEN ? THEN 0 ELSE body_failed END,
 		    smime_raw_body = ?, smime_encrypted = ?,
 		    pgp_raw_body = ?, pgp_encrypted = ?
@@ -1244,6 +1245,7 @@ func (s *Store) UpdateBody(u BodyUpdate) error {
 	}
 	_, err := s.db.Exec(query,
 		nullString(u.BodyHTML), nullString(u.BodyText), nullString(u.Snippet), u.HasAttachments,
+		u.Truncated,
 		u.HasUsableContent(),
 		smimeRawBody, u.SMIMEEncrypted,
 		pgpRawBody, u.PGPEncrypted,
@@ -1527,6 +1529,12 @@ type BodyUpdate struct {
 	BodyText       string
 	Snippet        string
 	HasAttachments bool
+	// Truncated records that the stored body is only the first part of
+	// the message: a part hit the 10 MB cap or the whole message hit the
+	// 50 MB cap during fetch/parse (audit finding 26). Persisted as
+	// body_truncated so the viewer can disclose it; a re-fetch would hit
+	// the same cap, so this is not a retry gate.
+	Truncated bool
 	// Enrichment, when set, is persisted alongside the body by
 	// UpdateBodiesBatch (the body pass is where extraction runs).
 	Enrichment         *enrich.Result
@@ -2243,6 +2251,7 @@ func (s *Store) UpdateBodiesBatch(updates []BodyUpdate) error {
 		UPDATE messages
 		SET body_html = ?, body_text = ?, snippet = ?, body_fetched = 1,
 		    has_attachments = ?,
+		    body_truncated = ?,
 		    body_failed = CASE WHEN ? THEN 0 ELSE body_failed END,
 		    smime_status = ?, smime_signer_email = ?, smime_signer_subject = ?,
 		    smime_raw_body = ?, smime_encrypted = ?,
@@ -2278,6 +2287,7 @@ func (s *Store) UpdateBodiesBatch(updates []BodyUpdate) error {
 		_, err := stmt.Exec(
 			nullString(u.BodyHTML), nullString(u.BodyText), nullString(u.Snippet),
 			u.HasAttachments,
+			u.Truncated,
 			u.HasUsableContent(),
 			nullString(u.SMIMEStatus), nullString(u.SMIMESignerEmail), nullString(u.SMIMESignerSubject),
 			smimeRawBody, u.SMIMEEncrypted,
@@ -2342,10 +2352,11 @@ func (s *Store) GetPGPRawBody(messageID string) ([]byte, error) {
 // timeout, or a parser that has since improved) must be retried by the
 // Force Resync, not skipped forever by the flag — otherwise clearing the
 // bodies changes nothing for exactly the messages that need it most.
+// body_truncated is reset too: the re-fetch re-measures it from scratch.
 func (s *Store) ClearBodiesForFolder(folderID string) (int64, error) {
 	query := `
 		UPDATE messages
-		SET body_html = NULL, body_text = NULL, snippet = NULL, body_fetched = 0, body_failed = 0
+		SET body_html = NULL, body_text = NULL, snippet = NULL, body_fetched = 0, body_failed = 0, body_truncated = 0
 		WHERE folder_id = ?
 	`
 	result, err := s.db.Exec(query, folderID)
@@ -2790,7 +2801,7 @@ func (s *Store) GetConversation(threadID, folderID string) (*Conversation, error
 		SELECT m.id, m.account_id, m.folder_id, m.uid, m.message_id, m.in_reply_to, m.references_list, m.thread_id,
 		       m.subject, m.from_name, m.from_email, m.to_list, m.cc_list, m.bcc_list, m.reply_to, m.date,
 		       m.snippet, m.is_read, m.is_starred, m.is_answered, m.is_forwarded, m.is_draft, m.is_deleted,
-		       m.size, m.has_attachments, m.body_text, m.body_html, m.body_fetched,
+		       m.size, m.has_attachments, m.body_text, m.body_html, m.body_fetched, m.body_truncated,
 		       m.read_receipt_to, m.read_receipt_handled,
 		       m.smime_status, m.smime_signer_email, m.smime_signer_subject,
 		       m.smime_encrypted, (m.smime_raw_body IS NOT NULL) as has_smime,
@@ -2829,7 +2840,7 @@ func (s *Store) GetConversation(threadID, folderID string) (*Conversation, error
 			&m.ID, &m.AccountID, &m.FolderID, &uidI64, &messageID, &inReplyTo, &references, &threadIDVal,
 			&m.Subject, &m.FromName, &m.FromEmail, &toList, &ccList, &bccList, &replyTo, &dateStr,
 			&snippetVal, &m.IsRead, &m.IsStarred, &m.IsAnswered, &m.IsForwarded, &m.IsDraft, &m.IsDeleted,
-			&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched,
+			&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated,
 			&readReceiptTo, &m.ReadReceiptHandled,
 			&smimeStatus, &smimeSignerEmail, &smimeSignerSubject,
 			&m.SMIMEEncrypted, &m.HasSMIME,
@@ -3491,7 +3502,7 @@ func (s *Store) GetByIDs(ids []string) ([]*Message, error) {
 		SELECT id, account_id, folder_id, uid, message_id, in_reply_to, references_list, thread_id,
 		       subject, from_name, from_email, to_list, cc_list, bcc_list, reply_to, date,
 		       snippet, is_read, is_starred, is_answered, is_forwarded, is_draft, is_deleted,
-		       size, has_attachments, body_text, body_html, body_fetched,
+		       size, has_attachments, body_text, body_html, body_fetched, body_truncated,
 		       read_receipt_to, read_receipt_handled,
 		       smime_status, smime_signer_email, smime_signer_subject,
 		       smime_encrypted, (smime_raw_body IS NOT NULL) as has_smime,
@@ -3523,7 +3534,7 @@ func (s *Store) GetByIDs(ids []string) ([]*Message, error) {
 			&m.ID, &m.AccountID, &m.FolderID, &uidI64, &messageID, &inReplyTo, &references, &threadID,
 			&m.Subject, &m.FromName, &m.FromEmail, &toList, &ccList, &bccList, &replyTo, &dateStr,
 			&snippet, &m.IsRead, &m.IsStarred, &m.IsAnswered, &m.IsForwarded, &m.IsDraft, &m.IsDeleted,
-			&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched,
+			&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated,
 			&readReceiptTo, &m.ReadReceiptHandled,
 			&smimeStatus, &smimeSignerEmail, &smimeSignerSubject,
 			&m.SMIMEEncrypted, &m.HasSMIME,

@@ -23,8 +23,12 @@ type ProcessedBody struct {
 	BodyText       string
 	Snippet        string
 	HasAttachments bool
-	Attachments    []*message.Attachment  // Extracted during parsing (no re-parse needed)
-	RawBytes       []byte                 // For on-demand attachment content fetch
+	Attachments    []*message.Attachment // Extracted during parsing (no re-parse needed)
+	RawBytes       []byte                // For on-demand attachment content fetch
+	// Truncated mirrors ParsedBody.Truncated, plus the whole-message
+	// 50 MB cap applied while reading the BODY[] literal (audit
+	// finding 26). Persisted via BodyUpdate.Truncated.
+	Truncated      bool
 	SMIMEResult    *smime.SignatureResult // S/MIME verification result
 	SMIMERawBody   []byte                 // Raw S/MIME body for on-view processing
 	SMIMEEncrypted bool                   // Whether the message is encrypted
@@ -59,11 +63,24 @@ func bodyUpdateFromProcessedBody(pb *ProcessedBody) message.BodyUpdate {
 		BodyText:       pb.BodyText,
 		Snippet:        pb.Snippet,
 		HasAttachments: pb.HasAttachments,
+		Truncated:      pb.Truncated,
 		SMIMERawBody:   pb.SMIMERawBody,
 		SMIMEEncrypted: pb.SMIMEEncrypted,
 		PGPRawBody:     pb.PGPRawBody,
 		PGPEncrypted:   pb.PGPEncrypted,
 	}
+}
+
+// isBodyTruncated reports whether a fetched body was cut short by Daak's
+// own size caps (audit finding 26): the parser hit the 10 MB part cap
+// (parsedTruncated), or the BODY[] literal hit the 50 MB message cap
+// (receivedBytes at the cap — read with a maxMessageSize+1 limit so an
+// exactly-at-cap message is not misread as truncated). A shortfall below
+// the cap is server-side truncation instead, which shouldChargeFailure
+// already defers (leaving body_fetched=0 for a retry) — it is not a
+// cap truncation and must not set this flag.
+func isBodyTruncated(receivedBytes int64, parsedTruncated bool) bool {
+	return parsedTruncated || receivedBytes > maxMessageSize
 }
 
 // FetchMessageBody fetches the body for a single message on-demand.
@@ -227,7 +244,8 @@ func (e *Engine) fetchMessageBodiesBatch(ctx context.Context, client *imapclient
 		var fetchedUID imap.UID
 		var rawBytes []byte
 		var gotBodySection bool
-		var reportedSize int64 // RFC822.SIZE; 0 if server didn't return it
+		var reportedSize int64    // RFC822.SIZE; 0 if server didn't return it
+		var messageTruncated bool // BODY[] literal hit the 50 MB cap (finding 26)
 
 		for {
 			item := msg.Next()
@@ -245,9 +263,12 @@ func (e *Engine) fetchMessageBodiesBatch(ctx context.Context, client *imapclient
 				reportedSize = int64(data.Size)
 			case imapclient.FetchItemDataBodySection:
 				gotBodySection = true
-				// Read body from literal reader with size limit to prevent memory exhaustion
+				// Read body from literal reader with size limit to prevent memory exhaustion.
+				// The limit is maxMessageSize+1 so a message that lands
+				// exactly on the cap is not misread as truncated: only
+				// a read past the cap means bytes were cut (finding 26).
 				if data.Literal != nil {
-					lr := io.LimitReader(data.Literal, maxMessageSize)
+					lr := io.LimitReader(data.Literal, maxMessageSize+1)
 					var err error
 					rawBytes, err = io.ReadAll(lr)
 					if err != nil {
@@ -257,8 +278,15 @@ func (e *Engine) fetchMessageBodiesBatch(ctx context.Context, client *imapclient
 							Msg("Failed to read body literal, continuing with partial data")
 						// Keep whatever we got (may be partial)
 					}
-					// Log if we hit the size limit
-					if int64(len(rawBytes)) == maxMessageSize {
+					// Past the cap: keep only the first maxMessageSize
+					// bytes for parsing, and flag the message truncated
+					// instead of silently storing it as complete. The
+					// flag is persisted via ProcessedBody.Truncated;
+					// body_fetched stays 1 — a re-fetch would hit the
+					// same cap, so there is nothing to retry.
+					if isBodyTruncated(int64(len(rawBytes)), false) {
+						rawBytes = rawBytes[:maxMessageSize]
+						messageTruncated = true
 						e.log.Warn().
 							Uint32("uid", uint32(fetchedUID)).
 							Int64("maxSize", maxMessageSize).
@@ -346,6 +374,7 @@ func (e *Engine) fetchMessageBodiesBatch(ctx context.Context, client *imapclient
 			HasAttachments: parsed.HasAttachments,
 			Attachments:    parsed.Attachments,
 			RawBytes:       rawBytes,
+			Truncated:      messageTruncated || parsed.Truncated,
 			SMIMEResult:    parsed.SMIMEResult,
 			SMIMERawBody:   parsed.SMIMERawBody,
 			SMIMEEncrypted: parsed.SMIMEEncrypted,
@@ -1085,9 +1114,10 @@ func (e *Engine) buildMessageFromStreamedData(accountID, folderID string, uid im
 
 	// Parse message body
 	if len(rawBytes) > 0 {
-		bodyText, bodyHTML, hasAttachments := e.parseMessageBody(rawBytes)
+		bodyText, bodyHTML, hasAttachments, truncated := e.parseMessageBody(rawBytes)
 		m.BodyText = bodyText
 		m.HasAttachments = hasAttachments
+		m.BodyTruncated = truncated
 
 		// Sanitize HTML
 		if bodyHTML != "" {

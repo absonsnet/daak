@@ -220,6 +220,7 @@
     "failedToLoadMessages": "Failed to load messages.",
     "noContent": "No content available",
     "downloadingContent": "Downloading message content...",
+    "messageTruncated": "This message was truncated because it exceeds the size limit — only the first part is shown.",
     "copy": "Copy",
     "copyLink": "Copy Link",
     "selectAll": "Select All",

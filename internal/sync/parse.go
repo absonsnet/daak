@@ -233,7 +233,13 @@ func (e *Engine) parseMultipartBody(mr gomessage.MultipartReader, result *Parsed
 		// disposition). part.Body is already transfer-decoded by go-message.
 		if contentType == "application/ms-tnef" ||
 			(disposition == "attachment" && strings.EqualFold(dispParams["filename"], "winmail.dat")) {
-			raw, _ := io.ReadAll(io.LimitReader(part.Body, maxPartSize))
+			// Read maxPartSize+1 so a part landing exactly on the cap is
+			// not misread as truncated (finding 26).
+			raw, _ := io.ReadAll(io.LimitReader(part.Body, maxPartSize+1))
+			if int64(len(raw)) > maxPartSize {
+				result.Truncated = true
+				raw = raw[:maxPartSize]
+			}
 			if inner := email.DecodeTNEFAttachments(raw); len(inner) > 0 {
 				for _, ta := range inner {
 					result.Attachments = append(result.Attachments, &message.Attachment{
@@ -336,8 +342,10 @@ func (e *Engine) parseMultipartBody(mr gomessage.MultipartReader, result *Parsed
 			return
 		}
 
-		// Read text parts
-		lr := io.LimitReader(part.Body, maxPartSize)
+		// Read text parts. The limit is maxPartSize+1 so a part landing
+		// exactly on the cap is not misread as truncated: only a read
+		// past the cap means bytes were cut (finding 26).
+		lr := io.LimitReader(part.Body, maxPartSize+1)
 		partBody, err := io.ReadAll(lr)
 		if err != nil {
 			if len(partBody) > 0 {
@@ -348,7 +356,9 @@ func (e *Engine) parseMultipartBody(mr gomessage.MultipartReader, result *Parsed
 			}
 		}
 
-		if int64(len(partBody)) == maxPartSize {
+		if int64(len(partBody)) > maxPartSize {
+			partBody = partBody[:maxPartSize]
+			result.Truncated = true
 			e.log.Warn().Int("partIndex", partIndex).Int64("maxSize", maxPartSize).Msg("Part body truncated")
 		}
 
@@ -405,14 +415,16 @@ func (e *Engine) parseSinglePartBody(entity *gomessage.Entity, result *ParsedBod
 		return
 	}
 
-	lr := io.LimitReader(entity.Body, maxPartSize)
+	lr := io.LimitReader(entity.Body, maxPartSize+1)
 	body, err := io.ReadAll(lr)
 	if err != nil {
 		e.log.Debug().Err(err).Msg("Failed to read single-part message body")
 		return
 	}
 
-	if int64(len(body)) == maxPartSize {
+	if int64(len(body)) > maxPartSize {
+		body = body[:maxPartSize]
+		result.Truncated = true
 		e.log.Warn().Int64("maxSize", maxPartSize).Msg("Single-part body truncated")
 	}
 
@@ -437,7 +449,9 @@ func (e *Engine) parseSinglePartBody(entity *gomessage.Entity, result *ParsedBod
 // parseMessageBody parses a raw email message and extracts text/plain and text/html parts.
 // This is the legacy parsing path used by buildMessageFromStreamedData (via FetchServerMessage).
 // It does not handle S/MIME or PGP detection - see parseMessageBodyInternal for the modern path.
-func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAttachments bool) {
+// truncated reports whether any part was cut at the 10 MB cap (finding 26);
+// the returned bodies are then only the first part of the message.
+func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAttachments, truncated bool) {
 	reader := bytes.NewReader(raw)
 
 	// Parse the message using go-message
@@ -445,7 +459,7 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 	if err != nil {
 		e.log.Debug().Err(err).Int("rawLen", len(raw)).Msg("Failed to parse message, trying as plain text")
 		// If parsing fails, treat entire content as plain text
-		return string(raw), "", false
+		return string(raw), "", false, false
 	}
 
 	// Log top-level Content-Type for debugging
@@ -493,7 +507,7 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 
 			// Handle nested multipart
 			if strings.HasPrefix(contentType, "multipart/") {
-				nestedText, nestedHTML, nestedAttach := e.parseNestedMultipart(part)
+				nestedText, nestedHTML, nestedAttach, nestedTrunc := e.parseNestedMultipart(part)
 				if bodyText == "" {
 					bodyText = nestedText
 				}
@@ -501,11 +515,13 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 					bodyHTML = nestedHTML
 				}
 				hasAttachments = hasAttachments || nestedAttach
+				truncated = truncated || nestedTrunc
 				continue
 			}
 
 			// Read the part body with size limit to prevent memory exhaustion
-			lr := io.LimitReader(part.Body, maxPartSize)
+			// (maxPartSize+1 so an exactly-at-cap part is not misread as truncated)
+			lr := io.LimitReader(part.Body, maxPartSize+1)
 			partBody, err := io.ReadAll(lr)
 			if err != nil {
 				// Check if we got partial data despite the error (e.g., malformed email missing closing boundary)
@@ -522,8 +538,11 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 				}
 			}
 
-			// Log if we hit the size limit (truncated)
-			if int64(len(partBody)) == maxPartSize {
+			// Past the size limit: keep only the first maxPartSize bytes
+			// and flag the message truncated (finding 26).
+			if int64(len(partBody)) > maxPartSize {
+				partBody = partBody[:maxPartSize]
+				truncated = true
 				e.log.Warn().
 					Int("partIndex", partIndex).
 					Int64("maxSize", maxPartSize).
@@ -591,15 +610,19 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 			Msg("Processing single-part message")
 
 		// Read with size limit to prevent memory exhaustion
-		lr := io.LimitReader(entity.Body, maxPartSize)
+		// (maxPartSize+1 so an exactly-at-cap body is not misread as truncated)
+		lr := io.LimitReader(entity.Body, maxPartSize+1)
 		body, err := io.ReadAll(lr)
 		if err != nil {
 			e.log.Debug().Err(err).Msg("Failed to read single-part message body")
-			return "", "", false
+			return "", "", false, false
 		}
 
-		// Log if we hit the size limit (truncated)
-		if int64(len(body)) == maxPartSize {
+		// Past the size limit: keep only the first maxPartSize bytes
+		// and flag the message truncated (finding 26).
+		if int64(len(body)) > maxPartSize {
+			body = body[:maxPartSize]
+			truncated = true
 			e.log.Warn().
 				Int64("maxSize", maxPartSize).
 				Msg("Single-part body truncated at size limit - saving partial content")
@@ -636,15 +659,15 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 		Bool("hasAttachments", hasAttachments).
 		Msg("parseMessageBody complete")
 
-	return bodyText, bodyHTML, hasAttachments
+	return bodyText, bodyHTML, hasAttachments, truncated
 }
 
 // parseNestedMultipart handles nested multipart structures.
 // This is part of the legacy parsing path used by parseMessageBody.
-func (e *Engine) parseNestedMultipart(entity *gomessage.Entity) (bodyText, bodyHTML string, hasAttachments bool) {
+func (e *Engine) parseNestedMultipart(entity *gomessage.Entity) (bodyText, bodyHTML string, hasAttachments, truncated bool) {
 	mr := entity.MultipartReader()
 	if mr == nil {
-		return "", "", false
+		return "", "", false, false
 	}
 
 	for {
@@ -663,7 +686,7 @@ func (e *Engine) parseNestedMultipart(entity *gomessage.Entity) (bodyText, bodyH
 		}
 
 		if strings.HasPrefix(contentType, "multipart/") {
-			nestedText, nestedHTML, nestedAttach := e.parseNestedMultipart(part)
+			nestedText, nestedHTML, nestedAttach, nestedTrunc := e.parseNestedMultipart(part)
 			if bodyText == "" {
 				bodyText = nestedText
 			}
@@ -671,11 +694,13 @@ func (e *Engine) parseNestedMultipart(entity *gomessage.Entity) (bodyText, bodyH
 				bodyHTML = nestedHTML
 			}
 			hasAttachments = hasAttachments || nestedAttach
+			truncated = truncated || nestedTrunc
 			continue
 		}
 
 		// Read with size limit to prevent memory exhaustion
-		lr := io.LimitReader(part.Body, maxPartSize)
+		// (maxPartSize+1 so an exactly-at-cap part is not misread as truncated)
+		lr := io.LimitReader(part.Body, maxPartSize+1)
 		partBody, err := io.ReadAll(lr)
 		if err != nil {
 			// Check if we got partial data despite the error (e.g., malformed email missing closing boundary)
@@ -690,8 +715,11 @@ func (e *Engine) parseNestedMultipart(entity *gomessage.Entity) (bodyText, bodyH
 			}
 		}
 
-		// Log if we hit the size limit (truncated)
-		if int64(len(partBody)) == maxPartSize {
+		// Past the size limit: keep only the first maxPartSize bytes
+		// and flag the message truncated (finding 26).
+		if int64(len(partBody)) > maxPartSize {
+			partBody = partBody[:maxPartSize]
+			truncated = true
 			e.log.Warn().
 				Int64("maxSize", maxPartSize).
 				Msg("Nested part body truncated at size limit - saving partial content")
@@ -717,7 +745,40 @@ func (e *Engine) parseNestedMultipart(entity *gomessage.Entity) (bodyText, bodyH
 		}
 	}
 
-	return bodyText, bodyHTML, hasAttachments
+	return bodyText, bodyHTML, hasAttachments, truncated
+}
+
+// keepWriter counts every byte written while keeping only the first
+// limit bytes. Used by drainPart so an attachment's true decoded size is
+// recorded even when only a capped prefix is stored (finding 26).
+type keepWriter struct {
+	buf   bytes.Buffer
+	limit int64
+	total int64
+}
+
+func (w *keepWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	w.total += int64(n)
+	if int64(w.buf.Len()) < w.limit {
+		room := w.limit - int64(w.buf.Len())
+		if int64(n) > room {
+			p = p[:room]
+		}
+		w.buf.Write(p)
+	}
+	return n, nil
+}
+
+// drainPart reads a MIME part body fully, returning the first keep bytes
+// and the true decoded size. The old code read through a 10 MB
+// LimitReader, so any larger attachment was recorded at exactly 10 MB
+// (finding 26). The decoded stream is bounded by the 50 MB message cap
+// upstream, so draining cannot run away.
+func drainPart(r io.Reader, keep int64) (kept []byte, total int64, err error) {
+	w := &keepWriter{limit: keep}
+	_, err = io.Copy(w, r)
+	return w.buf.Bytes(), w.total, err
 }
 
 // extractAttachmentMetadata extracts attachment metadata from a MIME part.
@@ -747,29 +808,35 @@ func (e *Engine) extractAttachmentMetadata(part *gomessage.Entity, messageID, co
 		IsInline:    isInline,
 	}
 
-	// Read the attachment content
-	lr := io.LimitReader(part.Body, maxPartSize)
-	content, err := io.ReadAll(lr)
+	// Read the attachment content, counting the true decoded size.
+	// Only inline images keep content (capped at maxInlineContentSize);
+	// file attachments are fetched on-demand, so only their size is
+	// stored — but it must be the real size, not the first 10 MB of it.
+	var keep int64
+	if isInline {
+		keep = maxInlineContentSize
+	}
+	content, total, err := drainPart(part.Body, keep)
 	if err != nil {
 		e.log.Debug().Err(err).Str("filename", filename).Msg("Failed to read attachment content")
 		return att
 	}
 
-	att.Size = len(content)
+	att.Size = int(total)
 
 	if isInline {
 		// For inline images, store content (needed for display in email)
 		// But limit to maxInlineContentSize to prevent huge DB entries
-		if len(content) <= maxInlineContentSize {
+		if total <= maxInlineContentSize {
 			att.Content = content
-			e.log.Debug().Str("filename", filename).Int("size", len(content)).Msg("Extracted inline attachment with content")
+			e.log.Debug().Str("filename", filename).Int("size", int(total)).Msg("Extracted inline attachment with content")
 		} else {
-			e.log.Debug().Str("filename", filename).Int("size", len(content)).Msg("Inline attachment too large, stored metadata only")
+			e.log.Debug().Str("filename", filename).Int("size", int(total)).Msg("Inline attachment too large, stored metadata only")
 		}
 	} else {
 		// For file attachments, we have the size but don't store content
 		// Content will be fetched on-demand when user downloads
-		e.log.Debug().Str("filename", filename).Int("size", len(content)).Msg("Extracted file attachment metadata")
+		e.log.Debug().Str("filename", filename).Int("size", int(total)).Msg("Extracted file attachment metadata")
 	}
 
 	return att

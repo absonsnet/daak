@@ -1585,4 +1585,20 @@ var migrations = []Migration{
 			DELETE FROM send_queue WHERE status IN ('sent', 'cancelled');
 		`,
 	},
+	{
+		Version: 53,
+		SQL: `
+			-- Audit finding 26: truncation at the 10 MB part / 50 MB
+			-- message caps was only a log line; the partial body was
+			-- stored with body_fetched=1, so it looked complete and was
+			-- never retried. body_truncated records that the stored body
+			-- is only the first part of the message (capped at Daak's
+			-- own limits, so a re-fetch would hit the same wall — the
+			-- flag is a viewer disclosure, not a retry gate). It is
+			-- cleared by a full body persist (UpdateBody/
+			-- UpdateBodiesBatch) and by Force Resync
+			-- (ClearBodiesForFolder), like body_failed.
+			ALTER TABLE messages ADD COLUMN body_truncated INTEGER NOT NULL DEFAULT 0;
+		`,
+	},
 }
