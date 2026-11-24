@@ -2094,6 +2094,18 @@
                         onBodyChange={(html, subj) => handleTranslationBodyChange(msg.id, html, subj)}
                       />
 
+                      <!-- Truncated body (audit finding 26): the stored
+                           body is only the first part of the message — a
+                           part hit the 10 MB cap or the whole message hit
+                           the 50 MB cap — so say so instead of showing a
+                           partial message as if it were complete. -->
+                      {#if msg.bodyTruncated}
+                        <div class="flex items-center gap-2 px-3 py-2 mb-4 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-md text-sm text-amber-700 dark:text-amber-300">
+                          <Icon icon="mdi:alert-outline" class="w-4 h-4 flex-shrink-0" />
+                          <span>{$_('viewer.messageTruncated')}</span>
+                        </div>
+                      {/if}
+
                       <!-- Body (use on-view result for S/MIME or PGP messages) -->
                       <div class="mb-4">
                         {#if (msg as any).bodyFetched === false && !msg.bodyHtml && !msg.bodyText}

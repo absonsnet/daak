@@ -19,11 +19,37 @@ type NewMailInfo struct {
 	Subject     string `json:"subject"`
 	FromName    string `json:"fromName"`
 	FromEmail   string `json:"fromEmail"`
+	ThreadID    string `json:"threadId,omitempty"`
 	Count       int    `json:"count"` // Number of new messages
 }
 
 // NewMailCallback is called when new mail arrives
 type NewMailCallback func(info NewMailInfo)
+
+// newMailInfoFromResult builds the notification payload from a sync
+// result (audit finding 25). Count is the number of genuinely inserted
+// messages — not the TotalCount delta, which deletions shrink — and the
+// subject/sender describe the newest inserted message, not whichever
+// conversation happens to be newest overall. Returns nil when nothing
+// new arrived.
+func newMailInfoFromResult(accountID, accountName, folderID string, res *SyncResult) *NewMailInfo {
+	if res == nil || len(res.NewMessageIDs) == 0 {
+		return nil
+	}
+	info := &NewMailInfo{
+		AccountID:   accountID,
+		AccountName: accountName,
+		FolderID:    folderID,
+		Count:       len(res.NewMessageIDs),
+	}
+	if res.Newest != nil {
+		info.Subject = res.Newest.Subject
+		info.FromName = res.Newest.FromName
+		info.FromEmail = res.Newest.FromEmail
+		info.ThreadID = res.Newest.ThreadID
+	}
+	return info
+}
 
 // SyncCompletedCallback is called when a sync operation completes (success or error)
 type SyncCompletedCallback func(accountID, folderID string, err error)
@@ -289,11 +315,12 @@ func (s *Scheduler) syncAccountInbox(acc *account.Account) {
 		return
 	}
 
-	// Get current message count before sync
-	previousCount := inbox.TotalCount
-
-	// Sync messages (use account's sync period setting)
-	if err := s.engine.SyncMessages(ctx, acc.ID, inbox.ID, acc.SyncPeriodDays, false); err != nil {
+	// Sync messages (use account's sync period setting). The result
+	// counts genuinely inserted messages (UID-set diff), not the
+	// TotalCount delta — arrivals masked by same-sync deletions still
+	// notify (audit finding 25).
+	syncResult, err := s.engine.SyncMessagesWithResult(ctx, acc.ID, inbox.ID, acc.SyncPeriodDays, false)
+	if err != nil {
 		if ctx.Err() != nil {
 			s.log.Info().Str("account", acc.Name).Msg("Sync cancelled during message sync")
 			// Notify completion even on cancel so frontend clears progress
@@ -310,33 +337,16 @@ func (s *Scheduler) syncAccountInbox(acc *account.Account) {
 		return
 	}
 
-	// Get updated folder info
-	updatedInbox, err := s.folderStore.Get(inbox.ID)
-	if err != nil {
-		s.log.Error().Err(err).Str("account", acc.Name).Msg("Failed to get updated INBOX folder")
-		// Notify completion with error
-		if s.syncCompletedCallback != nil {
-			s.syncCompletedCallback(acc.ID, inbox.ID, err)
-		}
-		return
-	}
-
-	// Check if there are new messages
-	if updatedInbox != nil && updatedInbox.TotalCount > previousCount {
-		newCount := updatedInbox.TotalCount - previousCount
+	// Notify about genuinely new mail, if any arrived.
+	if info := newMailInfoFromResult(acc.ID, acc.Name, inbox.ID, syncResult); info != nil {
 		s.log.Info().
 			Str("account", acc.Name).
-			Int("newMessages", newCount).
+			Int("newMessages", info.Count).
 			Msg("New messages arrived")
 
 		// Notify about new mail
 		if s.newMailCallback != nil {
-			s.newMailCallback(NewMailInfo{
-				AccountID:   acc.ID,
-				AccountName: acc.Name,
-				FolderID:    inbox.ID,
-				Count:       newCount,
-			})
+			s.newMailCallback(*info)
 		}
 	}
 
@@ -511,14 +521,14 @@ func (s *Scheduler) SyncAccountInboxBlocking(accountID string) (*NewMailInfo, er
 		}
 	}
 
-	// Get current message count before sync
-	previousCount := inbox.TotalCount
-
 	// Sync messages (use account's sync period setting)
 	// IDLE-triggered inbox sync (new mail + cross-client deletions) — use the
 	// lightweight incremental flag path; the scheduled sync above stays the
-	// authoritative full reconciliation.
-	if err := s.engine.SyncMessages(ctx, acc.ID, inbox.ID, acc.SyncPeriodDays, true); err != nil {
+	// authoritative full reconciliation. The result counts genuinely
+	// inserted messages (UID-set diff), not the TotalCount delta, so
+	// arrivals masked by same-sync deletions still notify (finding 25).
+	syncResult, err := s.engine.SyncMessagesWithResult(ctx, acc.ID, inbox.ID, acc.SyncPeriodDays, true)
+	if err != nil {
 		if ctx.Err() != nil {
 			s.log.Info().Str("account", acc.Name).Msg("Sync cancelled during message sync")
 			return nil, ctx.Err()
@@ -526,22 +536,6 @@ func (s *Scheduler) SyncAccountInboxBlocking(accountID string) (*NewMailInfo, er
 		return nil, err
 	}
 
-	// Get updated folder info
-	updatedInbox, err := s.folderStore.Get(inbox.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check if there are new messages
-	if updatedInbox != nil && updatedInbox.TotalCount > previousCount {
-		newCount := updatedInbox.TotalCount - previousCount
-		return &NewMailInfo{
-			AccountID:   acc.ID,
-			AccountName: acc.Name,
-			FolderID:    inbox.ID,
-			Count:       newCount,
-		}, nil
-	}
-
-	return nil, nil
+	// Report genuinely new mail, if any arrived.
+	return newMailInfoFromResult(acc.ID, acc.Name, inbox.ID, syncResult), nil
 }

@@ -197,6 +197,10 @@ func TestMigrationV32_LocalRecordIDsRewrittenToUUIDs(t *testing.T) {
 	if _, err := db.Exec(`ALTER TABLE messages DROP COLUMN body_failed`); err != nil {
 		t.Fatalf("drop messages.body_failed for re-migrate: %v", err)
 	}
+	// And v53's body_truncated on messages.
+	if _, err := db.Exec(`ALTER TABLE messages DROP COLUMN body_truncated`); err != nil {
+		t.Fatalf("drop messages.body_truncated for re-migrate: %v", err)
+	}
 	// And v45's is_hidden on messages.
 	if _, err := db.Exec(`ALTER TABLE messages DROP COLUMN is_hidden`); err != nil {
 		t.Fatalf("drop messages.is_hidden for re-migrate: %v", err)
@@ -378,6 +382,10 @@ func TestMigrationV33_CleansExistingOrphans(t *testing.T) {
 	// And v39's body_failed on messages.
 	if _, err := db.Exec(`ALTER TABLE messages DROP COLUMN body_failed`); err != nil {
 		t.Fatalf("drop messages.body_failed for re-migrate: %v", err)
+	}
+	// And v53's body_truncated on messages.
+	if _, err := db.Exec(`ALTER TABLE messages DROP COLUMN body_truncated`); err != nil {
+		t.Fatalf("drop messages.body_truncated for re-migrate: %v", err)
 	}
 	// And v45's is_hidden on messages.
 	if _, err := db.Exec(`ALTER TABLE messages DROP COLUMN is_hidden`); err != nil {

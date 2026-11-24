@@ -72,6 +72,95 @@ func reconcileUIDs(localUIDs, remoteUIDs []uint32) (newUIDs, deletedUIDs []uint3
 	return newUIDs, deletedUIDs, emptyRemote, massDelete
 }
 
+// SyncResult reports what one SyncMessages run actually inserted locally.
+// The new-mail notification must count genuinely new messages, not the
+// TotalCount delta: 3 arrivals + 2 deletions in one sync is 3 new mail,
+// not 1, and equal arrivals/deletions is new mail, not silence (audit
+// finding 25). NewMessageIDs are the internal IDs of the rows this sync
+// inserted, newest first (highest UID first); Newest is the newest of
+// them, so the notification can describe the counted message instead of
+// whichever conversation happens to be newest overall.
+type SyncResult struct {
+	NewMessageIDs []string
+	NewUIDs       []uint32
+	Newest        *message.Message
+}
+
+// diffNewUIDs returns the UIDs present in after but not in before — the
+// UID-set diff SyncMessagesWithResult counts from. Kept pure so the
+// finding-25 counting rule is unit-testable without an IMAP server.
+func diffNewUIDs(before, after []uint32) []uint32 {
+	beforeSet := make(map[uint32]bool, len(before))
+	for _, uid := range before {
+		beforeSet[uid] = true
+	}
+	var out []uint32
+	for _, uid := range after {
+		if !beforeSet[uid] {
+			out = append(out, uid)
+		}
+	}
+	return out
+}
+
+// newMessageIDs maps new UIDs (highest first) to the internal IDs of the
+// rows actually stored for them, skipping UIDs with no stored row (a
+// header fetch that failed or was skipped mid-batch inserts nothing, so
+// it must not count). Pure over the lookup so it is unit-testable.
+func newMessageIDs(newUIDs []uint32, lookup func(uid uint32) (string, bool)) []string {
+	var ids []string
+	for _, uid := range newUIDs {
+		if id, ok := lookup(uid); ok && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// SyncMessagesWithResult runs SyncMessages and reports the messages it
+// genuinely inserted, by diffing the local UID set before and after.
+// The diff — not the folder TotalCount delta — is the new-mail count:
+// deletions in the same sync (expunges, sync-period purges) shrink the
+// total without shrinking the arrivals, and a header fetch that fails
+// for a UID inserts no row, so only stored rows count. A failed
+// before-snapshot degrades to "no new mail" rather than guessing: with
+// no baseline every local message would look new.
+func (e *Engine) SyncMessagesWithResult(ctx context.Context, accountID, folderID string, syncPeriodDays int, preferIncremental bool) (*SyncResult, error) {
+	before, beforeErr := e.messageStore.GetAllUIDs(folderID)
+	if beforeErr != nil {
+		e.log.Warn().Err(beforeErr).Str("folder", folderID).Msg("New-mail count disabled for this sync: could not snapshot local UIDs")
+	}
+	if err := e.SyncMessages(ctx, accountID, folderID, syncPeriodDays, preferIncremental); err != nil {
+		return nil, err
+	}
+	if beforeErr != nil {
+		return &SyncResult{}, nil
+	}
+	after, err := e.messageStore.GetAllUIDs(folderID)
+	if err != nil {
+		e.log.Warn().Err(err).Str("folder", folderID).Msg("New-mail count disabled for this sync: could not re-read local UIDs")
+		return &SyncResult{}, nil
+	}
+	newUIDs := diffNewUIDs(before, after)
+	if len(newUIDs) == 0 {
+		return &SyncResult{}, nil
+	}
+	// Newest first: higher UIDs arrived later.
+	sort.Slice(newUIDs, func(i, j int) bool { return newUIDs[i] > newUIDs[j] })
+	result := &SyncResult{NewUIDs: newUIDs}
+	result.NewMessageIDs = newMessageIDs(newUIDs, func(uid uint32) (string, bool) {
+		m, err := e.messageStore.GetByUID(folderID, uid)
+		if err != nil || m == nil {
+			return "", false
+		}
+		if result.Newest == nil {
+			result.Newest = m
+		}
+		return m.ID, true
+	})
+	return result, nil
+}
+
 func (e *Engine) SyncMessages(ctx context.Context, accountID, folderID string, syncPeriodDays int, preferIncremental bool) error {
 	// Check context at start
 	if ctx.Err() != nil {
