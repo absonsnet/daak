@@ -227,17 +227,25 @@ func (a *App) GetRunBackground() (bool, error) {
 
 // SetRunBackground sets whether Daak keeps running when the window is closed.
 // Disabling also force-disables start_hidden.
+//
+// Enabling starts the tray icon FIRST, and refuses to persist the
+// setting when the tray cannot start: background mode with no tray
+// icon would strand the window the first time it closes (the close
+// paths hide only when the tray is actually up, but a setting that
+// promises background mode without one is still a lie — and the
+// Settings toggle would show on while nothing can bring the window
+// back).
 func (a *App) SetRunBackground(enabled bool) error {
-	if err := a.settingsStore.SetRunBackground(enabled); err != nil {
-		return err
-	}
 	if !enabled {
+		if err := a.settingsStore.SetRunBackground(false); err != nil {
+			return err
+		}
 		return a.settingsStore.SetStartHidden(false)
 	}
-	// Show the tray icon so the hidden window can be reopened from it.
-	// (Turning it off does not hide the tray; see stopTray.)
-	a.startTray()
-	return nil
+	if !a.startTray() {
+		return fmt.Errorf("could not start the system tray icon, so background mode was not enabled")
+	}
+	return a.settingsStore.SetRunBackground(true)
 }
 
 // GetShowUnreadBadge returns whether the unread count badge is shown on the
@@ -277,9 +285,13 @@ func (a *App) GetStartHidden() (bool, error) {
 
 // SetStartHidden sets whether Daak starts with the window hidden.
 // Enabling also force-enables run_background (start hidden requires background mode).
+// It goes through SetRunBackground so the tray is started on the
+// same path — and a tray that cannot start refuses the whole change
+// instead of writing run_background directly and leaving a hidden
+// window with no tray icon to bring it back.
 func (a *App) SetStartHidden(enabled bool) error {
 	if enabled {
-		if err := a.settingsStore.SetRunBackground(true); err != nil {
+		if err := a.SetRunBackground(true); err != nil {
 			return err
 		}
 	}

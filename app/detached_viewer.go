@@ -1266,7 +1266,6 @@ func (v *ViewerApp) sendReaction(ctx context.Context, messageID, emoji string) e
 	if err != nil {
 		return fmt.Errorf("failed to queue reaction: %w", err)
 	}
-	v.notifyReactionQueued(msg.AccountID, reaction.ReactionSubject(orig.Subject), to.Address, res)
 
 	rec := &reaction.Reaction{
 		MessageID:       msg.ID,
@@ -1282,16 +1281,29 @@ func (v *ViewerApp) sendReaction(ctx context.Context, messageID, emoji string) e
 		return fmt.Errorf("reaction queued but failed to record: %w", err)
 	}
 
+	// Notify last, after the reaction is queued AND recorded: a
+	// failed notification must not lose the pill or invite a retry
+	// that would queue a second reaction email. The reaction is
+	// queued and the pill shows either way — only the countdown
+	// toast is missing — so surface the failure as an error and let
+	// the frontend say Undo lives in the Outbox.
+	if err := v.notifyReactionQueued(msg.AccountID, reaction.ReactionSubject(orig.Subject), to.Address, res); err != nil {
+		log.Warn().Err(err).Str("queueID", res.QueueID).
+			Msg("Reaction queued and recorded, but the main window could not be notified — no countdown toast will appear")
+		return fmt.Errorf("reaction queued, but the main window could not be notified: %w", err)
+	}
+
 	log.Info().Str("messageID", messageID).Str("emoji", emoji).Str("from", from.Address).Str("to", to.Address).Str("queueID", res.QueueID).Msg("Reaction queued")
 	return nil
 }
 
 // notifyReactionQueued tells the main window a reaction was queued,
 // so it can show the countdown toast with Undo. Mirrors the
-// detached composer's notifyMessageQueued.
-func (v *ViewerApp) notifyReactionQueued(accountID, subject, recipient string, res QueueSendResult) {
+// detached composer's notifyMessageQueued: a failed notification is
+// an error to surface, never a silent drop.
+func (v *ViewerApp) notifyReactionQueued(accountID, subject, recipient string, res QueueSendResult) error {
 	if v.ipcClient == nil {
-		return
+		return fmt.Errorf("no IPC connection to the main window")
 	}
 	ipcMsg, err := ipc.NewMessage(ipc.TypeMessageQueued, ipc.MessageQueuedPayload{
 		QueueID:      res.QueueID,
@@ -1302,9 +1314,12 @@ func (v *ViewerApp) notifyReactionQueued(accountID, subject, recipient string, r
 		DelaySeconds: res.DelaySeconds,
 	})
 	if err != nil {
-		return
+		return fmt.Errorf("failed to build message_queued notification: %w", err)
 	}
-	_ = v.ipcClient.Send(ipcMsg)
+	if err := v.ipcClient.Send(ipcMsg); err != nil {
+		return fmt.Errorf("failed to send message_queued notification: %w", err)
+	}
+	return nil
 }
 
 // ownEmailsForAccount returns the user's own addresses for an account

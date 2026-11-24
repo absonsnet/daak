@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -447,6 +448,54 @@ const sendQueueStaleClaimAge = 10 * time.Minute
 // never sends more than this many messages (a quit mid-countdown
 // with a large backlog still drains within a few ticks).
 const sendQueueDispatchBatch = 50
+
+// ReemitPendingCountdowns re-emits sendqueue:queued for every queued
+// send still inside its undo window, with the seconds remaining.
+// Restart recovery: a message queued seconds before a quit would
+// otherwise dispatch on the worker's first tick with no toast ever
+// shown — no undo opportunity. Re-emitting here (called from
+// NotifyStartupComplete, once the frontend is mounted and listening)
+// restores the countdown with the time that is actually left.
+//
+// Only fresh rows qualify: status pending, no dispatch attempt yet,
+// due_at still in the future. A row whose window already elapsed
+// while the app was down dispatches immediately, as before — its
+// undo opportunity lapsed during downtime, and holding it would
+// delay mail the user expected sent. A row in retry backoff
+// (attempts > 0, due_at pushed out) is not in an undo window at all,
+// so no toast is faked for it.
+func (s *sendQueueService) ReemitPendingCountdowns() {
+	items, err := s.store.List()
+	if err != nil {
+		log := logging.WithComponent("sendqueue")
+		log.Warn().Err(err).Msg("Could not list queued sends to restore undo countdowns")
+		return
+	}
+	now := s.clock()
+	for _, item := range items {
+		if item.Status != sendqueue.StatusPending || item.Attempts != 0 {
+			continue
+		}
+		remaining := item.DueAt.Sub(now)
+		if remaining <= 0 {
+			// Window already elapsed: the worker dispatches it on
+			// its next tick, as before.
+			continue
+		}
+		delay := int(math.Ceil(remaining.Seconds()))
+		if delay < 1 {
+			delay = 1
+		}
+		s.emitEvent("sendqueue:queued", map[string]interface{}{
+			"queueId":      item.ID,
+			"accountId":    item.AccountID,
+			"draftId":      item.DraftID,
+			"subject":      item.Subject,
+			"recipient":    item.Recipient,
+			"delaySeconds": delay,
+		})
+	}
+}
 
 // StartWorker starts the background dispatch goroutine. Safe to
 // call twice (second call is a no-op). MAIN PROCESS ONLY.

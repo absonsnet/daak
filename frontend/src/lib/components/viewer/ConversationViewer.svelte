@@ -953,10 +953,20 @@
       await loadReactions(messageId)
     } catch (err) {
       console.error('Send reaction failed:', err)
+      const message = err instanceof Error ? err.message : String(err)
+      if (message.includes('could not be notified')) {
+        // Queued and recorded — only the countdown toast is missing
+        // (the viewer's IPC notification to the main window failed).
+        // The pill shows and Undo lives in the Outbox, so do NOT
+        // reopen the picker: retrying would queue a second reaction.
+        toasts.warning($_('viewer.reactionQueuedButNoToast'))
+        await loadReactions(messageId)
+        return
+      }
       // Reopen the picker so the user can try another emoji.
       reactionPickerMessageId = messageId
       reactionPickerOpen = true
-      toasts.error(`${$_('viewer.failedToSendReaction')}: ${err instanceof Error ? err.message : String(err)}`)
+      toasts.error(`${$_('viewer.failedToSendReaction')}: ${message}`)
     } finally {
       sendingReaction = false
     }

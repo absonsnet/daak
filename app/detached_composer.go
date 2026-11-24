@@ -807,6 +807,13 @@ func (c *ComposerApp) SearchContacts(query string, limit int) ([]*contact.Contac
 // the countdown toast (this window closes right away). The draft row
 // stays in the DB as the Undo payload; the main process's worker
 // deletes it when the message actually dispatches.
+//
+// The IPC notification is load-bearing, not best-effort: without it
+// the countdown toast never appears and the Outbox is the only Undo
+// affordance left. So a failed notification is an error, not a
+// silent return — the message stays queued (the send is NOT
+// cancelled), but the caller keeps this window open and tells the
+// user Undo lives in the Outbox.
 func (c *ComposerApp) QueueSend(accountID string, msg smtp.ComposeMessage, draftID string) (QueueSendResult, error) {
 	// Cancel in-flight draft sync before queueing (mirrors SendMessage)
 	if c.currentDraft != nil {
@@ -822,7 +829,12 @@ func (c *ComposerApp) QueueSend(accountID string, msg smtp.ComposeMessage, draft
 	// later close path cannot treat it as an unsent draft.
 	c.currentDraft = nil
 
-	c.notifyMessageQueued(accountID, msg, res)
+	if err := c.notifyMessageQueued(accountID, msg, res); err != nil {
+		log := logging.WithComponent("composer")
+		log.Warn().Err(err).Str("queue_id", res.QueueID).
+			Msg("Message queued, but the main window could not be notified — no countdown toast will appear")
+		return QueueSendResult{}, fmt.Errorf("message queued, but the main window could not be notified: %w", err)
+	}
 	return res, nil
 }
 
@@ -839,10 +851,13 @@ func (c *ComposerApp) GetUndoSendDelay() (int, error) {
 }
 
 // notifyMessageQueued tells the main window a message was queued, so
-// it can show the countdown toast with Undo.
-func (c *ComposerApp) notifyMessageQueued(accountID string, msg smtp.ComposeMessage, res QueueSendResult) {
+// it can show the countdown toast with Undo. It returns an error when
+// the notification could not be delivered — the caller treats that as
+// a failure to surface (the message stays queued), never a silent
+// drop: without this notification no toast appears anywhere.
+func (c *ComposerApp) notifyMessageQueued(accountID string, msg smtp.ComposeMessage, res QueueSendResult) error {
 	if c.ipcClient == nil {
-		return
+		return fmt.Errorf("no IPC connection to the main window")
 	}
 	recipient := ""
 	if len(msg.To) > 0 {
@@ -857,9 +872,12 @@ func (c *ComposerApp) notifyMessageQueued(accountID string, msg smtp.ComposeMess
 		DelaySeconds: res.DelaySeconds,
 	})
 	if err != nil {
-		return
+		return fmt.Errorf("failed to build message_queued notification: %w", err)
 	}
-	_ = c.ipcClient.Send(ipcMsg)
+	if err := c.ipcClient.Send(ipcMsg); err != nil {
+		return fmt.Errorf("failed to send message_queued notification: %w", err)
+	}
+	return nil
 }
 
 // SendMessage sends the composed email.

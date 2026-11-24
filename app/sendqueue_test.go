@@ -685,3 +685,94 @@ func TestSameDraftContent(t *testing.T) {
 		t.Fatalf("round-trip-only fields compare as different")
 	}
 }
+
+// ReemitPendingCountdowns restores the Undo toast after a restart:
+// rows still inside their undo window re-emit sendqueue:queued with
+// the seconds actually remaining. Rows whose window already elapsed
+// (or that are in retry backoff) get no toast.
+func TestReemitPendingCountdowns(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	var got []map[string]interface{}
+	h.svc.emit = func(event string, data map[string]interface{}) {
+		if event == "sendqueue:queued" {
+			got = append(got, data)
+		}
+	}
+
+	res := h.queue(t)
+
+	// 2s into the 5s window: one event, 3s remaining, same payload
+	// the live queue path emits.
+	h.now = h.now.Add(2 * time.Second)
+	h.svc.ReemitPendingCountdowns()
+	if len(got) != 1 {
+		t.Fatalf("re-emitted %d queued events, want 1", len(got))
+	}
+	ev := got[0]
+	if ev["queueId"] != res.QueueID || ev["accountId"] != "acc-1" ||
+		ev["draftId"] != res.DraftID || ev["subject"] != "hello" ||
+		ev["recipient"] != "ada@example.com" || ev["delaySeconds"] != 3 {
+		t.Fatalf("event = %+v, want queue %q / acc-1 / draft %q / hello / ada@example.com / 3s",
+			ev, res.QueueID, res.DraftID)
+	}
+
+	// Past the window: no toast — the row dispatches on the next tick.
+	got = nil
+	h.now = h.now.Add(4 * time.Second)
+	h.svc.ReemitPendingCountdowns()
+	if len(got) != 0 {
+		t.Fatalf("re-emitted %d queued events past the window, want 0", len(got))
+	}
+}
+
+func TestReemitPendingCountdownsSkipsBackoffRows(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	var got []map[string]interface{}
+	h.svc.emit = func(event string, data map[string]interface{}) {
+		if event == "sendqueue:queued" {
+			got = append(got, data)
+		}
+	}
+
+	res := h.queue(t)
+	// One failed dispatch attempt, retry due in 60s: still pending,
+	// but the undo window is long over — no toast is faked for it.
+	if err := h.svc.store.RecordAttempt(res.QueueID, 1, sendqueue.StatusPending,
+		h.now.Add(60*time.Second), "connection refused"); err != nil {
+		t.Fatalf("RecordAttempt: %v", err)
+	}
+	h.now = h.now.Add(time.Second)
+	h.svc.ReemitPendingCountdowns()
+	if len(got) != 0 {
+		t.Fatalf("re-emitted %d queued events for a backoff row, want 0", len(got))
+	}
+}
+
+func TestReemitPendingCountdownsIncludesReactions(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	var got []map[string]interface{}
+	h.svc.emit = func(event string, data map[string]interface{}) {
+		if event == "sendqueue:queued" {
+			got = append(got, data)
+		}
+	}
+
+	_, err := h.svc.QueueReaction("acc-1",
+		smtp.Address{Name: "Me", Address: "me@example.com"},
+		[]string{"ada@example.com"}, []byte("raw reaction bytes"),
+		"Re: hello", "ada@example.com", "msg-1")
+	if err != nil {
+		t.Fatalf("QueueReaction: %v", err)
+	}
+	// QueueReaction itself emits one live toast event; only the
+	// re-emit after a restart is under test here.
+	got = nil
+	h.now = h.now.Add(2 * time.Second)
+	h.svc.ReemitPendingCountdowns()
+	if len(got) != 1 {
+		t.Fatalf("re-emitted %d queued events for a reaction, want 1", len(got))
+	}
+	if got[0]["draftId"] != "" || got[0]["delaySeconds"] != 3 {
+		t.Fatalf("reaction event = %+v, want draftId \"\" / 3s", got[0])
+	}
+}
