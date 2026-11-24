@@ -1205,13 +1205,36 @@ func (s *Store) GetHighestUID(folderID string) (uint32, error) {
 }
 
 // UpdateBody updates the body content of a message and marks it as fetched
-func (s *Store) UpdateBody(messageID, bodyHTML, bodyText, snippet string, hasAttachments bool) error {
+// UpdateBody persists a single fetched body. It mirrors UpdateBodiesBatch:
+// the raw S/MIME/PGP bodies are stored alongside the text (they are what
+// make an encrypted message decryptable on view), verification status is
+// NOT cached (computed fresh on each view), and an empty raw body is stored
+// as NULL so HasSMIME/HasPGP (computed as raw_body IS NOT NULL) stay
+// accurate. Previously this updated only the text columns, so an encrypted
+// message opened before the background body fetch ran was marked
+// body_fetched=1 with an empty body and its raw body discarded —
+// permanently undecryptable.
+func (s *Store) UpdateBody(u BodyUpdate) error {
 	query := `
 		UPDATE messages
-		SET body_html = ?, body_text = ?, snippet = ?, body_fetched = 1, has_attachments = ?
+		SET body_html = ?, body_text = ?, snippet = ?, body_fetched = 1, has_attachments = ?,
+		    smime_raw_body = ?, smime_encrypted = ?,
+		    pgp_raw_body = ?, pgp_encrypted = ?
 		WHERE id = ?
 	`
-	_, err := s.db.Exec(query, nullString(bodyHTML), nullString(bodyText), nullString(snippet), hasAttachments, messageID)
+	var smimeRawBody interface{}
+	if len(u.SMIMERawBody) > 0 {
+		smimeRawBody = u.SMIMERawBody
+	}
+	var pgpRawBody interface{}
+	if len(u.PGPRawBody) > 0 {
+		pgpRawBody = u.PGPRawBody
+	}
+	_, err := s.db.Exec(query,
+		nullString(u.BodyHTML), nullString(u.BodyText), nullString(u.Snippet), u.HasAttachments,
+		smimeRawBody, u.SMIMEEncrypted,
+		pgpRawBody, u.PGPEncrypted,
+		u.MessageID)
 	if err != nil {
 		return fmt.Errorf("failed to update body: %w", err)
 	}

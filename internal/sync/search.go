@@ -409,8 +409,41 @@ func (e *Engine) FetchServerMessage(ctx context.Context, accountID, folderID str
 	m := e.buildMessageFromStreamedData(accountID, folderID, fetchedUID, envelope, flags, rfc822Size, rawBytes)
 	m.BodyFetched = true
 
+	// Create does not store the raw S/MIME/PGP bodies, and an encrypted
+	// message without its raw body can never be decrypted again — so parse
+	// the full body here (same 30s budget as the batch path) and persist
+	// the raw bytes right after the row exists. If the message is
+	// encrypted but the raw body wasn't captured, leave body_fetched off
+	// so a later body pass retries it instead of stranding a permanently
+	// blank row.
+	var parsed *ParsedBody
+	if len(rawBytes) > 0 {
+		parsed = e.parseMessageBodyFull(rawBytes, "", 30*time.Second)
+		if parsed != nil &&
+			((parsed.SMIMEEncrypted && len(parsed.SMIMERawBody) == 0) ||
+				(parsed.PGPEncrypted && len(parsed.PGPRawBody) == 0)) {
+			m.BodyFetched = false
+		}
+	}
+
 	if err := e.messageStore.Create(m); err != nil {
 		return nil, fmt.Errorf("failed to save message: %w", err)
+	}
+
+	if parsed != nil && (len(parsed.SMIMERawBody) > 0 || len(parsed.PGPRawBody) > 0) {
+		if err := e.messageStore.UpdateBody(message.BodyUpdate{
+			MessageID:      m.ID,
+			BodyHTML:       m.BodyHTML,
+			BodyText:       m.BodyText,
+			Snippet:        m.Snippet,
+			HasAttachments: m.HasAttachments,
+			SMIMERawBody:   parsed.SMIMERawBody,
+			SMIMEEncrypted: parsed.SMIMEEncrypted,
+			PGPRawBody:     parsed.PGPRawBody,
+			PGPEncrypted:   parsed.PGPEncrypted,
+		}); err != nil {
+			return nil, fmt.Errorf("failed to store encrypted raw body: %w", err)
+		}
 	}
 
 	// Extract and store attachments. Replace, don't append (same class

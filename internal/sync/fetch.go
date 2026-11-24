@@ -46,6 +46,26 @@ type ProcessedBody struct {
 	ReceivedBytes int64
 }
 
+// bodyUpdateFromProcessedBody converts a fetched body into the store
+// update. Shared by the batch body-fetch path and the on-demand
+// FetchMessageBody so both persist exactly the same fields — notably the
+// raw S/MIME/PGP bodies that make an encrypted message decryptable on
+// view. (Verification status is deliberately not carried: it is computed
+// fresh on each view.)
+func bodyUpdateFromProcessedBody(pb *ProcessedBody) message.BodyUpdate {
+	return message.BodyUpdate{
+		MessageID:      pb.MessageID,
+		BodyHTML:       pb.BodyHTML,
+		BodyText:       pb.BodyText,
+		Snippet:        pb.Snippet,
+		HasAttachments: pb.HasAttachments,
+		SMIMERawBody:   pb.SMIMERawBody,
+		SMIMEEncrypted: pb.SMIMEEncrypted,
+		PGPRawBody:     pb.PGPRawBody,
+		PGPEncrypted:   pb.PGPEncrypted,
+	}
+}
+
 // FetchMessageBody fetches the body for a single message on-demand.
 // Uses streaming fetch internally to avoid blocking on .Collect().
 func (e *Engine) FetchMessageBody(ctx context.Context, accountID, messageID string) (*message.Message, error) {
@@ -97,9 +117,20 @@ func (e *Engine) FetchMessageBody(ctx context.Context, accountID, messageID stri
 		return nil, fmt.Errorf("message not found on server")
 	}
 
-	// Update message in store
+	// Update message in store, including the raw S/MIME/PGP bodies: they
+	// are what make an encrypted message decryptable on view, and the
+	// on-demand path previously dropped them while still marking the
+	// message body_fetched — permanently blank for encrypted mail.
 	if !result.IsReaction {
-		if err := e.messageStore.UpdateBody(messageID, result.BodyHTML, result.BodyText, result.Snippet, result.HasAttachments); err != nil {
+		// An encrypted message whose raw body wasn't captured must NOT be
+		// marked body_fetched: the row would be excluded from re-fetch
+		// and could never be decrypted. Leave it unfetched so the next
+		// body pass retries it.
+		if (result.SMIMEEncrypted && len(result.SMIMERawBody) == 0) ||
+			(result.PGPEncrypted && len(result.PGPRawBody) == 0) {
+			return nil, fmt.Errorf("encrypted message body could not be stored: raw body missing")
+		}
+		if err := e.messageStore.UpdateBody(bodyUpdateFromProcessedBody(result)); err != nil {
 			return nil, fmt.Errorf("failed to update message body: %w", err)
 		}
 		// Full sync-time enrichment for the on-demand body fetch.
@@ -836,18 +867,8 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 					continue
 				}
 
-				// Build body update
-				bu := message.BodyUpdate{
-					MessageID:      pb.MessageID,
-					BodyHTML:       pb.BodyHTML,
-					BodyText:       pb.BodyText,
-					Snippet:        pb.Snippet,
-					HasAttachments: pb.HasAttachments,
-					SMIMERawBody:   pb.SMIMERawBody,
-					SMIMEEncrypted: pb.SMIMEEncrypted,
-					PGPRawBody:     pb.PGPRawBody,
-					PGPEncrypted:   pb.PGPEncrypted,
-				}
+				// Build body update (same mapping as the on-demand path)
+				bu := bodyUpdateFromProcessedBody(pb)
 				// Full sync-time enrichment: category + code/reference
 				// extraction from the body head. Runs in the processing
 				// goroutine so the DB update (next iteration) carries it.
