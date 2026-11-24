@@ -565,21 +565,27 @@ func (a *App) handleNewMailNotification(info sync.NewMailInfo) {
 		Int("count", info.Count).
 		Msg("New mail notification")
 
-	// Get the most recent conversation for the notification
-	var subject, fromName, fromEmail, threadID string
-
-	inbox, err := a.folderStore.GetByType(info.AccountID, folder.TypeInbox)
-	if err == nil && inbox != nil {
-		// Get the most recent conversation (sorted by newest first)
-		conversations, err := a.messageStore.ListConversationsByFolder(info.FolderID, 0, 1, "newest", "", "", "")
-		if err == nil && len(conversations) > 0 {
-			conv := conversations[0]
-			subject = conv.Subject
-			threadID = conv.ThreadID
-			// Get sender info from participants
-			if len(conv.Participants) > 0 {
-				fromName = conv.Participants[0].Name
-				fromEmail = conv.Participants[0].Email
+	// The scheduler already identifies the newest genuinely new message
+	// (audit finding 25: the counted message, not whichever conversation
+	// happens to be newest overall — an older thread can sort first
+	// when a reply lands, or a deletion can shift the list). Use it
+	// when present; fall back to the newest conversation only when the
+	// info carries no message (e.g. an older scheduler payload).
+	subject, fromName, fromEmail, threadID := info.Subject, info.FromName, info.FromEmail, info.ThreadID
+	if subject == "" && fromEmail == "" {
+		inbox, err := a.folderStore.GetByType(info.AccountID, folder.TypeInbox)
+		if err == nil && inbox != nil {
+			// Get the most recent conversation (sorted by newest first)
+			conversations, err := a.messageStore.ListConversationsByFolder(info.FolderID, 0, 1, "newest", "", "", "")
+			if err == nil && len(conversations) > 0 {
+				conv := conversations[0]
+				subject = conv.Subject
+				threadID = conv.ThreadID
+				// Get sender info from participants
+				if len(conv.Participants) > 0 {
+					fromName = conv.Participants[0].Name
+					fromEmail = conv.Participants[0].Email
+				}
 			}
 		}
 	}
