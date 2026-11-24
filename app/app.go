@@ -1001,9 +1001,11 @@ func (a *App) BeforeClose(ctx context.Context) bool {
 	// restores the last size/position
 	a.saveWindowGeometry()
 
-	// Background mode: hide window instead of quitting
-	runBg, _ := a.settingsStore.GetRunBackground()
-	if runBg {
+	// Background mode: hide window instead of quitting — but only
+	// when the tray icon is actually up. Hiding with no tray leaves
+	// no visible window and no way back, so fall through to the real
+	// quit below instead.
+	if a.canHideOnClose() {
 		log := logging.WithComponent("app")
 		log.Info().Msg("Window close requested, hiding to background")
 		wailsRuntime.WindowHide(a.ctx)
@@ -1066,6 +1068,20 @@ func (a *App) NotifyStartupComplete() {
 			wailsRuntime.WindowMaximise(a.ctx)
 		}
 	}
+}
+
+// canHideOnClose reports whether closing the window may hide it in
+// the background: background mode is on AND the tray icon is
+// actually up this session. A failed tray start is NOT retried here:
+// on Windows the start waits up to 5s for the tray menu, which
+// would stall the close. Callers fall back to a real quit — never a
+// hidden window with no tray icon to bring it back.
+func (a *App) canHideOnClose() bool {
+	if a.settingsStore == nil {
+		return false
+	}
+	runBg, _ := a.settingsStore.GetRunBackground()
+	return runBg && a.trayStarted
 }
 
 // startTrayIfBackground shows the system tray icon when Run in
@@ -1236,12 +1252,13 @@ func (a *App) ShowWindow() {
 }
 
 // CloseWindow handles the window close button click.
-// If background mode is enabled, hides the window instead of quitting.
+// If background mode is enabled and the tray icon is actually up,
+// hides the window instead of quitting. Otherwise quits for real:
+// a hidden window with no tray icon has no way back.
 // Called by the frontend title bar close button.
 func (a *App) CloseWindow() {
 	a.saveWindowGeometry()
-	runBg, _ := a.settingsStore.GetRunBackground()
-	if runBg {
+	if a.canHideOnClose() {
 		log := logging.WithComponent("app")
 		log.Info().Msg("Window close requested, hiding to background")
 		wailsRuntime.WindowHide(a.ctx)
