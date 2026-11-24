@@ -109,11 +109,15 @@ func (e *Engine) FetchMessageBody(ctx context.Context, accountID, messageID stri
 
 	result, ok := results[uid]
 	if !ok || result == nil {
-		// Message no longer exists on server — clean up the ghost
-		e.log.Warn().Str("messageID", messageID).Uint32("uid", uid).Msg("Message not found on server, deleting ghost")
-		if delErr := e.messageStore.Delete(messageID); delErr != nil {
-			e.log.Debug().Err(delErr).Str("messageID", messageID).Msg("Failed to delete ghost message")
-		}
+		// The server did not return this UID. That does not prove the
+		// message is gone: a transient empty fetch, or a just-moved
+		// message whose destination sync hasn't completed yet, looks
+		// identical — and deleting here destroys local state (read flag,
+		// enrichment) the server copy may still hold. Leave the row so
+		// the next open (or sync) retries it. Only a confirmed expunge —
+		// the UID missing from a complete folder listing during sync —
+		// deletes local rows (see reconcileUIDs).
+		e.log.Warn().Str("messageID", messageID).Uint32("uid", uid).Msg("Message body not returned by server, leaving local copy")
 		return nil, fmt.Errorf("message not found on server")
 	}
 
@@ -288,10 +292,12 @@ func (e *Engine) fetchMessageBodiesBatch(ctx context.Context, client *imapclient
 		}
 
 		if len(rawBytes) == 0 {
-			e.log.Warn().Uint32("uid", uid).Str("messageID", messageID).Msg("Empty message body — deleting ghost message")
-			if delErr := e.messageStore.Delete(messageID); delErr != nil {
-				e.log.Warn().Err(delErr).Str("messageID", messageID).Msg("Failed to delete ghost message")
-			}
+			// An empty fetch is not proof the message is gone (transient
+			// failure, or a just-moved message not yet on the server in
+			// this folder). Never delete the local row here: leave it so
+			// the next fetch retries it. Only a confirmed expunge during
+			// sync deletes local rows (see reconcileUIDs).
+			e.log.Warn().Uint32("uid", uid).Str("messageID", messageID).Msg("Empty message body — leaving local copy")
 			continue
 		}
 
@@ -954,6 +960,13 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 // FetchRawMessage fetches the raw RFC822 content of a message from the IMAP server.
 // Uses streaming fetch to avoid blocking on .Collect().
 func (e *Engine) FetchRawMessage(ctx context.Context, accountID, folderID string, uid uint32) ([]byte, error) {
+	// UID 0 is never a real server UID (a just-moved message has no server
+	// UID yet — see GetMessageUIDAndFolder). Refuse rather than issuing a
+	// fetch the server cannot answer.
+	if uid == 0 {
+		return nil, fmt.Errorf("cannot fetch raw message without a server UID")
+	}
+
 	// Get folder path
 	f, err := e.folderStore.Get(folderID)
 	if err != nil {

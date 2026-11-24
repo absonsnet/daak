@@ -1445,6 +1445,16 @@ func (s *Store) GetMessageUIDAndFolder(messageID string) (uint32, string, error)
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to get message: %w", err)
 	}
+	// A just-moved message carries a negative placeholder UID (uid = -rowid,
+	// written by MoveMessages until the destination sync fetches the real
+	// UID and DeleteTempUIDs cleans the row up). Converting it to uint32
+	// would yield a huge bogus UID that the server can never return, and a
+	// fetch under it returns nothing — which the old body-fetch code then
+	// treated as a "ghost" and deleted. Refuse instead: callers leave the
+	// row alone and the destination sync resolves it.
+	if uidI64 <= 0 {
+		return 0, "", fmt.Errorf("message has no server UID yet (placeholder UID): %s", messageID)
+	}
 	return uint32(uidI64), folderID, nil
 }
 
