@@ -109,6 +109,23 @@ const (
 	EditScopeAll           EditScope = "all"
 )
 
+// wrapCalendarConflict rewrites an ErrConflict from a remote push/delete
+// into an error that names the event and states the outcome: the user's
+// change was NOT applied and the server version was kept. The composer
+// shows this text in its error area and the delete/drag paths toast it, so
+// the conflict reaches the user through the existing error paths instead of
+// as a bare "server-side conflict". Non-conflict errors pass through
+// unchanged (the caller wraps them with its own context).
+func wrapCalendarConflict(err error, summary, action string) error {
+	if !errors.Is(err, ErrConflict) {
+		return err
+	}
+	if summary == "" {
+		summary = "Untitled event"
+	}
+	return fmt.Errorf("calendar: %q changed on the server — your %s was not applied and the server version was kept. Refresh the calendar to see it, then re-apply your change: %w", summary, action, err)
+}
+
 // CreateEvent serializes the input as a VEVENT, pushes to the remote (no-op
 // for local), then inserts the events row plus any VALARM-driven event_alarms
 // rows. The bridge calls AlarmScheduler.Reevaluate() after.
@@ -184,6 +201,17 @@ func (a *API) CreateEvent(in EventInput) (string, error) {
 		}
 	}
 	if err != nil {
+		// A create collision (If-None-Match: * rejected) means the
+		// resource already exists on the server: name the event and say
+		// the server copy was kept, rather than surfacing a bare
+		// "server-side conflict".
+		if errors.Is(err, ErrConflict) {
+			summary := in.Summary
+			if summary == "" {
+				summary = "Untitled event"
+			}
+			return "", fmt.Errorf("calendar: an event named %q already exists on the server — your new event was not saved and the server copy was kept: %w", summary, err)
+		}
 		// Transport-level failure → soft-commit + enqueue. Drain
 		// (triggered by next sync / system:network-online) replays the
 		// push and fills in ETag + ProviderEventID. Any other error
@@ -289,6 +317,9 @@ func (a *API) updateInstance(src Source, cal Calendar, master Event, in EventInp
 		In:               in,
 	})
 	if err != nil {
+		if errors.Is(err, ErrConflict) {
+			return wrapCalendarConflict(err, master.Summary, "edit")
+		}
 		return fmt.Errorf("push instance to remote: %w", err)
 	}
 
@@ -493,6 +524,9 @@ func (a *API) DeleteEvent(eventID string, scope EditScope) error {
 		defer cancel()
 		derr := provider.DeleteRemote(delCtx, *src, *cal, *master)
 		if derr != nil {
+			if errors.Is(derr, ErrConflict) {
+				return wrapCalendarConflict(derr, master.Summary, "delete")
+			}
 			if !errors.Is(derr, ErrTransport) || a.queue == nil {
 				return fmt.Errorf("delete event on remote: %w", derr)
 			}
@@ -602,6 +636,9 @@ func (a *API) updateAllAndPush(src Source, cal Calendar, master Event, in EventI
 		}
 	}
 	if err != nil {
+		if errors.Is(err, ErrConflict) {
+			return wrapCalendarConflict(err, ev.Summary, "edit")
+		}
 		if !errors.Is(err, ErrTransport) || a.queue == nil {
 			return fmt.Errorf("push event to remote: %w", err)
 		}

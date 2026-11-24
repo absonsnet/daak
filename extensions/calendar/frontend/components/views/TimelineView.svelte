@@ -646,6 +646,12 @@
       // block.instance position which is the ORIGINAL (since no commit
       // happened) → natural snap-back to where the user grabbed it.
       toasts.error($_('calendar.drag.errorSave', { values: { message: String(err) } }))
+      // A server-side conflict means the server version was kept and the
+      // drag was not applied: pull the server version in so the block
+      // snaps back to the current state, not a stale one.
+      if (String(err).includes('server-side conflict')) {
+        void calendarSources.syncAll()
+      }
     } finally {
       saving = false
       dragState = null
