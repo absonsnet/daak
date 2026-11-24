@@ -96,18 +96,18 @@ func TestParseEmpty(t *testing.T) {
 func TestDomainMismatch(t *testing.T) {
 	cases := []struct {
 		sender, host string
-		want          bool
+		want         bool
 	}{
 		{"news@example.com", "example.com", false},
-		{"news@example.com", "news.example.com", false},       // subdomain of sender
-		{"news@example.com", "unsub.example.com", false},      // subdomain of sender
-		{"news@example.com", "other.com", true},               // unrelated
-		{"news@example.com", "links.sendgrid.net", false},     // known ESP
+		{"news@example.com", "news.example.com", false},             // subdomain of sender
+		{"news@example.com", "unsub.example.com", false},            // subdomain of sender
+		{"news@example.com", "other.com", true},                     // unrelated
+		{"news@example.com", "links.sendgrid.net", false},           // known ESP
 		{"news@example.com", "example.us10.list-manage.com", false}, // known ESP subdomain
 		{"news@example.com", "evil-sendgrid.net.evil.com", true},    // lookalike, not ESP
-		{"news@example.com", "", false},                       // nothing to compare
-		{"", "other.com", false},                              // no sender domain
-		{"NEWS@EXAMPLE.COM", "EXAMPLE.com", false},            // case-insensitive
+		{"news@example.com", "", false},                             // nothing to compare
+		{"", "other.com", false},                                    // no sender domain
+		{"NEWS@EXAMPLE.COM", "EXAMPLE.com", false},                  // case-insensitive
 	}
 	for _, c := range cases {
 		if got := DomainMismatch(c.sender, c.host); got != c.want {
@@ -215,5 +215,146 @@ func TestBuildMailtoMessageBadAddress(t *testing.T) {
 	}
 	if _, _, err := BuildMailtoMessage("Me", "not-an-address", "unsub@sender.example", "x"); err == nil {
 		t.Fatal("BuildMailtoMessage(bad from) succeeded, want error")
+	}
+}
+
+func TestParseMailtoSubjectStripsCRLF(t *testing.T) {
+	// Finding 12: a %0d%0a in the mailto subject must not survive
+	// into the parsed target — it would otherwise be written raw as
+	// a header line by BuildMailtoMessage.
+	got := Parse("<mailto:unsub@example.com?subject=hi%0d%0aBcc%3A%20victim%40example.com>", false)
+	if got.Method != MethodMailto {
+		t.Fatalf("Method = %q, want mailto", got.Method)
+	}
+	if strings.ContainsAny(got.MailtoSubject, "\r\n") {
+		t.Fatalf("MailtoSubject = %q, still contains CR/LF", got.MailtoSubject)
+	}
+	if got.MailtoSubject != "hiBcc: victim@example.com" {
+		t.Fatalf("MailtoSubject = %q, want the injected line folded into the subject text", got.MailtoSubject)
+	}
+}
+
+func TestBuildMailtoMessageStripsCRLFInjection(t *testing.T) {
+	// Finding 12: a crafted subject / display name carrying CRLF
+	// must not inject headers into the sent message.
+	raw, _, err := BuildMailtoMessage(
+		"Me\r\nBcc: injected@example.com",
+		"me@example.com",
+		"unsub@sender.example",
+		"hi\r\nBcc: victim@example.com",
+	)
+	if err != nil {
+		t.Fatalf("BuildMailtoMessage() error = %v", err)
+	}
+	msg, err := mail.ReadMessage(strings.NewReader(string(raw)))
+	if err != nil {
+		t.Fatalf("mail.ReadMessage() error = %v", err)
+	}
+	if got := msg.Header.Get("Bcc"); got != "" {
+		t.Errorf("Bcc = %q, want no injected Bcc header", got)
+	}
+	if got := msg.Header.Get("Subject"); got != "hiBcc: victim@example.com" {
+		t.Errorf("Subject = %q, want the injected line folded into the subject text", got)
+	}
+	if got := msg.Header.Get("From"); got != `"MeBcc: injected@example.com" <me@example.com>` {
+		t.Errorf("From = %q, want the injected line folded into a quoted display name", got)
+	}
+	// The raw bytes must contain no injected header line at all.
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		if strings.HasPrefix(line, "Bcc:") {
+			t.Errorf("raw message contains injected header line %q", line)
+		}
+	}
+}
+
+func TestPostOneClickRefuses302ToGET(t *testing.T) {
+	// Finding 13: a 302 turns the POST into a GET the endpoint never
+	// sees, so it must fail — never be reported as success.
+	landed := 0
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/unsub":
+			http.Redirect(w, r, "/landed", http.StatusFound)
+		case "/landed":
+			landed++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	if err := PostOneClick(context.Background(), srv.URL+"/unsub", srv.Client()); err == nil {
+		t.Fatal("PostOneClick(302 to GET endpoint) succeeded, want error")
+	}
+	if landed != 0 {
+		t.Errorf("redirect target hit %d times, want 0 (redirect must be refused before following)", landed)
+	}
+}
+
+func TestPostOneClickFollows307Repost(t *testing.T) {
+	// Finding 13: a 307 to https re-POSTs the body and still succeeds.
+	testPostOneClickFollowsMethodPreservingRedirect(t, http.StatusTemporaryRedirect)
+}
+
+func TestPostOneClickFollows308Repost(t *testing.T) {
+	// Finding 13: a 308 to https re-POSTs the body and still succeeds.
+	testPostOneClickFollowsMethodPreservingRedirect(t, http.StatusPermanentRedirect)
+}
+
+func testPostOneClickFollowsMethodPreservingRedirect(t *testing.T, status int) {
+	t.Helper()
+	var gotMethod, gotBody string
+	var finalHits int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/unsub":
+			http.Redirect(w, r, "/final", status)
+		case "/final":
+			finalHits++
+			gotMethod = r.Method
+			body, _ := io.ReadAll(r.Body)
+			gotBody = string(body)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	if err := PostOneClick(context.Background(), srv.URL+"/unsub", srv.Client()); err != nil {
+		t.Fatalf("PostOneClick(%d to https) error = %v, want success with re-POST", status, err)
+	}
+	if finalHits != 1 {
+		t.Fatalf("final endpoint hit %d times, want 1", finalHits)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotBody != "List-Unsubscribe=One-Click" {
+		t.Errorf("body = %q, want List-Unsubscribe=One-Click", gotBody)
+	}
+}
+
+func TestPostOneClickRefusesDowngrade(t *testing.T) {
+	// Finding 13: an https→http redirect must fail, even when the
+	// status (307) would preserve the POST.
+	plainHits := 0
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		plainHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer plain.Close()
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/landed", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	if err := PostOneClick(context.Background(), srv.URL+"/unsub", srv.Client()); err == nil {
+		t.Fatal("PostOneClick(https→http downgrade) succeeded, want error")
+	}
+	if plainHits != 0 {
+		t.Errorf("plain-http target hit %d times, want 0 (downgrade must be refused before following)", plainHits)
 	}
 }
