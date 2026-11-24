@@ -22,6 +22,7 @@ package unsubscribe
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -245,9 +246,13 @@ func Resolve(raw string, oneClick bool, senderEmail string) Target {
 // PostOneClick fires the RFC 8058 one-click POST: body
 // "List-Unsubscribe=One-Click" to an https URL. http URLs are refused
 // outright — the caller must degrade those to the browser. A non-2xx
-// response is an error; the server may redirect (the default client
-// follows up to 10). The client is injected so tests can point it at a
-// local TLS server; nil uses a 15-second default client.
+// response is an error. Redirects follow oneClickCheckRedirect: only
+// 307/308 re-POSTs to an https URL are followed; 301/302/303 (which
+// would turn the POST into a GET the endpoint never sees) and any
+// redirect off https are errors, so success is never reported when the
+// endpoint never received the POST. The client is injected so tests
+// can point it at a local TLS server; nil uses a 15-second default
+// client.
 func PostOneClick(ctx context.Context, targetURL string, client *http.Client) error {
 	u, err := url.Parse(targetURL)
 	if err != nil {
@@ -259,13 +264,18 @@ func PostOneClick(ctx context.Context, targetURL string, client *http.Client) er
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
+	// Clone so the caller's client (and its redirect policy) is
+	// untouched; the one-click redirect policy below is the security
+	// boundary for this POST.
+	effective := *client
+	effective.CheckRedirect = oneClickCheckRedirect
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL,
 		strings.NewReader("List-Unsubscribe=One-Click"))
 	if err != nil {
 		return fmt.Errorf("failed to build unsubscribe request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := client.Do(req)
+	resp, err := effective.Do(req)
 	if err != nil {
 		return fmt.Errorf("unsubscribe request failed: %w", err)
 	}
@@ -274,6 +284,37 @@ func PostOneClick(ctx context.Context, targetURL string, client *http.Client) er
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unsubscribe endpoint returned %s", resp.Status)
+	}
+	return nil
+}
+
+// oneClickCheckRedirect is the redirect policy for the RFC 8058
+// one-click POST. The default client follows up to 10 redirects and
+// converts POST to GET on 301/302/303, dropping the body — the
+// endpoint would never see the unsubscribe, yet any 2xx from the
+// redirect target would be reported as success. So:
+//
+//   - 301/302/303 are refused outright (they would turn the POST into
+//     a GET);
+//   - 307/308 are followed only while they stay on https, re-sending
+//     the POST body;
+//   - any redirect off https, including an https→http downgrade, is
+//     refused.
+//
+// A refused redirect is an error from PostOneClick, so the unsubscribe
+// is never recorded as done when the endpoint never received the POST.
+func oneClickCheckRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("unsubscribe redirect: stopped after 10 redirects")
+	}
+	if !strings.EqualFold(req.URL.Scheme, "https") {
+		return fmt.Errorf("unsubscribe redirect: refusing redirect to non-https URL %q", req.URL.String())
+	}
+	// Go builds the redirect request with the converted method before
+	// calling CheckRedirect, so a POST that became a GET shows up
+	// here as req.Method GET with a POST in via.
+	if len(via) > 0 && via[len(via)-1].Method == http.MethodPost && req.Method != http.MethodPost {
+		return errors.New("unsubscribe redirect: refusing POST-to-GET redirect (301/302/303); the endpoint would never receive the POST")
 	}
 	return nil
 }

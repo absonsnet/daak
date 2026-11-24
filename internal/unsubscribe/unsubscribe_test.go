@@ -266,3 +266,95 @@ func TestBuildMailtoMessageStripsCRLFInjection(t *testing.T) {
 		}
 	}
 }
+
+func TestPostOneClickRefuses302ToGET(t *testing.T) {
+	// Finding 13: a 302 turns the POST into a GET the endpoint never
+	// sees, so it must fail — never be reported as success.
+	landed := 0
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/unsub":
+			http.Redirect(w, r, "/landed", http.StatusFound)
+		case "/landed":
+			landed++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	if err := PostOneClick(context.Background(), srv.URL+"/unsub", srv.Client()); err == nil {
+		t.Fatal("PostOneClick(302 to GET endpoint) succeeded, want error")
+	}
+	if landed != 0 {
+		t.Errorf("redirect target hit %d times, want 0 (redirect must be refused before following)", landed)
+	}
+}
+
+func TestPostOneClickFollows307Repost(t *testing.T) {
+	// Finding 13: a 307 to https re-POSTs the body and still succeeds.
+	testPostOneClickFollowsMethodPreservingRedirect(t, http.StatusTemporaryRedirect)
+}
+
+func TestPostOneClickFollows308Repost(t *testing.T) {
+	// Finding 13: a 308 to https re-POSTs the body and still succeeds.
+	testPostOneClickFollowsMethodPreservingRedirect(t, http.StatusPermanentRedirect)
+}
+
+func testPostOneClickFollowsMethodPreservingRedirect(t *testing.T, status int) {
+	t.Helper()
+	var gotMethod, gotBody string
+	var finalHits int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/unsub":
+			http.Redirect(w, r, "/final", status)
+		case "/final":
+			finalHits++
+			gotMethod = r.Method
+			body, _ := io.ReadAll(r.Body)
+			gotBody = string(body)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	if err := PostOneClick(context.Background(), srv.URL+"/unsub", srv.Client()); err != nil {
+		t.Fatalf("PostOneClick(%d to https) error = %v, want success with re-POST", status, err)
+	}
+	if finalHits != 1 {
+		t.Fatalf("final endpoint hit %d times, want 1", finalHits)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotBody != "List-Unsubscribe=One-Click" {
+		t.Errorf("body = %q, want List-Unsubscribe=One-Click", gotBody)
+	}
+}
+
+func TestPostOneClickRefusesDowngrade(t *testing.T) {
+	// Finding 13: an https→http redirect must fail, even when the
+	// status (307) would preserve the POST.
+	plainHits := 0
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		plainHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer plain.Close()
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/landed", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	if err := PostOneClick(context.Background(), srv.URL+"/unsub", srv.Client()); err == nil {
+		t.Fatal("PostOneClick(https→http downgrade) succeeded, want error")
+	}
+	if plainHits != 0 {
+		t.Errorf("plain-http target hit %d times, want 0 (downgrade must be refused before following)", plainHits)
+	}
+}
