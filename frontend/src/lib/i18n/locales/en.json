@@ -131,6 +131,8 @@
     "outboxUndo": "Undo send",
     "outboxRetry": "Retry",
     "outboxDiscard": "Discard",
+    "flagsUnsynced": "{count} read/star change(s) haven't synced to the server yet — they will be re-sent automatically.",
+    "flagsUnsyncedRetry": "Retry now",
     "outboxSendAt": "Sending at {time}",
     "outboxHistory": "Sent & cancelled",
     "outboxReaction": "Reaction",

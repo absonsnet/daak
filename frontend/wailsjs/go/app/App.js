@@ -786,6 +786,10 @@ export function GetPendingMailto() {
   return window['go']['app']['App']['GetPendingMailto']();
 }
 
+export function GetPendingFlagChangeCount() {
+  return window['go']['app']['App']['GetPendingFlagChangeCount']();
+}
+
 export function GetReadReceiptResponsePolicy() {
   return window['go']['app']['App']['GetReadReceiptResponsePolicy']();
 }
@@ -1408,6 +1412,10 @@ export function ResolveMessageUID(arg1) {
 
 export function RetrySendQueueItem(arg1) {
   return window['go']['app']['App']['RetrySendQueueItem'](arg1);
+}
+
+export function RetryPendingFlagChanges() {
+  return window['go']['app']['App']['RetryPendingFlagChanges']();
 }
 
 export function RunEnrichmentBackfill() {

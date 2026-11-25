@@ -1685,4 +1685,34 @@ var migrations = []Migration{
 				WHERE kind = 'reaction' AND reaction_message_id <> '' AND status IN ('pending', 'sending');
 		`,
 	},
+	{
+		Version: 57,
+		SQL: `
+			-- Fourth-audit finding 18: read/star is written locally
+			-- first and pushed to IMAP in the background (3 tries,
+			-- then the error was only logged); the next sync
+			-- downloaded the server's flags and overwrote the local
+			-- ones, silently flipping the change back. Keep a small
+			-- queue of un-pushed local flag changes: a row per
+			-- (message, flag), upserted on every local flip so a
+			-- later flip replaces the earlier one, deleted when the
+			-- push succeeds. While a row exists, the sync flag
+			-- paths must not overwrite that flag (see
+			-- UpdateFlagsByUIDBatch). Rows are re-pushed after a
+			-- sync and on demand from the warning in the UI.
+			CREATE TABLE IF NOT EXISTS pending_flag_changes (
+				id TEXT PRIMARY KEY,
+				account_id TEXT NOT NULL,
+				folder_id TEXT NOT NULL,
+				message_id TEXT NOT NULL,
+				uid INTEGER NOT NULL,
+				flag_type TEXT NOT NULL CHECK (flag_type IN ('read', 'starred')),
+				flag_value INTEGER NOT NULL,
+				created_at TEXT NOT NULL,
+				UNIQUE (message_id, flag_type)
+			);
+			CREATE INDEX IF NOT EXISTS idx_pending_flag_changes_account
+				ON pending_flag_changes (account_id);
+		`,
+	},
 }

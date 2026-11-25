@@ -416,6 +416,8 @@ export function GetPGPSignPolicy(arg1:string):Promise<string>;
 
 export function GetPendingMailto():Promise<app.MailtoData>;
 
+export function GetPendingFlagChangeCount():Promise<number>;
+
 export function GetReadReceiptResponsePolicy():Promise<string>;
 
 export function GetRunBackground():Promise<boolean>;
@@ -727,6 +729,8 @@ export function ReorderAccounts(arg1:Array<string>):Promise<void>;
 export function ResolveMessageUID(arg1:string):Promise<number>;
 
 export function RetrySendQueueItem(arg1:string):Promise<void>;
+
+export function RetryPendingFlagChanges():Promise<number>;
 
 export function RunEnrichmentBackfill():Promise<number>;
 

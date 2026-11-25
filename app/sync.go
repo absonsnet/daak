@@ -143,6 +143,11 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 	// fails the sync itself.
 	a.applySenderRules(accountID, folderID)
 
+	// Fourth-audit finding 18: a successful sync means the server is
+	// reachable again, so re-push any local read/star changes whose
+	// earlier push failed. They stay queued if this push fails too.
+	go a.retryPendingFlagsForAccount(accountID)
+
 	// Registry size trend: a key that never disappears is a leaked entry.
 	a.syncMu.Lock()
 	activeKeys := make([]string, 0, len(a.syncContexts))

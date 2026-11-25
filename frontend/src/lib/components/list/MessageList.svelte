@@ -19,7 +19,7 @@
   import { cn } from '$lib/utils'
   import { Button } from '$lib/components/ui/button'
   // @ts-ignore - wailsjs bindings
-  import { GetConversations, GetConversationCount, SyncFolder, ForceSyncFolder, CancelFolderSync, SetMessageListSortOrder, GetUnifiedFolderConversations, GetUnifiedFolderCount, SearchConversations, SearchUnifiedFolder, GetSearchCount, GetSearchCountUnifiedFolder, GetFTSIndexStatus, IsFTSIndexing, Trash, DeletePermanently, EmptyTrash, EmptySpam, Undo, IMAPSearchFolder, FetchServerMessage, MarkAsRead, MarkAsUnread, Archive, Star, Unstar, MarkAsSpam, MarkAsNotSpam, MoveToFolder, GetAccounts, GetCategoryCounts, GetInboxTabDefault, MailMerge_ListQueue, MailMerge_SendUnsent, MailMerge_CancelQueuedItem, ListSendQueue, RetrySendQueueItem, DeleteSendQueueItem } from '../../../../wailsjs/go/app/App'
+  import { GetConversations, GetConversationCount, SyncFolder, ForceSyncFolder, CancelFolderSync, SetMessageListSortOrder, GetUnifiedFolderConversations, GetUnifiedFolderCount, SearchConversations, SearchUnifiedFolder, GetSearchCount, GetSearchCountUnifiedFolder, GetFTSIndexStatus, IsFTSIndexing, Trash, DeletePermanently, EmptyTrash, EmptySpam, Undo, IMAPSearchFolder, FetchServerMessage, MarkAsRead, MarkAsUnread, Archive, Star, Unstar, MarkAsSpam, MarkAsNotSpam, MoveToFolder, GetAccounts, GetCategoryCounts, GetInboxTabDefault, MailMerge_ListQueue, MailMerge_SendUnsent, MailMerge_CancelQueuedItem, ListSendQueue, RetrySendQueueItem, DeleteSendQueueItem, GetPendingFlagChangeCount, RetryPendingFlagChanges } from '../../../../wailsjs/go/app/App'
   import { toasts } from '$lib/stores/toast'
   import { _ } from '$lib/i18n'
   import { ConfirmDialog } from '$lib/components/ui/confirm-dialog'
@@ -247,6 +247,34 @@
   let queueError = $state<string | null>(null)
   let expandedQueueId = $state<string | null>(null)
   let queueActionBusy = $state('')
+
+  // Un-pushed read/star changes (audit4 finding 18): the server push
+  // failed and the changes are queued locally. Shown as a banner with
+  // a Retry button; the count comes from the backend and refreshes on
+  // the messages:flagsUnsynced event.
+  let pendingFlagCount = $state(0)
+  let pendingFlagsBusy = $state(false)
+
+  async function loadPendingFlagCount() {
+    try {
+      pendingFlagCount = await GetPendingFlagChangeCount()
+    } catch (err) {
+      console.error('Failed to load pending flag change count:', err)
+    }
+  }
+
+  async function retryPendingFlagChanges() {
+    pendingFlagsBusy = true
+    try {
+      await RetryPendingFlagChanges()
+      await loadPendingFlagCount()
+    } catch (err) {
+      console.error('Retry pending flag changes failed:', err)
+      toasts.error((err as Error)?.message ?? String(err))
+    } finally {
+      pendingFlagsBusy = false
+    }
+  }
 
   const waitingQueueItems = $derived(queueItems.filter((i) => i.status === 'queued' || i.status === 'sending' || i.status === 'pending'))
   // "Send unsent now" only dispatches Mail Merge rows — normal sends
@@ -720,6 +748,13 @@
     EventsOn('sendqueue:updated', () => {
       if (isOutboxView) void loadQueue()
     })
+
+    // Un-pushed read/star changes (audit4 finding 18): refresh the
+    // banner count whenever a push fails or a re-push lands.
+    EventsOn('messages:flagsUnsynced', (data: { count: number }) => {
+      pendingFlagCount = data.count ?? 0
+    })
+    void loadPendingFlagCount()
 
     // Category tab default (Phase E): the user's Settings → Categories
     // pick, "all" unless they chose otherwise. If it differs from the
@@ -2604,6 +2639,24 @@
           style="width: {indexProgress}%"
         ></div>
       </div>
+    </div>
+  {/if}
+
+  <!-- Read/star changes not synced (audit4 finding 18): the local
+       change is kept and will be re-pushed, but the server still has
+       the old flags — say so, with a Retry button. -->
+  {#if pendingFlagCount > 0}
+    <div class="flex items-center gap-2 px-4 py-2 bg-amber-500/10 border-b border-border">
+      <Icon icon="mdi:alert-circle-outline" class="w-4 h-4 text-amber-600 flex-shrink-0" />
+      <span class="flex-1 min-w-0 text-sm text-amber-800 dark:text-amber-200">{$_('messageList.flagsUnsynced', { values: { count: pendingFlagCount } })}</span>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={pendingFlagsBusy}
+        onclick={retryPendingFlagChanges}
+      >
+        {$_('messageList.flagsUnsyncedRetry')}
+      </Button>
     </div>
   {/if}
 
