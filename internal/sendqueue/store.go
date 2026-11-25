@@ -11,8 +11,12 @@
 // structure) and the worker sends them raw.
 //
 // Sent rows are deleted on success and undone rows on Undo — the
-// Outbox keeps no history; the Sent folder is the record. Failed
-// rows stay, with Retry.
+// Outbox keeps no history; the Sent folder is the record. The one
+// exception is a StatusSentUnsaved row (re-audit finding R24): a
+// mail that was delivered but whose Sent-folder save failed stays
+// as a persistent warning, because the Sent folder is not the
+// record for that mail — there is no copy of it anywhere else.
+// Failed rows stay, with Retry.
 //
 // This package owns persistence and the retry policy only. The worker
 // itself lives in the app package (it needs composeOps), and the
@@ -36,6 +40,16 @@ const (
 	StatusSent      = "sent"      // kept for Stats/tests; rows are deleted on success, so none persist
 	StatusFailed    = "failed"    // permanent error, or attempts exhausted
 	StatusCancelled = "cancelled" // kept for Stats/tests; undone rows are deleted, so none persist
+	// StatusSentUnsaved marks a mail that WAS delivered but whose
+	// Sent-folder save failed (re-audit finding R24): the queue row
+	// was already deleted at SMTP accept, so without this row the
+	// delivered mail would have no record anywhere in Daak. The row
+	// stays in the Outbox as a persistent, user-visible warning
+	// naming the subject and recipient — it must NEVER be retried
+	// (Retry only handles status 'failed', and the service refuses
+	// this status explicitly), because the recipient already has
+	// the mail and a retry would deliver a second copy.
+	StatusSentUnsaved = "sent_unsaved"
 )
 
 // Item kinds. A normal send stores its ComposeMessage JSON and the
@@ -110,20 +124,24 @@ func (s *Store) Enqueue(item Item) error {
 	if item.To == nil {
 		toRaw = []byte("[]")
 	}
+	var sentAt sql.NullString
+	if item.SentAt != nil {
+		sentAt = sql.NullString{String: item.SentAt.UTC().Format(time.RFC3339Nano), Valid: true}
+	}
 	_, err = s.db.Exec(`
 		INSERT INTO send_queue
 			(id, account_id, draft_id, kind, message_json, raw_message,
 			 reaction_message_id, subject, recipient,
 			 from_address, to_json, status, attempts, max_attempts,
-			 send_at, due_at, last_error, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 send_at, due_at, last_error, created_at, sent_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, item.ID, item.AccountID, item.DraftID, item.Kind, item.MessageJSON,
 		item.RawMessage, item.ReactionMessageID, item.Subject,
 		item.Recipient, item.FromAddress, string(toRaw), item.Status,
 		item.Attempts, item.MaxAttempts,
 		item.SendAt.UTC().Format(time.RFC3339Nano),
 		item.DueAt.UTC().Format(time.RFC3339Nano),
-		item.LastError, item.CreatedAt.UTC().Format(time.RFC3339Nano))
+		item.LastError, item.CreatedAt.UTC().Format(time.RFC3339Nano), sentAt)
 	if err != nil {
 		return fmt.Errorf("sendqueue: enqueue: %w", err)
 	}

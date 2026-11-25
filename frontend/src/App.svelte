@@ -638,6 +638,20 @@
       showSentSnackbar(data.subject ?? '')
     })
 
+    // Re-audit finding R24: a message was delivered but its Sent
+    // copy could not be saved, so there is no Sent copy to view —
+    // the backend records a persistent Outbox warning row instead.
+    // This toast is only the immediate notice naming the message;
+    // the Outbox row is the durable record, and it survives a
+    // restart.
+    EventsOn('sendqueue:sent-save-failed', (data: { queueId: string, accountId: string, subject: string, recipient: string }) => {
+      removeUndoSendCountdown(data.queueId)
+      addToast({
+        type: 'error',
+        message: $_('toast.sentSaveFailed', { values: { subject: data.subject ?? '', recipient: data.recipient ?? '' } }),
+      })
+    })
+
     // A viewer popup's switcher asks the main window to open its thread
     // in another mode; the popup closes itself after sending.
     EventsOn('viewer:switch', (data: { mode: string; accountId: string; folderId: string; threadId: string }) => {

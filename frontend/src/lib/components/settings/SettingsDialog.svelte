@@ -233,63 +233,78 @@
 
   async function handleSave() {
     saving = true
+    // The display name of the setting whose save failed, if any —
+    // named in the error toast so a partial save is not a generic
+    // failure (re-audit finding R25).
+    let failedSetting: string | null = null
     try {
       // Convert seconds to ms for storage
       const delayMs = markAsReadDelaySeconds < 0 ? -1 : Math.round(markAsReadDelaySeconds * 1000)
 
-      // Save settings sequentially to avoid SQLite lock conflicts
-      await SetReadReceiptResponsePolicy(readReceiptResponsePolicy)
-      await SetMarkAsReadDelay(delayMs)
-      await SetMessageListDensity(messageListDensity)
-      await SetThemeMode(themeMode)
-      await SetShowTitleBar(showTitleBar)
-      await SetRunBackground(runBackground)
-      await SetStartHidden(startHidden)
-      await SetShowUnreadBadge(showUnreadBadge)
-      await SetAutostart(autostart)
-      if (language) {
-        await SetLanguage(language)
-      }
-      await SetComposerMode(composerMode)
-      await SetMailtoMode(mailtoMode)
-      await SetComposerFormat(composerFormat)
-      await SetUndoSendDelay(undoSendDelay)
-      await SetSpellcheckEnabled(spellcheckEnabled)
-      await SetSpellcheckLanguages(spellcheckLanguages)
-      await SetNativeTitleBar(nativeTitleBar)
-      await SetWindowControlsSide(windowControlsSide)
-      await SetAlwaysLoadImages(alwaysLoadImages)
-      await SetDarkMailContent(darkMailContent)
-      await SetDarkComposerBody(darkComposerBody)
-      await SetAccentBarUnread(accentBarUnread)
-      await SetAccentUnreadStyle(accentUnreadStyle)
-      await SetShowMessageListCircles(showMessageListCircles)
-      await SetShowMessageListProfilePics(showMessageListProfilePics)
-      await SetAlwaysShowMessageCheckbox(alwaysShowMessageCheckbox)
-      await SetShowViewerCircles(showViewerCircles)
-      await SetShowMessagePreviewPane(showMessagePreviewPane)
-      await SetMessageOpenMode(messageOpenMode)
-      setHideUnifiedSingleAccount(hideUnifiedSingleAccount)
-      await SetCodeChipClickMode(codeChipClickMode)
-      await SetOtpClipboardClearSeconds(otpClipboardClearSeconds)
-      await SetAttentionEnabled(attentionEnabled)
-      await SetAttentionTypeEnabled('verification_code', attentionTypeVerificationCode)
-      await SetAttentionTypeEnabled('flight_changed', attentionTypeFlightChanged)
-      await SetAttentionTypeEnabled('payment_failed', attentionTypePaymentFailed)
-      await SetAttentionTypeEnabled('delivery_problem', attentionTypeDeliveryProblem)
-      await SetInboxTabDefault(inboxTabDefault)
-      await SetTranslationEnabled(translateEnabled)
-      await SetTranslationMode(translateMode)
-      await SetTranslationTargetLanguage(translateTargetLanguage)
-      await SetTranslationOnlineProvider(translateOnlineProvider)
-      await SetTranslationOnlineConsent('google', translateConsentGoogle)
-      await SetTranslationOnlineConsent('deepl', translateConsentDeepL)
-      // The DeepL key field is empty unless the user typed a new key:
-      // only save when a key was typed, or when it was cleared.
-      if (deeplKeyInput) {
-        await SetDeepLAPIKey(deeplKeyInput)
-      } else if (deeplKeyCleared) {
-        await SetDeepLAPIKey('')
+      // Save settings sequentially to avoid SQLite lock conflicts.
+      // Each step carries its display name: the loop stops at the
+      // first failure, so settings after it are skipped and settings
+      // before it are already saved — a partial save. The catch
+      // below names the failing setting and re-reads the persisted
+      // values, so the dialog shows what is actually saved instead
+      // of what the user set.
+      const steps: Array<{ label: string; run: () => Promise<unknown> }> = [
+        { label: $_('settingsGeneral.readReceiptPolicy'), run: () => SetReadReceiptResponsePolicy(readReceiptResponsePolicy) },
+        { label: $_('settingsGeneral.markAsReadAfter'), run: () => SetMarkAsReadDelay(delayMs) },
+        { label: $_('settingsGeneral.messageListDensity'), run: () => SetMessageListDensity(messageListDensity) },
+        { label: $_('settingsGeneral.theme'), run: () => SetThemeMode(themeMode) },
+        { label: $_('settingsGeneral.titleBar'), run: () => SetShowTitleBar(showTitleBar) },
+        { label: $_('settingsGeneral.runInBackground'), run: () => SetRunBackground(runBackground) },
+        { label: $_('settingsGeneral.startHidden'), run: () => SetStartHidden(startHidden) },
+        { label: $_('settingsGeneral.showUnreadBadge'), run: () => SetShowUnreadBadge(showUnreadBadge) },
+        { label: $_('settingsGeneral.autostartOnLogin'), run: () => SetAutostart(autostart) },
+        ...(language ? [{ label: $_('settingsGeneral.language'), run: () => SetLanguage(language) }] : []),
+        { label: $_('settings.composerMode'), run: () => SetComposerMode(composerMode) },
+        { label: $_('settings.mailtoMode'), run: () => SetMailtoMode(mailtoMode) },
+        { label: $_('settings.composerFormat'), run: () => SetComposerFormat(composerFormat) },
+        { label: $_('settings.undoSendDelay'), run: () => SetUndoSendDelay(undoSendDelay) },
+        { label: $_('spellcheck.enable'), run: () => SetSpellcheckEnabled(spellcheckEnabled) },
+        { label: $_('spellcheck.languages'), run: () => SetSpellcheckLanguages(spellcheckLanguages) },
+        { label: $_('settingsGeneral.titleBar'), run: () => SetNativeTitleBar(nativeTitleBar) },
+        { label: $_('settingsGeneral.windowControls'), run: () => SetWindowControlsSide(windowControlsSide) },
+        { label: $_('settingsGeneral.alwaysLoadImages'), run: () => SetAlwaysLoadImages(alwaysLoadImages) },
+        { label: $_('settingsGeneral.darkMailContent'), run: () => SetDarkMailContent(darkMailContent) },
+        { label: $_('settingsGeneral.darkComposerBody'), run: () => SetDarkComposerBody(darkComposerBody) },
+        { label: $_('settingsGeneral.accentBarUnread'), run: () => SetAccentBarUnread(accentBarUnread) },
+        { label: $_('settingsGeneral.accentStyle'), run: () => SetAccentUnreadStyle(accentUnreadStyle) },
+        { label: $_('settingsGeneral.showMessageListCircles'), run: () => SetShowMessageListCircles(showMessageListCircles) },
+        { label: $_('settingsGeneral.showMessageListProfilePics'), run: () => SetShowMessageListProfilePics(showMessageListProfilePics) },
+        { label: $_('settingsGeneral.alwaysShowCheckbox'), run: () => SetAlwaysShowMessageCheckbox(alwaysShowMessageCheckbox) },
+        { label: $_('settingsGeneral.showViewerCircles'), run: () => SetShowViewerCircles(showViewerCircles) },
+        { label: $_('settingsGeneral.showMessagePreviewPane'), run: () => SetShowMessagePreviewPane(showMessagePreviewPane) },
+        { label: $_('settingsGeneral.messageOpenMode'), run: () => SetMessageOpenMode(messageOpenMode) },
+        { label: $_('settingsGeneral.hideUnifiedSingleAccount'), run: async () => { setHideUnifiedSingleAccount(hideUnifiedSingleAccount) } },
+        { label: $_('settingsMessages.codeChipClick'), run: () => SetCodeChipClickMode(codeChipClickMode) },
+        { label: $_('settingsMessages.otpClearSeconds'), run: () => SetOtpClipboardClearSeconds(otpClipboardClearSeconds) },
+        { label: $_('settingsAttention.enabled'), run: () => SetAttentionEnabled(attentionEnabled) },
+        { label: $_('attention.typeVerificationCode'), run: () => SetAttentionTypeEnabled('verification_code', attentionTypeVerificationCode) },
+        { label: $_('attention.typeFlightChanged'), run: () => SetAttentionTypeEnabled('flight_changed', attentionTypeFlightChanged) },
+        { label: $_('attention.typePaymentFailed'), run: () => SetAttentionTypeEnabled('payment_failed', attentionTypePaymentFailed) },
+        { label: $_('attention.typeDeliveryProblem'), run: () => SetAttentionTypeEnabled('delivery_problem', attentionTypeDeliveryProblem) },
+        { label: $_('settingsCategories.defaultTab'), run: () => SetInboxTabDefault(inboxTabDefault) },
+        { label: $_('settingsTranslation.enabled'), run: () => SetTranslationEnabled(translateEnabled) },
+        { label: $_('settingsTranslation.mode'), run: () => SetTranslationMode(translateMode) },
+        { label: $_('settingsTranslation.target'), run: () => SetTranslationTargetLanguage(translateTargetLanguage) },
+        { label: $_('settingsTranslation.onlineProvider'), run: () => SetTranslationOnlineProvider(translateOnlineProvider) },
+        { label: `${$_('settingsTranslation.consentHeading')} (Google)`, run: () => SetTranslationOnlineConsent('google', translateConsentGoogle) },
+        { label: `${$_('settingsTranslation.consentHeading')} (DeepL)`, run: () => SetTranslationOnlineConsent('deepl', translateConsentDeepL) },
+        // The DeepL key field is empty unless the user typed a new key:
+        // only save when a key was typed, or when it was cleared.
+        ...(deeplKeyInput
+          ? [{ label: $_('settingsTranslation.deeplKey'), run: () => SetDeepLAPIKey(deeplKeyInput) }]
+          : deeplKeyCleared
+            ? [{ label: $_('settingsTranslation.deeplKey'), run: () => SetDeepLAPIKey('') }]
+            : []),
+      ]
+      for (const step of steps) {
+        failedSetting = step.label
+        await step.run()
+        failedSetting = null
       }
       // Update the reactive stores so UI updates immediately
       updateDensityStore(messageListDensity as MessageListDensity)
@@ -346,8 +361,19 @@
       console.error('Failed to save settings:', err)
       addToast({
         type: 'error',
-        message: $_('toast.failedToSaveSettings'),
+        // Name the setting that failed instead of a generic error:
+        // everything before it is already saved, everything after
+        // it was skipped, and the user needs to know which one.
+        message: failedSetting
+          ? $_('toast.failedToSaveSetting', { values: { setting: failedSetting } })
+          : $_('toast.failedToSaveSettings'),
       })
+      // Re-read the persisted settings into the dialog so the
+      // toggles show what is actually saved, not what the user set.
+      // The dialog stays open: the user can fix the failing setting
+      // and save again. (loadSettings also reverts the live theme
+      // preview when the theme itself did not save.)
+      await loadSettings()
     } finally {
       saving = false
     }
