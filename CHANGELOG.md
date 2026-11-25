@@ -1,5 +1,17 @@
 # CHANGELOG
 
+**v8.0.0 - 25-11-2026**
+---
+
+- Cancelling a Mail Merge run now tells you how many messages were cancelled and how many were already sending and will still go out — and cancelling when nothing is queued no longer reports success
+- New contacts now reach the cloud even when the first address book is read-only: each address book's writability is checked, the save moves on to the next writable book, and a failure that can't be worked around is shown instead of only logged
+- A Mail Merge run that fails while recording its failed rows now says so in the run's error, and Resume is offered for any failed run — not only when failed rows were recorded
+- If saving a sent mail to Sent fails, the mail no longer vanishes without a trace: a lasting "Sent — not saved" warning appears in the Outbox naming the message, and it can never be retried into a duplicate
+- When saving settings fails part-way, the message now names the setting that failed, and the dialog reloads the settings as actually saved so the toggles stop showing the wrong state
+- Reactions from non-English Outlook (German, French and others) are now detected and shown on the message instead of staying visible as stray emails, and reaction headers folded across lines are now unfolded before checking
+- New opt-in in the Mail Merge settings: "Count ordinary emails I send toward this hourly limit too" — off by default (the hourly cap counts Mail Merge mail only, as before); when on, ordinary sends through the send queue count toward the same cap; reactions never count
+- If notifications are blocked on macOS, Settings now says so with a button that opens System Settings at Daak's row, and a one-time notice explains how to turn them back on
+
 **v0.7.40 - 25-11-2026**
 ---
 
