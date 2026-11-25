@@ -217,7 +217,14 @@ func (e *AttachmentExtractor) extractFromMultipart(messageID string, mr gomessag
 		// Check for TNEF (winmail.dat)
 		if contentType == "application/ms-tnef" ||
 			(disposition == "attachment" && strings.EqualFold(dispParams["filename"], "winmail.dat")) {
-			tnefAttachments := e.extractFromTNEF(messageID, part.Body)
+			fallbackName := dispParams["filename"]
+			if fallbackName == "" {
+				fallbackName = params["name"]
+			}
+			if fallbackName == "" {
+				fallbackName = "winmail.dat"
+			}
+			tnefAttachments := e.extractFromTNEF(messageID, part.Body, fallbackName)
 			attachments = append(attachments, tnefAttachments...)
 			continue
 		}
@@ -323,8 +330,15 @@ func DecodeTNEFAttachments(data []byte) []TNEFAttachment {
 	return out
 }
 
-// extractFromTNEF extracts attachments from a TNEF (winmail.dat) file
-func (e *AttachmentExtractor) extractFromTNEF(messageID string, reader io.Reader) []*AttachmentData {
+// extractFromTNEF extracts attachments from a TNEF (winmail.dat) file.
+// Decode failure (or an empty container) surfaces the container itself
+// under fallbackName instead of returning nothing (fourth-audit finding
+// 50): the sync parser already does this, but this extractor — the path
+// a message opened from server search takes — returned nil, so the
+// message kept its has_attachments flag with zero downloadable rows
+// and the paperclip opened an empty list. The surfaced container is
+// the real bytes the server sent, so it downloads like any attachment.
+func (e *AttachmentExtractor) extractFromTNEF(messageID string, reader io.Reader, fallbackName string) []*AttachmentData {
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil
@@ -344,8 +358,24 @@ func (e *AttachmentExtractor) extractFromTNEF(messageID string, reader io.Reader
 			Content: tnefAtt.Content,
 		})
 	}
+	if len(attachments) > 0 {
+		return attachments
+	}
 
-	return attachments
+	if fallbackName == "" {
+		fallbackName = "winmail.dat"
+	}
+	return []*AttachmentData{{
+		Attachment: &message.Attachment{
+			ID:          uuid.New().String(),
+			MessageID:   messageID,
+			Filename:    fallbackName,
+			ContentType: "application/ms-tnef",
+			Size:        len(data),
+			IsInline:    false,
+		},
+		Content: data,
+	}}
 }
 
 // decodeRFC2047 decodes RFC 2047 encoded strings (like filenames)
