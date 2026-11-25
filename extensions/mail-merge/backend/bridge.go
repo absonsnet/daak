@@ -519,6 +519,47 @@ func messageIDFromRaw(raw []byte) string {
 // sent / draft-saved rows — the duplicate-suppression seed for a resume
 // or a held batch (finding 8). Failed / held / skipped rows are not
 // included: their addresses were never delivered.
+// remainingRunCap returns how many more sends a capped run may make:
+// the per-run cap minus what the run already sent (audit4 finding 27).
+// The cap is per-run (settings.go), so a resume or held batch must not
+// restart the count at zero — a capped batch could otherwise send up
+// to CapLimit more on top of what the run already sent. Floor 0.
+func remainingRunCap(req hostmm.RunRequest, sentCount int) int {
+	limit := req.CapLimit
+	if limit <= 0 {
+		limit = 100
+	}
+	remaining := limit - sentCount
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining
+}
+
+// unionAlreadySent merges the stored (inherited) duplicate seed with
+// the addresses this run already sent/draft-saved, deduplicated
+// case-insensitively (audit4 finding 27). The seed is stored with the
+// run's request, so a resume-of-a-resume keeps the whole lineage's
+// addresses instead of just the latest run's rows.
+func unionAlreadySent(stored []string, run *hostmm.Run) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(addr string) {
+		norm := strings.ToLower(strings.TrimSpace(addr))
+		if norm != "" && !seen[norm] {
+			seen[norm] = true
+			out = append(out, addr)
+		}
+	}
+	for _, a := range stored {
+		add(a)
+	}
+	for _, a := range sentAddresses(run) {
+		add(a)
+	}
+	return out
+}
+
 func sentAddresses(run *hostmm.Run) []string {
 	if run == nil {
 		return nil
@@ -603,16 +644,29 @@ func (b *MailMergeBridge) MailMerge_ResumeRun(runID string) (string, error) {
 	// failed rows, but the duplicate check otherwise covers just the
 	// resumed run: a failed row to an address the original run already
 	// delivered to (via another row) would send the same person the
-	// same mail twice.
-	req.AlreadySent = sentAddresses(run)
+	// same mail twice. The seed unions the stored (inherited) seed —
+	// a resume-of-a-resume must keep the whole lineage's addresses,
+	// not just this run's rows — with this run's sent rows (finding
+	// 27: the seed is persisted with the run's stored request).
+	var queuedAddrs []string
 	if req.DeliverMode == "later" {
 		if items, err := b.store.ListQueueItems(); err == nil {
 			for _, it := range items {
 				if it.RunID == runID && (it.Status == QueueStatusQueued || it.Status == QueueStatusSending) && it.Recipient != "" {
-					req.AlreadySent = append(req.AlreadySent, it.Recipient)
+					queuedAddrs = append(queuedAddrs, it.Recipient)
 				}
 			}
 		}
+	}
+	req.AlreadySent = unionAlreadySent(append(req.AlreadySent, queuedAddrs...), run)
+	// Seed the per-run cap from what this run's lineage already sent
+	// (finding 27): the resumed run is the same run's continuation,
+	// so its budget is the cap minus the lineage's sends, not a
+	// fresh cap. The stored (inherited) seed plus this run's own
+	// SentCount is the lineage total. A whole-run failure sent
+	// nothing, so it resumes with a zero seed.
+	if req.CapEnabled {
+		req.CapAlreadySent = req.CapAlreadySent + run.SentCount
 	}
 	req.AttachmentDir = b.effectiveAttachmentDir(req)
 	if v := hostmm.Validate(req.Template, req.Rows, req.AttachmentDir); len(v.UnresolvedVariables) > 0 {
@@ -1020,12 +1074,22 @@ func (b *MailMergeBridge) sendBatch(runID string, capped bool) error {
 		return fmt.Errorf("mail-merge: run %q has no held rows", runID)
 	}
 	take := heldIndices
-	limit := req.CapLimit
-	if limit <= 0 {
-		limit = 100
+	fullLimit := req.CapLimit
+	if fullLimit <= 0 {
+		fullLimit = 100
 	}
-	if capped && len(take) > limit {
-		take = take[:limit]
+	// The lineage's sends so far: the stored (inherited) seed plus
+	// this run's own SentCount (finding 27).
+	lineageSent := req.CapAlreadySent + run.SentCount
+	// The cap is per-run (finding 27): the batch may take only what
+	// the run's budget still has left, not a fresh CapLimit on top of
+	// what the run already sent.
+	remaining := fullLimit
+	if capped {
+		remaining = remainingRunCap(req, lineageSent)
+	}
+	if capped && len(take) > remaining {
+		take = take[:remaining]
 	}
 	rows := make([]map[string]string, 0, len(take))
 	messageIDs := make([]string, 0, len(take))
@@ -1046,21 +1110,26 @@ func (b *MailMergeBridge) sendBatch(runID string, capped bool) error {
 		messageIDs = append(messageIDs, heldIDs[idx])
 	}
 	sub := hostmm.RunRequest{
-		Template:      req.Template,
-		Rows:          rows,
-		MessageIDs:    messageIDs,
-		SourceKind:    req.SourceKind,
-		DeliverMode:   "send",
-		PauseSeconds:  req.PauseSeconds,
-		RandomPause:   req.RandomPause,
-		CapEnabled:    capped,
-		CapLimit:      limit,
-		AccountID:     req.AccountID,
-		AttachmentDir: b.effectiveAttachmentDir(req),
+		Template:     req.Template,
+		Rows:         rows,
+		MessageIDs:   messageIDs,
+		SourceKind:   req.SourceKind,
+		DeliverMode:  "send",
+		PauseSeconds: req.PauseSeconds,
+		RandomPause:  req.RandomPause,
+		CapEnabled:   capped,
+		CapLimit:     fullLimit,
+		// Seed the cap counter with the lineage's sends (finding 27),
+		// so Execute holds the batch's rows once the per-run cap is
+		// spent instead of sending up to a fresh cap.
+		CapAlreadySent: lineageSent,
+		AccountID:      req.AccountID,
+		AttachmentDir:  b.effectiveAttachmentDir(req),
 		// A held row to an address the run already sent (via an
 		// earlier row) must not go out a second time when the batch
-		// sends — same seed as ResumeRun.
-		AlreadySent: sentAddresses(run),
+		// sends — same seed as ResumeRun, including the stored
+		// (inherited) seed for a resume-of-a-resume lineage.
+		AlreadySent: unionAlreadySent(req.AlreadySent, run),
 	}
 	// The sub-run executes against `rows`; indexMap translates its
 	// positions back to the original run's row indices. The live tally

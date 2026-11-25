@@ -37,22 +37,38 @@ func (a *App) initMailMergeExtension() {
 		SettingsStore: a.settingsStore,
 		Paths:         a.paths,
 		Core:          mailMergeCore,
-		Service:       newMailMergeService(&a.composeOps, &appMailMergeDraftSaver{a: a}, a.contactStore),
+		Service:       newMailMergeService(&a.composeOps, &appMailMergeDraftSaver{a: a}, a.contactStore, &mailMergeSentSaveFailureRecorder{get: func() *sendQueueService { return a.sendQueue }}),
 		Ctx:           a.ctx,
 	})
 }
 
 // newMailMergeService builds the host-side merge service from the shared
 // compose ops, a draft saver, and the contact store. Shared by App and
-// ComposerApp (both carry composeOps + contactStore).
-func newMailMergeService(ops *composeOps, draftSaver hostmm.DraftSaver, contacts *contact.Store) *hostmm.Service {
+// ComposerApp (both carry composeOps + contactStore). failureRecorder
+// is resolved lazily (the send queue may not exist yet when the bridge
+// is built); nil means Sent-save failures only log, as before.
+func newMailMergeService(ops *composeOps, draftSaver hostmm.DraftSaver, contacts *contact.Store, failureRecorder hostmm.SentSaveFailureRecorder) *hostmm.Service {
 	return hostmm.NewService(hostmm.ServiceDeps{
-		DraftSaver:    draftSaver,
-		SenderFactory: &mailMergeSenderFactory{ops: ops},
-		SentSaver:     &mailMergeSentSaver{ops: ops},
-		ContactLister: &mailMergeContactLister{store: contacts},
-		MessageSigner: &mailMergeMessageSigner{ops: ops},
+		DraftSaver:              draftSaver,
+		SenderFactory:           &mailMergeSenderFactory{ops: ops},
+		SentSaver:               &mailMergeSentSaver{ops: ops},
+		ContactLister:           &mailMergeContactLister{store: contacts},
+		MessageSigner:           &mailMergeMessageSigner{ops: ops},
+		SentSaveFailureRecorder: failureRecorder,
 	})
+}
+
+// mailMergeSentSaveFailureRecorder adapts a send queue service to the
+// hostmm.SentSaveFailureRecorder interface, resolving the service
+// lazily so the bridge can be built before the queue exists.
+type mailMergeSentSaveFailureRecorder struct {
+	get func() *sendQueueService
+}
+
+func (r *mailMergeSentSaveFailureRecorder) RecordSentSaveFailure(_ context.Context, accountID, subject, recipient, fromAddress string, saveErr error) {
+	if svc := r.get(); svc != nil {
+		svc.RecordMailMergeSentSaveFailure(accountID, subject, recipient, fromAddress, saveErr)
+	}
 }
 
 // mailMergeMessageSigner adapts composeOps' S/MIME + PGP signers to

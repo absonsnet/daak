@@ -1776,6 +1776,38 @@ export namespace backend {
 		    return a;
 		}
 	}
+	export class ExhaustedWrite {
+	    id: string;
+	    sourceId: string;
+	    calendarId: string;
+	    eventId: string;
+	    op: string;
+	    scope: string;
+	    summary: string;
+	    lastError: string;
+	    attempt: number;
+	    lastAttemptUnix: number;
+	    createdUnix: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ExhaustedWrite(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.sourceId = source["sourceId"];
+	        this.calendarId = source["calendarId"];
+	        this.eventId = source["eventId"];
+	        this.op = source["op"];
+	        this.scope = source["scope"];
+	        this.summary = source["summary"];
+	        this.lastError = source["lastError"];
+	        this.attempt = source["attempt"];
+	        this.lastAttemptUnix = source["lastAttemptUnix"];
+	        this.createdUnix = source["createdUnix"];
+	    }
+	}
 	export class FreeBusyBlock {
 	    email: string;
 	    startUnix: number;

@@ -50,11 +50,18 @@ func (e *Engine) parseMessageBodyFull(raw []byte, messageID string, timeout time
 			Msg("Body parsing timed out - attempting fallback extraction")
 
 		partialText := e.extractPlainTextFallback(raw)
+		// The fallback is NOT a complete parse: attachment metadata
+		// from the timed-out pass is unknown, so report the timeout
+		// (and failed text parts) instead of a body that claims
+		// "no attachments". The fetch layer leaves the body
+		// unfetched so the message is retried (audit4 finding 22).
 		return &ParsedBody{
-			BodyText:       partialText,
-			BodyHTML:       "",
-			HasAttachments: false,
-			Attachments:    nil,
+			BodyText:        partialText,
+			BodyHTML:        "",
+			HasAttachments:  false,
+			Attachments:     nil,
+			TextPartsFailed: true,
+			ParseTimedOut:   true,
 		}
 	}
 }

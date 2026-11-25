@@ -35,11 +35,19 @@ type ProcessedBody struct {
 	// "no text parts exist". Carried into BodyUpdate so
 	// markUnresolvedAsFailed can tell the two apart.
 	TextPartsFailed bool
-	SMIMEResult     *smime.SignatureResult // S/MIME verification result
-	SMIMERawBody    []byte                 // Raw S/MIME body for on-view processing
-	SMIMEEncrypted  bool                   // Whether the message is encrypted
-	PGPRawBody      []byte                 // Raw PGP body for on-view processing
-	PGPEncrypted    bool                   // Whether the message is PGP encrypted
+	// ParseTimedOut mirrors ParsedBody.ParseTimedOut (audit4 finding
+	// 22): the parse hit its time budget, so the body and attachment
+	// metadata are incomplete and must not be stored as complete.
+	ParseTimedOut bool
+	// EmptyFetch is set when the server returned an empty body for a
+	// message it was asked for (audit4 finding 23): nothing was
+	// fetched at all, so the message must not be charged body_failed.
+	EmptyFetch     bool
+	SMIMEResult    *smime.SignatureResult // S/MIME verification result
+	SMIMERawBody   []byte                 // Raw S/MIME body for on-view processing
+	SMIMEEncrypted bool                   // Whether the message is encrypted
+	PGPRawBody     []byte                 // Raw PGP body for on-view processing
+	PGPEncrypted   bool                   // Whether the message is PGP encrypted
 	// IsReaction is set when the message is a reaction email whose reaction
 	// was linked to its original (recorded + hidden). Such messages get no
 	// body update: their body was consumed as a reaction.
@@ -93,9 +101,16 @@ func bodyUpdateFromProcessedBody(pb *ProcessedBody) message.BodyUpdate {
 // body_failed=1 (via BodyUpdate.HasUsableContent), and the viewer offers
 // a manual retry. A genuinely attachment-only message (full fetch, no
 // text parts, no read failure) is complete and persists normally.
+//
+// A timed-out parse (audit4 finding 22) also defers: the fallback body
+// is partial and its attachment metadata unknown, so persisting it
+// would store a "complete" body with its attachments silently dropped.
 func deferBodyUpdate(pb *ProcessedBody) bool {
 	if pb == nil || pb.IsReaction {
 		return false
+	}
+	if pb.ParseTimedOut {
+		return true
 	}
 	if pb.BodyText != "" || pb.BodyHTML != "" || pb.SMIMEEncrypted || pb.PGPEncrypted {
 		return false
@@ -396,8 +411,19 @@ func (e *Engine) fetchMessageBodiesBatch(ctx context.Context, client *imapclient
 			// failure, or a just-moved message not yet on the server in
 			// this folder). Never delete the local row here: leave it so
 			// the next fetch retries it. Only a confirmed expunge during
-			// sync deletes local rows (see reconcileUIDs).
+			// sync deletes local rows (see reconcileUIDs). Record the
+			// empty fetch explicitly (audit4 finding 23) so the
+			// background pass knows the server returned nothing at
+			// all — without this marker the message is charged
+			// body_failed as "requested but not returned" and is
+			// never retried.
 			e.log.Warn().Uint32("uid", uid).Str("messageID", messageID).Msg("Empty message body — leaving local copy")
+			results[uid] = &ProcessedBody{
+				MessageID:     messageID,
+				EmptyFetch:    true,
+				ReportedSize:  reportedSize,
+				ReceivedBytes: 0,
+			}
 			continue
 		}
 
@@ -448,6 +474,7 @@ func (e *Engine) fetchMessageBodiesBatch(ctx context.Context, client *imapclient
 			RawBytes:        rawBytes,
 			Truncated:       messageTruncated || parsed.Truncated,
 			TextPartsFailed: parsed.TextPartsFailed,
+			ParseTimedOut:   parsed.ParseTimedOut,
 			SMIMEResult:     parsed.SMIMEResult,
 			SMIMERawBody:    parsed.SMIMERawBody,
 			SMIMEEncrypted:  parsed.SMIMEEncrypted,
@@ -571,7 +598,13 @@ type fetchedSize struct {
 	reported int64
 }
 
-func (e *Engine) markUnresolvedAsFailed(requestedIDs []string, updates []message.BodyUpdate, sizes map[string]fetchedSize, consumedIDs []string) {
+// deferredIDs are messages whose fetch produced no storable body for a
+// reason that must never charge body_failed: a parse that timed out
+// (audit4 finding 22 — the body is partial, retry next sync) or a
+// fetch that returned nothing at all (audit4 finding 23 — an empty
+// fetch is not proof of a permanently unparseable message). They are
+// deferred like truncated fetches, regardless of the size signal.
+func (e *Engine) markUnresolvedAsFailed(requestedIDs []string, updates []message.BodyUpdate, sizes map[string]fetchedSize, consumedIDs []string, deferredIDs map[string]bool) {
 	if len(requestedIDs) == 0 {
 		return
 	}
@@ -591,6 +624,10 @@ func (e *Engine) markUnresolvedAsFailed(requestedIDs []string, updates []message
 	var deferredCount int
 	for _, id := range requestedIDs {
 		if resolved[id] {
+			continue
+		}
+		if deferredIDs[id] {
+			deferredCount++
 			continue
 		}
 		// Defer marking when the response looks truncated — retrying next
@@ -757,6 +794,10 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 		attachments  []*message.Attachment
 		sizes        map[string]fetchedSize
 		consumedIDs  []string
+		// deferredIDs are messages that must never be charged
+		// body_failed: timed-out parses (finding 22) and empty
+		// fetches (finding 23). They stay unfetched for retry.
+		deferredIDs  map[string]bool
 		fetchedCount int
 	}
 
@@ -804,7 +845,7 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 			// OR it has attachments. Everything else — including IDs the
 			// server didn't return — gets flagged. The flag is cleared by
 			// a Force Resync or a later successful body persist.
-			e.markUnresolvedAsFailed(result.requestedIDs, result.bodyUpdates, result.sizes, result.consumedIDs)
+			e.markUnresolvedAsFailed(result.requestedIDs, result.bodyUpdates, result.sizes, result.consumedIDs, result.deferredIDs)
 
 			// Apply database updates - MUST complete before querying next batch
 			if len(result.bodyUpdates) > 0 {
@@ -1019,7 +1060,7 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 			// and gets charged. Pass nil to keep the call sites uniform.
 			// requestedIDs (not batchIDs): placeholder-UID messages were
 			// never asked of the server, so they must not be charged.
-			e.markUnresolvedAsFailed(requestedIDs, nil, nil, nil)
+			e.markUnresolvedAsFailed(requestedIDs, nil, nil, nil, nil)
 			failed += len(uidToMessageID)
 			continue
 		}
@@ -1036,6 +1077,7 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 			var allAttachments []*message.Attachment
 			var consumedIDs []string
 			sizes := make(map[string]fetchedSize, len(currentBodies))
+			deferredIDs := map[string]bool{}
 
 			for _, pb := range currentBodies {
 				// Linked reaction emails were consumed during fetch (recorded
@@ -1044,6 +1086,17 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 				if pb.IsReaction {
 					consumedIDs = append(consumedIDs, pb.MessageID)
 					sizes[pb.MessageID] = fetchedSize{received: pb.ReceivedBytes, reported: pb.ReportedSize}
+					continue
+				}
+
+				// Empty fetch (finding 23) or timed-out parse
+				// (finding 22): nothing storable was produced, so
+				// no body update and no attachments — and the
+				// message is deferred, never charged body_failed,
+				// so the next sync retries it.
+				if pb.EmptyFetch || pb.ParseTimedOut {
+					sizes[pb.MessageID] = fetchedSize{received: pb.ReceivedBytes, reported: pb.ReportedSize}
+					deferredIDs[pb.MessageID] = true
 					continue
 				}
 
@@ -1093,6 +1146,7 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 				attachments:  allAttachments,
 				sizes:        sizes,
 				consumedIDs:  consumedIDs,
+				deferredIDs:  deferredIDs,
 				fetchedCount: len(currentBodies),
 			}
 		}()
@@ -1107,7 +1161,7 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 
 		// Persist parse failures for the final batch via the same path as
 		// every other batch — see markUnresolvedAsFailed.
-		e.markUnresolvedAsFailed(result.requestedIDs, result.bodyUpdates, result.sizes, result.consumedIDs)
+		e.markUnresolvedAsFailed(result.requestedIDs, result.bodyUpdates, result.sizes, result.consumedIDs, result.deferredIDs)
 
 		if len(result.bodyUpdates) > 0 {
 			if err := e.messageStore.UpdateBodiesBatch(result.bodyUpdates); err != nil {

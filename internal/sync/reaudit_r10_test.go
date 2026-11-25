@@ -141,6 +141,7 @@ func TestMarkUnresolvedAsFailed_TextPartFailureWithAttachmentsFlagged(t *testing
 		[]message.BodyUpdate{{MessageID: "orig-1", HasAttachments: true, TextPartsFailed: true}},
 		map[string]fetchedSize{"orig-1": {received: 5000, reported: 5000}},
 		nil,
+		nil,
 	)
 
 	var flag int
@@ -164,6 +165,7 @@ func TestMarkUnresolvedAsFailed_TextPartFailureTruncatedDeferred(t *testing.T) {
 		[]string{"orig-1"},
 		[]message.BodyUpdate{{MessageID: "orig-1", HasAttachments: true, TextPartsFailed: true}},
 		map[string]fetchedSize{"orig-1": {received: 1000, reported: 50000}},
+		nil,
 		nil,
 	)
 

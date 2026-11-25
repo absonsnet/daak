@@ -33,6 +33,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/absonsnet/daak/internal/logging"
 	"github.com/emersion/go-ical"
 	"github.com/google/uuid"
 )
@@ -255,7 +256,7 @@ func (a *API) CreateEvent(in EventInput) (string, error) {
 		if err := a.store.UpsertEventTx(tx, ev); err != nil {
 			return err
 		}
-		return a.extractAndUpsertAlarmsTx(tx, ev)
+		return extractAndUpsertAlarmsTx(a.store, tx, ev)
 	})
 	if err != nil {
 		return "", fmt.Errorf("persist event: %w", err)
@@ -356,12 +357,16 @@ func (a *API) updateInstance(src Source, cal Calendar, master Event, in EventInp
 		if errors.Is(err, ErrConflict) {
 			return wrapCalendarConflict(err, master.Summary, "edit")
 		}
-		// Transport failure: queue the whole split for retry instead
-		// of losing it. Nothing is persisted locally — the local
-		// state still shows the pre-edit series, and Drain replays
-		// the push (the following sync then reconciles the local
-		// rows). The error still surfaces so the user knows the
-		// change has not landed yet.
+		// Transport failure: queue the whole split for retry, and
+		// soft-commit it locally (audit4 finding 20) — the same
+		// treatment every other calendar edit gets. Without the
+		// soft-commit the local state still shows the pre-edit
+		// series and the edit is effectively invisible until Drain
+		// replays it AND the next sync reconciles the rows. An
+		// empty result means "no server identifiers yet" — the
+		// next sync reconciles them. A soft-commit failure must
+		// not lose the queued row: the change is still queued,
+		// only its local preview is missing.
 		if errors.Is(err, ErrTransport) && a.queue != nil {
 			if _, qerr := a.queue.Enqueue(PendingOp{
 				SourceID:         src.ID,
@@ -386,6 +391,21 @@ func (a *API) updateInstance(src Source, cal Calendar, master Event, in EventInp
 				RRuleText:        rruleText(in.Recurrence),
 				In:               &in,
 			}); qerr == nil {
+				var softErr error
+				switch {
+				case op == EditScopeThis && kind == InstanceOpUpdate:
+					softErr = applyThisUpdateLocal(a.store, master, in, instanceUnix, PushInstanceResult{})
+				case op == EditScopeThis && kind == InstanceOpDelete:
+					softErr = applyThisDeleteLocal(a.store, master, instanceUnix, PushInstanceResult{})
+				case op == EditScopeThisAndFuture && kind == InstanceOpUpdate:
+					softErr = applyThisAndFutureUpdateLocal(a.store, master, in, instanceUnix, PushInstanceResult{})
+				case op == EditScopeThisAndFuture && kind == InstanceOpDelete:
+					softErr = applyThisAndFutureDeleteLocal(a.store, master, instanceUnix, PushInstanceResult{})
+				}
+				if softErr != nil {
+					log := logging.WithComponent("calendar")
+					log.Warn().Err(softErr).Str("eventId", master.ID).Msg("Offline instance edit queued but its local soft-commit failed; the change is still queued for replay")
+				}
 				return fmt.Errorf("calendar: could not reach the server — this change is queued and will sync when you are back online: %w", err)
 			}
 		}
@@ -419,50 +439,13 @@ func pendingOpKindFor(kind InstanceOpKind) PendingOpKind {
 // occurrence start: it is the override's RECURRENCE-ID, while in carries
 // the NEW fields (DTSTART may have moved).
 func (a *API) persistThisUpdate(master Event, in EventInput, instanceUnix int64, result PushInstanceResult) error {
-	overrideBlob, err := serializeVEVENTWithRecurrenceID(master.UID, in, instanceUnix)
-	if err != nil {
-		return fmt.Errorf("serialize override: %w", err)
-	}
-	return a.store.WithTx(func(tx *sql.Tx) error {
-		if err := a.store.UpsertOverrideTx(tx, master.ID, instanceUnix, overrideBlob); err != nil {
-			return err
-		}
-		if result.MasterNewETag != "" {
-			if _, err := tx.Exec(
-				`UPDATE events SET etag = ? WHERE id = ?`,
-				result.MasterNewETag, master.ID,
-			); err != nil {
-				return fmt.Errorf("update master etag: %w", err)
-			}
-		}
-		return a.extractAndUpsertAlarmsTx(tx, master)
-	})
+	return applyThisUpdateLocal(a.store, master, in, instanceUnix, result)
 }
 
 // persistThisDelete adds EXDATE to the master + drops any existing
 // matching override row.
 func (a *API) persistThisDelete(master Event, instanceUnix int64, result PushInstanceResult) error {
-	updatedICS, err := addEXDATE(master.ICSBlob, instanceUnix)
-	if err != nil {
-		return err
-	}
-	updated := master
-	updated.ICSBlob = updatedICS
-	if result.MasterNewETag != "" {
-		updated.ETag = result.MasterNewETag
-	}
-	return a.store.WithTx(func(tx *sql.Tx) error {
-		if err := a.store.UpsertEventTx(tx, updated); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			`DELETE FROM event_recurrence_overrides WHERE event_id = ? AND recurrence_id_unix = ?`,
-			master.ID, instanceUnix,
-		); err != nil {
-			return err
-		}
-		return a.extractAndUpsertAlarmsTx(tx, updated)
-	})
+	return applyThisDeleteLocal(a.store, master, instanceUnix, result)
 }
 
 // persistThisAndFutureUpdateLocally clamps the master locally + inserts
@@ -470,107 +453,13 @@ func (a *API) persistThisDelete(master Event, instanceUnix int64, result PushIns
 // the provider (or are generated locally for local sources via the same
 // pattern as the legacy updateThisAndFuture).
 func (a *API) persistThisAndFutureUpdateLocally(master Event, in EventInput, splitUnix int64, result PushInstanceResult) error {
-	// splitUnix is the ORIGINAL occurrence start — the clamp point.
-	// in.DTStartUnix is the NEW series' start and may have moved.
-
-	// 1. Clamp master's RRULE locally.
-	clampedRRULE := clampRRuleUntil(master.RRuleText, splitUnix-1)
-	clampedICS, err := reserializeMasterICS(master, clampedRRULE)
-	if err != nil {
-		return err
-	}
-	clampedMaster := master
-	clampedMaster.RRuleText = clampedRRULE
-	clampedMaster.ICSBlob = clampedICS
-	if result.MasterNewETag != "" {
-		clampedMaster.ETag = result.MasterNewETag
-	}
-
-	// 2. New master for the future series — UID + identifiers from the
-	//    provider's NewSeries (non-nil for any non-local source), or
-	//    locally-generated for local.
-	var newUID string
-	var newETag string
-	var newHref string
-	var newProviderEventID string
-	if result.NewSeries != nil {
-		newUID = result.NewSeries.UID
-		newETag = result.NewSeries.ETag
-		newHref = result.NewSeries.Href
-		newProviderEventID = result.NewSeries.ProviderEventID
-	}
-	if newUID == "" {
-		newUID = uuid.NewString() + "@daak-local"
-	}
-	newICS, err := serializeVEVENT(newUID, in)
-	if err != nil {
-		return err
-	}
-	newMaster := Event{
-		ID:              uuid.NewString(),
-		CalendarID:      master.CalendarID,
-		UID:             newUID,
-		ETag:            newETag,
-		Href:            newHref,
-		ProviderEventID: newProviderEventID,
-		Summary:         in.Summary,
-		Description:     in.Description,
-		Location:        in.Location,
-		DTStartUnix:     in.DTStartUnix,
-		DTEndUnix:       in.DTEndUnix,
-		IsAllDay:        in.IsAllDay,
-		RRuleText:       rruleText(in.Recurrence),
-		Transparency:    normTransparency(in.Transparency),
-		Visibility:      normVisibility(in.Visibility),
-		ICSBlob:         newICS,
-	}
-
-	return a.store.WithTx(func(tx *sql.Tx) error {
-		if err := a.store.UpsertEventTx(tx, clampedMaster); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			`DELETE FROM event_recurrence_overrides WHERE event_id = ? AND recurrence_id_unix >= ?`,
-			master.ID, splitUnix,
-		); err != nil {
-			return err
-		}
-		if err := a.store.UpsertEventTx(tx, newMaster); err != nil {
-			return err
-		}
-		if err := a.extractAndUpsertAlarmsTx(tx, clampedMaster); err != nil {
-			return err
-		}
-		return a.extractAndUpsertAlarmsTx(tx, newMaster)
-	})
+	return applyThisAndFutureUpdateLocal(a.store, master, in, splitUnix, result)
 }
 
 // persistThisAndFutureDeleteLocally clamps the master locally + drops
 // future overrides. No new series row.
 func (a *API) persistThisAndFutureDeleteLocally(master Event, splitUnix int64, result PushInstanceResult) error {
-	clampedRRULE := clampRRuleUntil(master.RRuleText, splitUnix-1)
-	clampedICS, err := reserializeMasterICS(master, clampedRRULE)
-	if err != nil {
-		return err
-	}
-	updated := master
-	updated.RRuleText = clampedRRULE
-	updated.ICSBlob = clampedICS
-	if result.MasterNewETag != "" {
-		updated.ETag = result.MasterNewETag
-	}
-	return a.store.WithTx(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(
-			`DELETE FROM event_recurrence_overrides WHERE event_id = ? AND recurrence_id_unix >= ?`,
-			master.ID, splitUnix,
-		); err != nil {
-			return err
-		}
-		if err := a.store.UpsertEventTx(tx, updated); err != nil {
-			return err
-		}
-		return a.extractAndUpsertAlarmsTx(tx, updated)
-	})
+	return applyThisAndFutureDeleteLocal(a.store, master, splitUnix, result)
 }
 
 // DeleteEvent removes an event with scope semantics symmetric to UpdateEvent.
@@ -811,7 +700,7 @@ func (a *API) updateAllAndPush(src Source, cal Calendar, master Event, in EventI
 				return err
 			}
 		}
-		return a.extractAndUpsertAlarmsTx(tx, ev)
+		return extractAndUpsertAlarmsTx(a.store, tx, ev)
 	})
 }
 
@@ -1085,8 +974,8 @@ func setRRuleText(props ical.Props, rt string) {
 
 // extractAndUpsertAlarmsTx re-parses the event's blob, extracts VALARMs,
 // and upserts them into event_alarms. Keeps create/update → alarms atomic.
-func (a *API) extractAndUpsertAlarmsTx(tx *sql.Tx, ev Event) error {
-	overrides, err := a.store.ListOverrides(ev.ID)
+func extractAndUpsertAlarmsTx(store *Store, tx *sql.Tx, ev Event) error {
+	overrides, err := store.ListOverrides(ev.ID)
 	if err != nil {
 		return err
 	}
@@ -1100,7 +989,7 @@ func (a *API) extractAndUpsertAlarmsTx(tx *sql.Tx, ev Event) error {
 		return fmt.Errorf("extract alarms: %w", err)
 	}
 	for _, alm := range alarms {
-		if err := a.store.UpsertAlarmTx(tx, alm); err != nil {
+		if err := store.UpsertAlarmTx(tx, alm); err != nil {
 			return err
 		}
 	}

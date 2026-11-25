@@ -229,6 +229,14 @@ func (a *App) setReadStatus(messageIDs []string, isRead bool) error {
 		return fmt.Errorf("failed to update local flags: %w", err)
 	}
 
+	// Record the change as pending before pushing: if the push fails,
+	// the row survives, the next sync must not overwrite this flag
+	// (UpdateFlagsByUIDBatch guards pending flags), and the change is
+	// re-pushed after a sync or on demand (finding 18).
+	if err := a.messageStore.RecordPendingFlagChanges(messages, message.FlagTypeRead, isRead); err != nil {
+		log.Warn().Err(err).Msg("Local read flag updated but its pending row could not be recorded — a failed push may flip it back")
+	}
+
 	// Emit event for UI update with flag state
 	wailsRuntime.EventsEmit(a.ctx, "messages:readChanged", map[string]interface{}{
 		"messageIds": messageIDs,
@@ -249,20 +257,9 @@ func (a *App) setReadStatus(messageIDs []string, isRead bool) error {
 	// Sync to IMAP in background with retry
 	go func() {
 		defer recoverPanic("app.actions", "sync flags to IMAP")
-		for folderID, msgs := range byFolder {
-			var err error
-			for attempt := 1; attempt <= 3; attempt++ {
-				err = a.syncFlagsToIMAP(msgs, folderID, "read", isRead)
-				if err == nil {
-					break
-				}
-				log.Warn().Err(err).Int("attempt", attempt).Str("folderID", folderID).Msg("Failed to sync read flags to IMAP, retrying...")
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-			if err != nil {
-				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to sync read flags to IMAP after 3 attempts")
-			}
-		}
+		pushFlagChangesByFolder(a.messageStore, a.syncFlagsToIMAP, func(event string, data map[string]interface{}) {
+			wailsRuntime.EventsEmit(a.ctx, event, data)
+		}, byFolder, message.FlagTypeRead, isRead)
 	}()
 
 	// Read-flag changes are intentionally NOT pushed onto the undo stack.
@@ -313,6 +310,10 @@ func (a *App) setStarredStatus(messageIDs []string, isStarred bool) error {
 		return fmt.Errorf("failed to update local flags: %w", err)
 	}
 
+	if err := a.messageStore.RecordPendingFlagChanges(messages, message.FlagTypeStarred, isStarred); err != nil {
+		log.Warn().Err(err).Msg("Local star flag updated but its pending row could not be recorded — a failed push may flip it back")
+	}
+
 	wailsRuntime.EventsEmit(a.ctx, "messages:starredChanged", map[string]interface{}{
 		"messageIds": messageIDs,
 		"isStarred":  isStarred,
@@ -321,20 +322,9 @@ func (a *App) setStarredStatus(messageIDs []string, isStarred bool) error {
 	// Sync to IMAP in background with retry
 	go func() {
 		defer recoverPanic("app.actions", "sync star flags to IMAP")
-		for folderID, msgs := range byFolder {
-			var err error
-			for attempt := 1; attempt <= 3; attempt++ {
-				err = a.syncFlagsToIMAP(msgs, folderID, "starred", isStarred)
-				if err == nil {
-					break
-				}
-				log.Warn().Err(err).Int("attempt", attempt).Str("folderID", folderID).Msg("Failed to sync starred flags to IMAP, retrying...")
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-			if err != nil {
-				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to sync starred flags to IMAP after 3 attempts")
-			}
-		}
+		pushFlagChangesByFolder(a.messageStore, a.syncFlagsToIMAP, func(event string, data map[string]interface{}) {
+			wailsRuntime.EventsEmit(a.ctx, event, data)
+		}, byFolder, message.FlagTypeStarred, isStarred)
 	}()
 
 	// Star changes are intentionally NOT pushed onto the undo stack. Same
@@ -346,6 +336,117 @@ func (a *App) setStarredStatus(messageIDs []string, isStarred bool) error {
 }
 
 // syncFlagsToIMAP syncs flag changes to IMAP server
+// --- Pending flag changes (fourth-audit finding 18) -----------------
+
+// pushFlagChangesByFolder pushes local read/star changes for each folder
+// to IMAP with retry, deleting the pending rows on success. A push that
+// still fails after 3 tries leaves its rows pending — the next sync's
+// flag download must not overwrite them (UpdateFlagsByUIDBatch guards
+// pending flags), and the UI is told how many changes are still
+// un-pushed so it can show the warning and offer a retry. Shared by
+// App and ViewerApp, which differ only in how they push and emit.
+func pushFlagChangesByFolder(store *message.Store, push func(messages []*message.Message, folderID, flagType string, flagValue bool) error, emit func(event string, data map[string]interface{}), byFolder map[string][]*message.Message, flagType string, flagValue bool) {
+	log := logging.WithComponent("app")
+	failed := 0
+	for folderID, msgs := range byFolder {
+		var err error
+		for attempt := 1; attempt <= 3; attempt++ {
+			err = push(msgs, folderID, flagType, flagValue)
+			if err == nil {
+				break
+			}
+			log.Warn().Err(err).Int("attempt", attempt).Str("folderID", folderID).Msg("Failed to sync flags to IMAP, retrying...")
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+		if err != nil {
+			log.Error().Err(err).Str("folderID", folderID).Msg("Failed to sync flags to IMAP after 3 attempts — change stays queued for re-push")
+			failed += len(msgs)
+			continue
+		}
+		ids := make([]string, len(msgs))
+		for i, m := range msgs {
+			ids[i] = m.ID
+		}
+		if err := store.DeletePendingFlagChanges(ids, flagType); err != nil {
+			log.Warn().Err(err).Str("folderID", folderID).Msg("Flag push succeeded but its pending rows could not be cleared")
+		}
+	}
+	if failed > 0 {
+		if count, err := store.PendingFlagChangeCount(); err == nil {
+			emit("messages:flagsUnsynced", map[string]interface{}{"count": count})
+		}
+	}
+}
+
+// retryPendingFlagChanges re-pushes every un-pushed local flag change,
+// grouped by account/folder/flag. Returns how many messages were
+// pushed. A group that still fails stays pending for the next attempt.
+func (a *App) retryPendingFlagChanges() (int, error) {
+	pending, err := a.messageStore.ListPendingFlagChanges()
+	if err != nil {
+		return 0, err
+	}
+	if len(pending) == 0 {
+		return 0, nil
+	}
+	type groupKey struct {
+		accountID, folderID, flagType string
+	}
+	groups := make(map[groupKey][]message.PendingFlagChange)
+	for _, p := range pending {
+		k := groupKey{p.AccountID, p.FolderID, p.FlagType}
+		groups[k] = append(groups[k], p)
+	}
+	pushed := 0
+	var firstErr error
+	for k, rows := range groups {
+		msgs := make([]*message.Message, len(rows))
+		ids := make([]string, len(rows))
+		for i, p := range rows {
+			msgs[i] = &message.Message{ID: p.MessageID, AccountID: p.AccountID, FolderID: p.FolderID, UID: p.UID}
+			ids[i] = p.MessageID
+		}
+		if err := a.syncFlagsToIMAP(msgs, k.folderID, k.flagType, rows[0].FlagValue); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err := a.messageStore.DeletePendingFlagChanges(ids, k.flagType); err != nil {
+			log := logging.WithComponent("app")
+			log.Warn().Err(err).Msg("Re-pushed flags but their pending rows could not be cleared")
+		}
+		pushed += len(rows)
+	}
+	if count, err := a.messageStore.PendingFlagChangeCount(); err == nil {
+		wailsRuntime.EventsEmit(a.ctx, "messages:flagsUnsynced", map[string]interface{}{"count": count})
+	}
+	return pushed, firstErr
+}
+
+// RetryPendingFlagChanges re-pushes un-pushed local read/star changes
+// to the server (Wails-bound; the "changes not synced" banner calls it).
+func (a *App) RetryPendingFlagChanges() (int, error) {
+	return a.retryPendingFlagChanges()
+}
+
+// GetPendingFlagChangeCount returns how many local read/star changes
+// have not reached the server yet (Wails-bound; the banner reads it).
+func (a *App) GetPendingFlagChangeCount() (int, error) {
+	return a.messageStore.PendingFlagChangeCount()
+}
+
+// retryPendingFlagsForAccount re-pushes un-pushed flag changes in the
+// background after a sync, when the server is reachable again. It
+// retries everything pending (each group is pushed through its own
+// account's connection); a group that still fails stays pending.
+func (a *App) retryPendingFlagsForAccount(accountID string) {
+	if _, err := a.retryPendingFlagChanges(); err != nil {
+		log := logging.WithComponent("app")
+		log.Warn().Err(err).Str("accountID", accountID).Msg("Re-push of pending flag changes failed; they stay queued")
+	}
+}
+
 func (a *App) syncFlagsToIMAP(messages []*message.Message, folderID, flagType string, flagValue bool) error {
 	if len(messages) == 0 {
 		return nil

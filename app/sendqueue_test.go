@@ -844,13 +844,38 @@ func (h *sendQueueTestHarness) editQueuedDraft(t *testing.T, draftID, body strin
 	}
 }
 
-// TestUndoSendRestoresSnapshot: edits made to the live draft during
-// the undo window must not survive Undo — the reopened composer
-// shows the queued snapshot, the message that was about to send.
-func TestUndoSendRestoresSnapshot(t *testing.T) {
+// TestUndoSendKeepsEditedDraft (audit4 finding 19): edits made to the
+// live draft during the undo window must survive Undo — restoring the
+// queued snapshot over them would silently destroy the user's edits.
+// The reopened composer shows the edited draft; the queued send is
+// still cancelled.
+func TestUndoSendKeepsEditedDraft(t *testing.T) {
 	h := newSendQueueTestHarness(t)
 	res := h.queue(t)
 	h.editQueuedDraft(t, res.DraftID, "edited during the undo window")
+
+	undone, err := h.svc.UndoSend(res.QueueID)
+	if err != nil {
+		t.Fatalf("UndoSend: %v", err)
+	}
+	if undone.DraftID != res.DraftID {
+		t.Fatalf("UndoSend draft = %q, want %q", undone.DraftID, res.DraftID)
+	}
+	d, err := h.draftStore.Get(res.DraftID)
+	if err != nil || d == nil {
+		t.Fatalf("draft after undo not found: %v", err)
+	}
+	if d.BodyText != "edited during the undo window" {
+		t.Fatalf("draft body after undo = %q, want the user's edit kept %q", d.BodyText, "edited during the undo window")
+	}
+}
+
+// TestUndoSendRestoresSnapshotWhenUnedited: when the live draft still
+// matches the queued snapshot, Undo restores it as before (a no-op
+// restore of identical content).
+func TestUndoSendRestoresSnapshotWhenUnedited(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
 
 	undone, err := h.svc.UndoSend(res.QueueID)
 	if err != nil {
@@ -1389,5 +1414,69 @@ func TestQueueReactionConflictRetryRejectsSending(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "already being sent") {
 		t.Fatalf("error %q, want 'already being sent'", err)
+	}
+}
+
+// Audit4 finding 30: a failed Outbox row can be discarded, and doing so
+// unblocks its draft for a fresh send.
+func TestDeleteSendQueueItemFailedUnblocksDraft(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
+
+	h.sendErr = fmt.Errorf("failed to login to SMTP server: 535 Authentication failed")
+	h.now = h.now.Add(6 * time.Second)
+	if _, err := h.svc.dispatchDue(h.now); err != nil {
+		t.Fatal(err)
+	}
+	if item := h.mustItem(t, res.QueueID); item.Status != sendqueue.StatusFailed {
+		t.Fatalf("after permanent failure: %+v, want failed", item)
+	}
+	// While the failed row sits in the Outbox the draft cannot be sent again.
+	if _, err := h.svc.QueueSend("acc-1", testComposeMessage(), res.DraftID); err == nil {
+		t.Fatalf("QueueSend with a failed row present succeeded, want it blocked")
+	}
+	if err := h.svc.DeleteSendQueueItem(res.QueueID); err != nil {
+		t.Fatalf("DeleteSendQueueItem: %v", err)
+	}
+	if item, err := h.svc.store.Get(res.QueueID); err != nil || item != nil {
+		t.Fatalf("failed row after discard = %+v, %v, want gone", item, err)
+	}
+	// The draft is unblocked now.
+	if _, err := h.svc.QueueSend("acc-1", testComposeMessage(), res.DraftID); err != nil {
+		t.Fatalf("QueueSend after discard: %v, want the draft sendable again", err)
+	}
+}
+
+// Audit4 finding 30: only failed normal sends can be discarded — a
+// pending row is undone, not deleted.
+func TestDeleteSendQueueItemRefusesPending(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
+	if err := h.svc.DeleteSendQueueItem(res.QueueID); err == nil || !strings.Contains(err.Error(), "only failed sends") {
+		t.Fatalf("DeleteSendQueueItem(pending) = %v, want an 'only failed sends' error", err)
+	}
+}
+
+// Audit4 finding 30: an unbuildable queued message is discardable, not
+// endlessly retriable — Retry refuses it and points at Discard.
+func TestRetrySendQueueItemRefusesCorrupt(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	corrupt := sendqueue.Item{
+		ID: "q-corrupt", AccountID: "acc-1", DraftID: "draft-1",
+		Kind: sendqueue.KindMessage, MessageJSON: `{"subject": broken`,
+		Subject: "hi", Recipient: "ada@example.com",
+		FromAddress: "me@example.com", To: []string{"ada@example.com"},
+		Status: sendqueue.StatusFailed, MaxAttempts: sendqueue.DefaultMaxAttempts,
+		SendAt: h.now, DueAt: h.now, CreatedAt: h.now,
+		LastError: "corrupt queued message: unexpected end of JSON input",
+	}
+	if err := h.svc.store.Enqueue(corrupt); err != nil {
+		t.Fatalf("Enqueue(corrupt): %v", err)
+	}
+	if err := h.svc.RetrySendQueueItem("q-corrupt"); err == nil || !strings.Contains(err.Error(), "discard") {
+		t.Fatalf("RetrySendQueueItem(corrupt) = %v, want a 'discard' error", err)
+	}
+	if err := h.svc.DeleteSendQueueItem("q-corrupt"); err != nil {
+		t.Fatalf("DeleteSendQueueItem(corrupt): %v", err)
 	}
 }

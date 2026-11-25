@@ -684,6 +684,9 @@ func (v *ViewerApp) setReadStatus(messageIDs []string, isRead bool) error {
 	if err := v.messageStore.UpdateFlagsBatch(messageIDs, isReadPtr, nil); err != nil {
 		return fmt.Errorf("failed to update local flags: %w", err)
 	}
+	if err := v.messageStore.RecordPendingFlagChanges(messages, message.FlagTypeRead, isRead); err != nil {
+		log.Warn().Err(err).Msg("Local read flag updated but its pending row could not be recorded — a failed push may flip it back")
+	}
 	wailsRuntime.EventsEmit(v.ctx, "messages:readChanged", map[string]interface{}{
 		"messageIds": messageIDs,
 		"isRead":     isRead,
@@ -692,20 +695,9 @@ func (v *ViewerApp) setReadStatus(messageIDs []string, isRead bool) error {
 	// Sync to IMAP in background with retry (same as App).
 	go func() {
 		defer recoverPanic("viewer.actions", "sync flags to IMAP")
-		for folderID, msgs := range byFolder {
-			var err error
-			for attempt := 1; attempt <= 3; attempt++ {
-				err = v.syncFlagsToIMAP(msgs, folderID, "read", isRead)
-				if err == nil {
-					break
-				}
-				log.Warn().Err(err).Int("attempt", attempt).Str("folderID", folderID).Msg("Failed to sync read flags to IMAP, retrying...")
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-			if err != nil {
-				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to sync read flags to IMAP after 3 attempts")
-			}
-		}
+		pushFlagChangesByFolder(v.messageStore, v.syncFlagsToIMAP, func(event string, data map[string]interface{}) {
+			wailsRuntime.EventsEmit(v.ctx, event, data)
+		}, byFolder, message.FlagTypeRead, isRead)
 	}()
 	return nil
 }
@@ -741,6 +733,9 @@ func (v *ViewerApp) setStarredStatus(messageIDs []string, isStarred bool) error 
 	if err := v.messageStore.UpdateFlagsBatch(messageIDs, nil, isStarredPtr); err != nil {
 		return fmt.Errorf("failed to update local flags: %w", err)
 	}
+	if err := v.messageStore.RecordPendingFlagChanges(messages, message.FlagTypeStarred, isStarred); err != nil {
+		log.Warn().Err(err).Msg("Local star flag updated but its pending row could not be recorded — a failed push may flip it back")
+	}
 	wailsRuntime.EventsEmit(v.ctx, "messages:starredChanged", map[string]interface{}{
 		"messageIds": messageIDs,
 		"isStarred":  isStarred,
@@ -748,20 +743,9 @@ func (v *ViewerApp) setStarredStatus(messageIDs []string, isStarred bool) error 
 
 	go func() {
 		defer recoverPanic("viewer.actions", "sync star flags to IMAP")
-		for folderID, msgs := range byFolder {
-			var err error
-			for attempt := 1; attempt <= 3; attempt++ {
-				err = v.syncFlagsToIMAP(msgs, folderID, "starred", isStarred)
-				if err == nil {
-					break
-				}
-				log.Warn().Err(err).Int("attempt", attempt).Str("folderID", folderID).Msg("Failed to sync starred flags to IMAP, retrying...")
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-			if err != nil {
-				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to sync starred flags to IMAP after 3 attempts")
-			}
-		}
+		pushFlagChangesByFolder(v.messageStore, v.syncFlagsToIMAP, func(event string, data map[string]interface{}) {
+			wailsRuntime.EventsEmit(v.ctx, event, data)
+		}, byFolder, message.FlagTypeStarred, isStarred)
 	}()
 	return nil
 }
@@ -1800,7 +1784,7 @@ func (v *ViewerApp) DownloadAttachment(attachmentID, savePath string) (string, e
 	}
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
-	content, err := downloader.ExtractAttachmentContent(raw, att.Filename)
+	content, err := downloader.ExtractAttachmentContentFor(raw, att)
 	if err != nil {
 		return "", fmt.Errorf("failed to extract attachment: %w", err)
 	}
@@ -2014,13 +1998,14 @@ func (v *ViewerApp) SaveAllAttachments(messageID string) (string, error) {
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
 	savedCount := 0
+	usedNames := map[string]bool{}
 	for _, att := range attachments {
-		content, err := downloader.ExtractAttachmentContent(raw, att.Filename)
+		content, err := downloader.ExtractAttachmentContentFor(raw, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract attachment")
 			continue
 		}
-		savePath := filepath.Join(saveDir, att.Filename)
+		savePath := filepath.Join(saveDir, email.DeduplicateFilename(saveDir, att.Filename, usedNames))
 		_, err = downloader.SaveAttachment(att, content, savePath)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save attachment")
@@ -2111,12 +2096,13 @@ func (v *ViewerApp) DownloadEncryptedAttachment(messageID, filename, savePath st
 	}
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
-	content, err := downloader.ExtractAttachmentContent(innerBytes, filename)
+	content, err := downloader.ExtractAttachmentContentFor(innerBytes, &message.Attachment{MessageID: messageID, Filename: filename})
 	if err != nil {
 		return "", fmt.Errorf("failed to extract attachment from decrypted message: %w", err)
 	}
 
 	att := &message.Attachment{
+		MessageID:   messageID,
 		Filename:    filename,
 		ContentType: "application/octet-stream",
 		Size:        len(content),
@@ -2227,13 +2213,14 @@ func (v *ViewerApp) SaveAllEncryptedAttachments(messageID string) (string, error
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
 	savedCount := 0
+	usedNames := map[string]bool{}
 	for _, att := range regularAtts {
-		content, err := downloader.ExtractAttachmentContent(innerBytes, att.Filename)
+		content, err := downloader.ExtractAttachmentContentFor(innerBytes, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract encrypted attachment")
 			continue
 		}
-		savePath := filepath.Join(saveDir, att.Filename)
+		savePath := filepath.Join(saveDir, email.DeduplicateFilename(saveDir, att.Filename, usedNames))
 		_, err = downloader.SaveAttachment(att, content, savePath)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save encrypted attachment")
@@ -2251,9 +2238,10 @@ func (v *ViewerApp) SaveAllEncryptedAttachments(messageID string) (string, error
 func (v *ViewerApp) saveAllAttachmentsViaPortal(messageID string, attachments []*message.Attachment, defaultDir string) (string, error) {
 	log := logging.WithComponent("viewer")
 
+	usedNames := map[string]bool{}
 	filenames := make([]string, len(attachments))
 	for i, att := range attachments {
-		filenames[i] = att.Filename
+		filenames[i] = email.DeduplicateFilename("", att.Filename, usedNames)
 	}
 
 	savePaths, err := platform.PortalSaveFiles("Save All Attachments", filenames, defaultDir)
@@ -2286,7 +2274,7 @@ func (v *ViewerApp) saveAllAttachmentsViaPortal(messageID string, attachments []
 		if i >= len(savePaths) {
 			break
 		}
-		content, err := downloader.ExtractAttachmentContent(raw, att.Filename)
+		content, err := downloader.ExtractAttachmentContentFor(raw, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract attachment")
 			continue
@@ -2308,9 +2296,10 @@ func (v *ViewerApp) saveAllAttachmentsViaPortal(messageID string, attachments []
 func (v *ViewerApp) saveAllEncryptedAttachmentsViaPortal(attachments []*message.Attachment, innerBytes []byte, defaultDir string) (string, error) {
 	log := logging.WithComponent("viewer")
 
+	usedNames := map[string]bool{}
 	filenames := make([]string, len(attachments))
 	for i, att := range attachments {
-		filenames[i] = att.Filename
+		filenames[i] = email.DeduplicateFilename("", att.Filename, usedNames)
 	}
 
 	savePaths, err := platform.PortalSaveFiles("Save All Attachments", filenames, defaultDir)
@@ -2330,7 +2319,7 @@ func (v *ViewerApp) saveAllEncryptedAttachmentsViaPortal(attachments []*message.
 		if i >= len(savePaths) {
 			break
 		}
-		content, err := downloader.ExtractAttachmentContent(innerBytes, att.Filename)
+		content, err := downloader.ExtractAttachmentContentFor(innerBytes, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract encrypted attachment")
 			continue

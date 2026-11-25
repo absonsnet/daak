@@ -30,6 +30,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"strings"
 
 	coreapi "github.com/absonsnet/daak/internal/core/api/v1"
 )
@@ -122,11 +123,11 @@ const (
 // the master event's current state (needed for ETag + ICSBlob composition)
 // plus the targeted occurrence + new fields.
 type PushInstancePayload struct {
-	Master           Event       // current master with ETag, Href, ProviderEventID, ICSBlob
-	InstanceTimeUnix int64       // original DTSTART of the targeted occurrence (unix seconds, UTC)
-	Op               EditScope   // EditScopeThis | EditScopeThisAndFuture
+	Master           Event     // current master with ETag, Href, ProviderEventID, ICSBlob
+	InstanceTimeUnix int64     // original DTSTART of the targeted occurrence (unix seconds, UTC)
+	Op               EditScope // EditScopeThis | EditScopeThisAndFuture
 	Kind             InstanceOpKind
-	In               EventInput  // new fields for update; ignored for delete
+	In               EventInput // new fields for update; ignored for delete
 }
 
 // PushInstanceResult carries what the API layer persists after a
@@ -187,7 +188,32 @@ var (
 	// error path with `fmt.Errorf("%w: %v", ErrTransport, err)` so the
 	// sentinel propagates through any wrapping chain.
 	ErrTransport = errors.New("calendar: transport-level failure")
+
+	// ErrAuth marks an authentication failure (HTTP 401/403, or a token
+	// refresh that could not produce a usable credential). The offline
+	// queue must NOT count it toward a row's retry budget (audit4
+	// finding 21): the user is not offline and the edit is not broken —
+	// the credentials are. The row stays pending for the next Drain
+	// after the user re-authenticates.
+	ErrAuth = errors.New("calendar: authentication failed — sign in again")
 )
+
+// IsAuthFailure reports whether err is an authentication failure: the
+// ErrAuth sentinel, or an HTTP 401/403 surfaced by a provider call site.
+// Provider write paths format status errors with the status line in
+// the message ("google post event 401 401 Unauthorized: ..."), so the
+// classifier matches the code together with its status text — a body
+// that merely mentions a bare 401 does not match.
+func IsAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrAuth) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "401 Unauthorized") || strings.Contains(msg, "403 Forbidden")
+}
 
 // serverCopyVerdict is the outcome of re-fetching the server's current
 // copy of an event and comparing it with the locally stored version.

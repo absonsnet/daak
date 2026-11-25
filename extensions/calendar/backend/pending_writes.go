@@ -31,11 +31,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	coreapi "github.com/absonsnet/daak/internal/core/api/v1"
+	"github.com/absonsnet/daak/internal/logging"
 )
 
 // PendingOpKind enumerates queueable operations.
@@ -259,17 +261,23 @@ func (q *PendingQueue) Drain(ctx context.Context, sourceID string) error {
 	if sourceID == "" {
 		return errors.New("pending queue: sourceID required")
 	}
+	// tried tracks the rows attempted in this pass. A row whose
+	// outcome neither deletes it nor bumps its attempt (an auth
+	// failure, finding 21) must not be re-picked forever — each row
+	// is tried once per Drain, and the next pass retries it.
+	tried := map[string]bool{}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		row, err := q.nextPending(sourceID)
+		row, err := q.nextPendingSkip(sourceID, tried)
 		if err != nil {
 			return err
 		}
 		if row == nil {
 			return nil // queue empty for this source
 		}
+		tried[row.ID] = true
 		q.processRow(ctx, *row)
 	}
 }
@@ -299,15 +307,32 @@ func (q *PendingQueue) DrainAll(ctx context.Context) error {
 // pendingMaxAttempts, or nil when none. Skips exhausted rows so they
 // don't permanently block the queue.
 func (q *PendingQueue) nextPending(sourceID string) (*pendingRow, error) {
-	rowRes := q.store.DB().QueryRow(`
+	return q.nextPendingSkip(sourceID, nil)
+}
+
+// nextPendingSkip is nextPending excluding the given row IDs — Drain uses
+// it to try each row once per pass (a row whose outcome neither deletes
+// it nor bumps its attempt must not be re-picked forever).
+func (q *PendingQueue) nextPendingSkip(sourceID string, skip map[string]bool) (*pendingRow, error) {
+	query := `
 		SELECT id, source_id, calendar_id, COALESCE(event_id, ''), op,
 		       COALESCE(scope, ''), payload_json, attempt,
 		       COALESCE(last_attempt_unix, 0), COALESCE(last_error, ''),
 		       created_unix
 		FROM pending_writes
 		WHERE source_id = ? AND attempt < ?
-		ORDER BY created_unix ASC
-		LIMIT 1`, sourceID, pendingMaxAttempts)
+	`
+	args := []any{sourceID, pendingMaxAttempts}
+	if len(skip) > 0 {
+		placeholders := make([]string, 0, len(skip))
+		for id := range skip {
+			placeholders = append(placeholders, "?")
+			args = append(args, id)
+		}
+		query += ` AND id NOT IN (` + strings.Join(placeholders, ",") + `)`
+	}
+	query += ` ORDER BY created_unix ASC LIMIT 1`
+	rowRes := q.store.DB().QueryRow(query, args...)
 
 	var row pendingRow
 	var payloadJSON string
@@ -376,9 +401,11 @@ func (q *PendingQueue) processRow(ctx context.Context, row pendingRow) {
 		// A scoped row (this / this-and-future) is a split, not a
 		// whole-series write: replay it through PushInstance with
 		// the original occurrence time + new fields from the queued
-		// payload. The following sync pass reconciles the local
-		// rows (clamped master, new series, override) from the
-		// server state the replay produced.
+		// payload. The replay also applies the change locally
+		// (finding 20): the sync that ran before Drain in this
+		// pass already re-fetched the pre-replay server state, so
+		// without the local apply the change would stay invisible
+		// until the next sync.
 		if row.Scope == string(EditScopeThis) || row.Scope == string(EditScopeThisAndFuture) {
 			in := EventInput{
 				CalendarID:  row.CalendarID,
@@ -397,13 +424,17 @@ func (q *PendingQueue) processRow(ctx context.Context, row pendingRow) {
 			if kind == "" {
 				kind = InstanceOpUpdate
 			}
-			_, perr = provider.PushInstance(pushCtx, *src, cal, PushInstancePayload{
+			var result PushInstanceResult
+			result, perr = provider.PushInstance(pushCtx, *src, cal, PushInstancePayload{
 				Master:           ev,
 				InstanceTimeUnix: row.Payload.InstanceTimeUnix,
 				Op:               EditScope(row.Scope),
 				Kind:             kind,
 				In:               in,
 			})
+			if perr == nil {
+				q.applyReplayedInstance(row, result, kind, in)
+			}
 			break
 		}
 		result, presErr := provider.PushEvent(pushCtx, *src, cal, ev)
@@ -416,16 +447,33 @@ func (q *PendingQueue) processRow(ctx context.Context, row pendingRow) {
 		// A scoped delete is a split too (EXDATE / instance delete),
 		// not a whole-series DELETE.
 		if row.Scope == string(EditScopeThis) || row.Scope == string(EditScopeThisAndFuture) {
-			_, perr = provider.PushInstance(pushCtx, *src, cal, PushInstancePayload{
+			var result PushInstanceResult
+			result, perr = provider.PushInstance(pushCtx, *src, cal, PushInstancePayload{
 				Master:           ev,
 				InstanceTimeUnix: row.Payload.InstanceTimeUnix,
 				Op:               EditScope(row.Scope),
 				Kind:             InstanceOpDelete,
 				In:               EventInput{DTStartUnix: row.Payload.InstanceTimeUnix, DTEndUnix: row.Payload.InstanceTimeUnix},
 			})
+			if perr == nil {
+				q.applyReplayedInstance(row, result, InstanceOpDelete, EventInput{})
+			}
 			break
 		}
 		perr = provider.DeleteRemote(pushCtx, *src, cal, ev)
+		if perr == nil {
+			// Finding 28: the sync that ran before Drain in this
+			// pass re-created the local row (the server still had
+			// the event), and the replay just deleted the server
+			// copy — remove the local row in the same step, or the
+			// deleted event pops back up until the next sync.
+			if err := q.store.WithTx(func(tx *sql.Tx) error {
+				return q.store.DeleteEventByUIDTx(tx, row.CalendarID, ev.UID)
+			}); err != nil {
+				log := logging.WithComponent("calendar")
+				log.Warn().Err(err).Str("eventId", row.EventID).Msg("Replayed delete succeeded remotely but the local row could not be removed; the next sync reconciles it")
+			}
+		}
 	default:
 		// Unknown op — drop the row.
 		_ = q.deleteRow(row.ID)
@@ -435,11 +483,58 @@ func (q *PendingQueue) processRow(ctx context.Context, row pendingRow) {
 	q.recordOutcome(row, perr)
 }
 
+// applyReplayedInstance applies a scoped replay's result to the local
+// rows (audit4 finding 20): the sync that ran before Drain in this pass
+// already re-fetched the pre-replay server state, so without this the
+// change would stay invisible until the next sync. Best-effort: the
+// remote replay already succeeded, so a local-apply failure only logs
+// and the next sync reconciles.
+func (q *PendingQueue) applyReplayedInstance(row pendingRow, result PushInstanceResult, kind InstanceOpKind, in EventInput) {
+	master, err := q.store.GetEvent(row.EventID)
+	if err != nil || master == nil {
+		return // already gone locally; nothing to apply
+	}
+	var aerr error
+	switch {
+	case row.Scope == string(EditScopeThis) && kind == InstanceOpUpdate:
+		aerr = applyThisUpdateLocal(q.store, *master, in, row.Payload.InstanceTimeUnix, result)
+	case row.Scope == string(EditScopeThis) && kind == InstanceOpDelete:
+		aerr = applyThisDeleteLocal(q.store, *master, row.Payload.InstanceTimeUnix, result)
+	case row.Scope == string(EditScopeThisAndFuture) && kind == InstanceOpUpdate:
+		aerr = applyThisAndFutureUpdateLocal(q.store, *master, in, row.Payload.InstanceTimeUnix, result)
+	case row.Scope == string(EditScopeThisAndFuture) && kind == InstanceOpDelete:
+		aerr = applyThisAndFutureDeleteLocal(q.store, *master, row.Payload.InstanceTimeUnix, result)
+	}
+	if aerr != nil {
+		log := logging.WithComponent("calendar")
+		log.Warn().Err(aerr).Str("eventId", row.EventID).Msg("Replayed scoped change but its local rows could not be updated; the next sync reconciles them")
+	}
+}
+
 // recordOutcome translates the per-row push result into table state +
 // emits a conflict event when applicable.
 func (q *PendingQueue) recordOutcome(row pendingRow, perr error) {
 	if perr == nil {
 		_ = q.deleteRow(row.ID)
+		return
+	}
+	if IsAuthFailure(perr) {
+		// Audit4 finding 21: an auth failure is not a failed push —
+		// the credentials are stale, not the edit. Do not consume
+		// the retry budget: record the failure and leave the row
+		// pending for the next Drain after re-authentication.
+		// The attempt count is untouched, so the row can never be
+		// exhausted by auth failures alone.
+		_ = q.noteFailure(row.ID, perr.Error())
+		if q.events != nil {
+			_ = q.events.Publish("calendar:write-auth-failed", map[string]any{
+				"sourceId":   row.SourceID,
+				"calendarId": row.CalendarID,
+				"eventId":    row.EventID,
+				"op":         row.Op,
+				"summary":    row.Payload.Summary,
+			})
+		}
 		return
 	}
 	if errors.Is(perr, ErrConflict) {
@@ -460,7 +555,20 @@ func (q *PendingQueue) recordOutcome(row pendingRow, perr error) {
 	}
 	// Transport or other error: bump attempt + record last_error. Drain
 	// will skip rows past pendingMaxAttempts on subsequent passes.
-	_ = q.bumpAttempt(row.ID, perr.Error())
+	// When the bump exhausts the row, publish so the calendar UI can
+	// surface it (audit4 finding 21) — otherwise the edit would
+	// silently never reach the server.
+	if n, err := q.bumpAttempt(row.ID, perr.Error()); err == nil && n >= pendingMaxAttempts {
+		if q.events != nil {
+			_ = q.events.Publish("calendar:write-exhausted", map[string]any{
+				"sourceId":   row.SourceID,
+				"calendarId": row.CalendarID,
+				"eventId":    row.EventID,
+				"op":         row.Op,
+				"summary":    row.Payload.Summary,
+			})
+		}
+	}
 }
 
 func (q *PendingQueue) deleteRow(id string) error {
@@ -468,14 +576,131 @@ func (q *PendingQueue) deleteRow(id string) error {
 	return err
 }
 
-func (q *PendingQueue) bumpAttempt(id, lastError string) error {
-	_, err := q.store.DB().Exec(`
+// bumpAttempt increments a row's attempt counter and records the
+// failure, returning the new attempt count.
+func (q *PendingQueue) bumpAttempt(id, lastError string) (int, error) {
+	if _, err := q.store.DB().Exec(`
 		UPDATE pending_writes
 		SET attempt = attempt + 1,
 		    last_attempt_unix = ?,
 		    last_error = ?
+		WHERE id = ?`, time.Now().Unix(), lastError, id); err != nil {
+		return 0, err
+	}
+	var attempt int
+	if err := q.store.DB().QueryRow(
+		`SELECT attempt FROM pending_writes WHERE id = ?`, id,
+	).Scan(&attempt); err != nil {
+		return 0, err
+	}
+	return attempt, nil
+}
+
+// noteFailure records a failed attempt's error + time WITHOUT consuming
+// retry budget. Used for auth failures (audit4 finding 21): the row
+// stays pending for the next Drain instead of marching toward
+// exhaustion while the credentials are stale.
+func (q *PendingQueue) noteFailure(id, lastError string) error {
+	_, err := q.store.DB().Exec(`
+		UPDATE pending_writes
+		SET last_attempt_unix = ?,
+		    last_error = ?
 		WHERE id = ?`, time.Now().Unix(), lastError, id)
 	return err
+}
+
+// ExhaustedWrite is one pending row that used up its retry budget
+// (audit4 finding 21). Surfaced in the calendar UI with retry/discard.
+type ExhaustedWrite struct {
+	ID              string `json:"id"`
+	SourceID        string `json:"sourceId"`
+	CalendarID      string `json:"calendarId"`
+	EventID         string `json:"eventId"`
+	Op              string `json:"op"`
+	Scope           string `json:"scope"`
+	Summary         string `json:"summary"`
+	LastError       string `json:"lastError"`
+	Attempt         int    `json:"attempt"`
+	LastAttemptUnix int64  `json:"lastAttemptUnix"`
+	CreatedUnix     int64  `json:"createdUnix"`
+}
+
+// ListExhausted returns every pending row at or past the retry budget,
+// oldest first.
+func (q *PendingQueue) ListExhausted() ([]ExhaustedWrite, error) {
+	rows, err := q.store.DB().Query(`
+		SELECT id, source_id, calendar_id, COALESCE(event_id, ''), op,
+		       COALESCE(scope, ''), payload_json, attempt,
+		       COALESCE(last_attempt_unix, 0), COALESCE(last_error, ''),
+		       created_unix
+		FROM pending_writes
+		WHERE attempt >= ?
+		ORDER BY created_unix ASC`, pendingMaxAttempts)
+	if err != nil {
+		return nil, fmt.Errorf("list exhausted pending writes: %w", err)
+	}
+	defer rows.Close()
+	var out []ExhaustedWrite
+	for rows.Next() {
+		var w ExhaustedWrite
+		var payloadJSON string
+		if err := rows.Scan(
+			&w.ID, &w.SourceID, &w.CalendarID, &w.EventID, &w.Op,
+			&w.Scope, &payloadJSON, &w.Attempt,
+			&w.LastAttemptUnix, &w.LastError, &w.CreatedUnix,
+		); err != nil {
+			return nil, fmt.Errorf("scan exhausted pending write: %w", err)
+		}
+		var payload pendingPayload
+		if err := json.Unmarshal([]byte(payloadJSON), &payload); err == nil {
+			w.Summary = payload.Summary
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// ExhaustedCount returns how many pending rows used up their budget.
+func (q *PendingQueue) ExhaustedCount() (int, error) {
+	var n int
+	if err := q.store.DB().QueryRow(
+		`SELECT COUNT(*) FROM pending_writes WHERE attempt >= ?`, pendingMaxAttempts,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count exhausted pending writes: %w", err)
+	}
+	return n, nil
+}
+
+// RetryExhausted resets an exhausted row's attempt budget so the next
+// Drain retries it. Only exhausted rows can be retried this way — a row
+// still inside its budget retries on its own.
+func (q *PendingQueue) RetryExhausted(id string) error {
+	res, err := q.store.DB().Exec(`
+		UPDATE pending_writes
+		SET attempt = 0, last_error = '', last_attempt_unix = 0
+		WHERE id = ? AND attempt >= ?`, id, pendingMaxAttempts)
+	if err != nil {
+		return fmt.Errorf("retry exhausted pending write: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return fmt.Errorf("pending write %q is not exhausted", id)
+	}
+	return nil
+}
+
+// DiscardExhausted drops an exhausted row without pushing it. Only
+// exhausted rows can be discarded this way — the edit never reaches
+// the server, so the user must choose this explicitly in the UI.
+func (q *PendingQueue) DiscardExhausted(id string) error {
+	res, err := q.store.DB().Exec(
+		`DELETE FROM pending_writes WHERE id = ? AND attempt >= ?`, id, pendingMaxAttempts)
+	if err != nil {
+		return fmt.Errorf("discard exhausted pending write: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return fmt.Errorf("pending write %q is not exhausted", id)
+	}
+	return nil
 }
 
 func (q *PendingQueue) updateEventTransportFields(calendarID, uid, etag, providerEventID string) error {

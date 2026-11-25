@@ -70,9 +70,9 @@ func newTestMicrosoftProvider(serverURL string) microsoftProvider {
 
 func TestMicrosoftTranslate_NonRecurringTimedRoundTrip(t *testing.T) {
 	src := graphEvent{
-		ICalUID: "evt-uid-1@daak-microsoft",
-		Subject: "Project sync",
-		Body:    &graphBody{ContentType: "text", Content: "Weekly project status"},
+		ICalUID:  "evt-uid-1@daak-microsoft",
+		Subject:  "Project sync",
+		Body:     &graphBody{ContentType: "text", Content: "Weekly project status"},
 		Location: &graphLocation{DisplayName: "Room 4B"},
 		Start: &graphTimePoint{
 			DateTime: "2026-06-10T21:00:00.0000000",
@@ -200,71 +200,71 @@ func TestMicrosoftTranslate_RecurringWeeklyWithReminder(t *testing.T) {
 
 func TestMicrosoftTranslate_PatternMappings(t *testing.T) {
 	tests := []struct {
-		name        string
-		rrule       string
-		dtstart     time.Time
-		wantType    string
-		wantDays    []string
-		wantDayOfM  int
-		wantMonth   int
+		name          string
+		rrule         string
+		dtstart       time.Time
+		wantType      string
+		wantDays      []string
+		wantDayOfM    int
+		wantMonth     int
 		wantRangeType string
-		wantCount   int
+		wantCount     int
 	}{
 		{
-			name:     "DAILY",
-			rrule:    "FREQ=DAILY",
-			dtstart:  time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC),
-			wantType: "daily",
+			name:          "DAILY",
+			rrule:         "FREQ=DAILY",
+			dtstart:       time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC),
+			wantType:      "daily",
 			wantRangeType: "noEnd",
 		},
 		{
-			name:     "WEEKLY with composer default (single day from DTSTART)",
-			rrule:    "FREQ=WEEKLY",
-			dtstart:  time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC), // Wed
-			wantType: "weekly",
-			wantDays: []string{"wednesday"},
+			name:          "WEEKLY with composer default (single day from DTSTART)",
+			rrule:         "FREQ=WEEKLY",
+			dtstart:       time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC), // Wed
+			wantType:      "weekly",
+			wantDays:      []string{"wednesday"},
 			wantRangeType: "noEnd",
 		},
 		{
-			name:     "WEEKLY with BYDAY",
-			rrule:    "FREQ=WEEKLY;BYDAY=MO,WE,FR",
-			dtstart:  time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC),
-			wantType: "weekly",
-			wantDays: []string{"monday", "wednesday", "friday"},
+			name:          "WEEKLY with BYDAY",
+			rrule:         "FREQ=WEEKLY;BYDAY=MO,WE,FR",
+			dtstart:       time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC),
+			wantType:      "weekly",
+			wantDays:      []string{"monday", "wednesday", "friday"},
 			wantRangeType: "noEnd",
 		},
 		{
-			name:       "MONTHLY uses DTSTART day",
-			rrule:      "FREQ=MONTHLY",
-			dtstart:    time.Date(2026, 6, 15, 9, 0, 0, 0, time.UTC),
-			wantType:   "absoluteMonthly",
-			wantDayOfM: 15,
+			name:          "MONTHLY uses DTSTART day",
+			rrule:         "FREQ=MONTHLY",
+			dtstart:       time.Date(2026, 6, 15, 9, 0, 0, 0, time.UTC),
+			wantType:      "absoluteMonthly",
+			wantDayOfM:    15,
 			wantRangeType: "noEnd",
 		},
 		{
-			name:       "YEARLY from DTSTART month + day",
-			rrule:      "FREQ=YEARLY",
-			dtstart:    time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
-			wantType:   "absoluteYearly",
-			wantDayOfM: 4,
-			wantMonth:  7,
+			name:          "YEARLY from DTSTART month + day",
+			rrule:         "FREQ=YEARLY",
+			dtstart:       time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+			wantType:      "absoluteYearly",
+			wantDayOfM:    4,
+			wantMonth:     7,
 			wantRangeType: "noEnd",
 		},
 		{
-			name:     "COUNT",
-			rrule:    "FREQ=WEEKLY;COUNT=10",
-			dtstart:  time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC),
-			wantType: "weekly",
-			wantDays: []string{"wednesday"},
+			name:          "COUNT",
+			rrule:         "FREQ=WEEKLY;COUNT=10",
+			dtstart:       time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC),
+			wantType:      "weekly",
+			wantDays:      []string{"wednesday"},
 			wantRangeType: "numbered",
-			wantCount: 10,
+			wantCount:     10,
 		},
 		{
-			name:     "UNTIL",
-			rrule:    "FREQ=WEEKLY;UNTIL=20261231T235959Z",
-			dtstart:  time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC),
-			wantType: "weekly",
-			wantDays: []string{"wednesday"},
+			name:          "UNTIL",
+			rrule:         "FREQ=WEEKLY;UNTIL=20261231T235959Z",
+			dtstart:       time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC),
+			wantType:      "weekly",
+			wantDays:      []string{"wednesday"},
 			wantRangeType: "endDate",
 		},
 	}
@@ -629,13 +629,13 @@ var _ = strconv.Itoa
 // suppresses deletes so a glitchy/empty pull can't wipe the calendar.
 func TestPlanEventSync(t *testing.T) {
 	rows := []graphEvent{
-		{ICalUID: "s1", ETag: "e2new"},                        // single, changed
-		{ICalUID: "x1", SeriesMasterID: "m1"},                 // exception — skip entirely
-		{ICalUID: "n1", ETag: "e3"},                           // new single
-		{ICalUID: "u1", ETag: "eu"},                           // single, unchanged
-		{ICalUID: "mm", ETag: "em", Type: "seriesMaster"},     // master, unchanged etag
-		{ICalUID: ""},                                         // no UID — skip
-		{ICalUID: "s1", ETag: "e2new"},                        // duplicate — dedupe
+		{ICalUID: "s1", ETag: "e2new"},                    // single, changed
+		{ICalUID: "x1", SeriesMasterID: "m1"},             // exception — skip entirely
+		{ICalUID: "n1", ETag: "e3"},                       // new single
+		{ICalUID: "u1", ETag: "eu"},                       // single, unchanged
+		{ICalUID: "mm", ETag: "em", Type: "seriesMaster"}, // master, unchanged etag
+		{ICalUID: ""},                  // no UID — skip
+		{ICalUID: "s1", ETag: "e2new"}, // duplicate — dedupe
 	}
 	local := map[string]string{
 		"s1":   "e2old", // changed → processed
@@ -703,9 +703,9 @@ func TestPlanEventSync_EmptyListSuppressesDeletes(t *testing.T) {
 // neither id nor UID stay empty (and are skipped by planEventSync).
 func TestSynthesizeICalUIDs(t *testing.T) {
 	rows := []graphEvent{
-		{ID: "gid1"},                       // synthesized
-		{ID: "gid2", ICalUID: "real-uid"},  // untouched
-		{},                                 // neither — stays empty
+		{ID: "gid1"},                      // synthesized
+		{ID: "gid2", ICalUID: "real-uid"}, // untouched
+		{},                                // neither — stays empty
 	}
 	synthesizeICalUIDs(rows)
 
@@ -1003,5 +1003,68 @@ func TestMicrosoftProvider_DeleteRemote_EmptyETag_ChangedIsConflict(t *testing.T
 	}
 	if got := ms.countMethod(http.MethodDelete); got != 0 {
 		t.Fatalf("server saw %d DELETEs, want 0; requests=%+v", got, ms.requests)
+	}
+}
+
+// Audit4 finding 25: the this-and-future clamp date must be computed in
+// the event's time zone, not UTC.
+func TestMicrosoftSplitEndDate_TimezoneAware(t *testing.T) {
+	// 02:00 in Karachi (UTC+5) = 21:00 UTC the previous day. The UTC
+	// computation would clamp to Oct 31 and drop the Nov 1 occurrence.
+	instance := time.Date(2026, 11, 2, 2, 0, 0, 0, time.FixedZone("PKT", 5*3600)).Unix()
+	if got := microsoftSplitEndDate("Asia/Karachi", "", instance); got != "2026-11-01" {
+		t.Errorf("Karachi endDate = %q, want 2026-11-01", got)
+	}
+	// Windows zone IDs resolve too.
+	if got := microsoftSplitEndDate("Pakistan Standard Time", "", instance); got != "2026-11-01" {
+		t.Errorf("Windows-zone endDate = %q, want 2026-11-01", got)
+	}
+	// 22:00 in New York (UTC-5) = 03:00 UTC the next day. The UTC
+	// computation would clamp to Nov 2 and keep an extra occurrence.
+	instanceNY := time.Date(2026, 11, 2, 22, 0, 0, 0, time.FixedZone("EST", -5*3600)).Unix()
+	if got := microsoftSplitEndDate("America/New_York", "", instanceNY); got != "2026-11-01" {
+		t.Errorf("New York endDate = %q, want 2026-11-01", got)
+	}
+	// No zone at all falls back to UTC behaviour.
+	if got := microsoftSplitEndDate("", "", instance); got != "2026-10-31" {
+		t.Errorf("UTC endDate = %q, want 2026-10-31", got)
+	}
+}
+
+// Audit4 finding 25: a previously moved occurrence must be findable again
+// by its ORIGINAL start, not its moved start.
+func TestMicrosoftFindInstanceID_MatchesOriginalStart(t *testing.T) {
+	original := time.Date(2026, 11, 9, 9, 0, 0, 0, time.UTC)
+	moved := original.Add(3 * time.Hour)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(graphEventsResponse{Value: []graphEvent{
+			{
+				ID:            "moved-instance",
+				Type:          "exception",
+				OriginalStart: original.Format(time.RFC3339),
+				Start:         &graphTimePoint{DateTime: moved.Format("2006-01-02T15:04:05"), TimeZone: "UTC"},
+				End:           &graphTimePoint{DateTime: moved.Add(time.Hour).Format("2006-01-02T15:04:05"), TimeZone: "UTC"},
+			},
+			{
+				ID:    "plain-instance",
+				Type:  "occurrence",
+				Start: &graphTimePoint{DateTime: original.AddDate(0, 0, 7).Format("2006-01-02T15:04:05"), TimeZone: "UTC"},
+				End:   &graphTimePoint{DateTime: original.AddDate(0, 0, 7).Add(time.Hour).Format("2006-01-02T15:04:05"), TimeZone: "UTC"},
+			},
+		}})
+	}))
+	defer srv.Close()
+
+	p := newTestMicrosoftProvider(srv.URL)
+	client, err := p.httpClient(Source{ID: "src-m1", Type: SourceTypeMicrosoft, AccountID: "acct-1"})
+	if err != nil {
+		t.Fatalf("httpClient: %v", err)
+	}
+	id, err := p.findInstanceID(t.Context(), client, "master-1", original.Unix())
+	if err != nil {
+		t.Fatalf("findInstanceID: %v", err)
+	}
+	if id != "moved-instance" {
+		t.Errorf("findInstanceID = %q, want moved-instance (matched by original start)", id)
 	}
 }

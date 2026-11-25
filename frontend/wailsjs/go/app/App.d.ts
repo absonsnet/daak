@@ -78,6 +78,8 @@ export function Calendar_DeleteEvent(arg1:string,arg2:string,arg3:number):Promis
 
 export function Calendar_DeleteSource(arg1:string):Promise<void>;
 
+export function Calendar_DiscardExhaustedWrite(arg1:string):Promise<void>;
+
 export function Calendar_DismissAlarm(arg1:string):Promise<void>;
 
 export function Calendar_ForceSyncSource(arg1:string):Promise<void>;
@@ -89,6 +91,8 @@ export function Calendar_GrantCalendarAccess(arg1:string,arg2:string,arg3:string
 export function Calendar_ListCalendars(arg1:string):Promise<Array<backend.Calendar>>;
 
 export function Calendar_ListEventsInRange(arg1:Array<string>,arg2:number,arg3:number):Promise<Array<backend.EventInstance>>;
+
+export function Calendar_ListExhaustedWrites():Promise<Array<backend.ExhaustedWrite>>;
 
 export function Calendar_ListGoogleCalendarsForAccount(arg1:string):Promise<Array<backend.GoogleCalendarChoice>>;
 
@@ -105,6 +109,8 @@ export function Calendar_QueryFreeBusy(arg1:Array<string>,arg2:Array<string>,arg
 export function Calendar_RenameSource(arg1:string,arg2:string):Promise<void>;
 
 export function Calendar_ReprobeCalDAVOrganizerIdentities(arg1:string):Promise<number>;
+
+export function Calendar_RetryExhaustedWrite(arg1:string):Promise<void>;
 
 export function Calendar_SearchContacts(arg1:string,arg2:number):Promise<Array<v1.Contact>>;
 
@@ -209,6 +215,8 @@ export function DeletePGPSenderKey(arg1:string):Promise<void>;
 export function DeletePermanently(arg1:Array<string>):Promise<void>;
 
 export function DeleteSMIMECertificate(arg1:string):Promise<void>;
+
+export function DeleteSendQueueItem(arg1:string):Promise<void>;
 
 export function DeleteSenderCert(arg1:string):Promise<void>;
 
@@ -413,6 +421,8 @@ export function GetPGPKeyServers():Promise<Array<pgp.KeyServer>>;
 export function GetPGPSignPolicy(arg1:string):Promise<string>;
 
 export function GetPendingMailto():Promise<app.MailtoData>;
+
+export function GetPendingFlagChangeCount():Promise<number>;
 
 export function GetReadReceiptResponsePolicy():Promise<string>;
 
@@ -725,6 +735,8 @@ export function ReorderAccounts(arg1:Array<string>):Promise<void>;
 export function ResolveMessageUID(arg1:string):Promise<number>;
 
 export function RetrySendQueueItem(arg1:string):Promise<void>;
+
+export function RetryPendingFlagChanges():Promise<number>;
 
 export function RunEnrichmentBackfill():Promise<number>;
 

@@ -10,7 +10,15 @@
     },
     "write": {
       "queued": "Saved — will sync when you're back online.",
-      "conflict": "This event was changed on the server. Please open it and re-apply your edit."
+      "conflict": "This event was changed on the server. Please open it and re-apply your edit.",
+      "exhausted": "These changes could not be synced after several tries. They never reached the server.",
+      "exhaustedOp": {
+        "create": "Create",
+        "update": "Edit",
+        "delete": "Delete"
+      },
+      "retry": "Retry",
+      "discard": "Discard"
     },
     "drag": {
       "errorSave": "Failed to save event: {message}",

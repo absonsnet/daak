@@ -1050,7 +1050,17 @@ func (s *Store) UpdateFlagsByUIDBatch(folderID string, updates []FlagUpdate) err
 
 	stmt, err := tx.Prepare(`
 		UPDATE messages SET
-			is_read = ?, is_starred = ?, is_answered = ?, is_forwarded = ?,
+			is_read = CASE WHEN EXISTS (
+				SELECT 1 FROM pending_flag_changes p
+				JOIN messages m2 ON m2.id = p.message_id
+				WHERE m2.folder_id = ? AND m2.uid = ? AND p.flag_type = 'read'
+			) THEN is_read ELSE ? END,
+			is_starred = CASE WHEN EXISTS (
+				SELECT 1 FROM pending_flag_changes p
+				JOIN messages m2 ON m2.id = p.message_id
+				WHERE m2.folder_id = ? AND m2.uid = ? AND p.flag_type = 'starred'
+			) THEN is_starred ELSE ? END,
+			is_answered = ?, is_forwarded = ?,
 			is_draft = ?, is_deleted = ?
 		WHERE folder_id = ? AND uid = ?
 	`)
@@ -1060,7 +1070,7 @@ func (s *Store) UpdateFlagsByUIDBatch(folderID string, updates []FlagUpdate) err
 	defer stmt.Close()
 
 	for _, u := range updates {
-		_, err := stmt.Exec(u.IsRead, u.IsStarred, u.IsAnswered, u.IsForwarded, u.IsDraft, u.IsDeleted, folderID, u.UID)
+		_, err := stmt.Exec(folderID, u.UID, u.IsRead, folderID, u.UID, u.IsStarred, u.IsAnswered, u.IsForwarded, u.IsDraft, u.IsDeleted, folderID, u.UID)
 		if err != nil {
 			return fmt.Errorf("failed to update flags for UID %d: %w", u.UID, err)
 		}
@@ -1071,6 +1081,114 @@ func (s *Store) UpdateFlagsByUIDBatch(folderID string, updates []FlagUpdate) err
 	}
 
 	return nil
+}
+
+// PendingFlagChange is one local read/star change that has not been
+// pushed to the server yet (fourth-audit finding 18). While it exists,
+// the sync flag paths must not overwrite that flag on that message —
+// see UpdateFlagsByUIDBatch — and the change is re-pushed after a
+// sync or on demand from the UI.
+type PendingFlagChange struct {
+	ID        string
+	AccountID string
+	FolderID  string
+	MessageID string
+	UID       uint32
+	FlagType  string // "read" or "starred"
+	FlagValue bool
+	CreatedAt time.Time
+}
+
+// FlagTypeRead / FlagTypeStarred are the pending_flag_changes flag_type values.
+const (
+	FlagTypeRead    = "read"
+	FlagTypeStarred = "starred"
+)
+
+// RecordPendingFlagChanges upserts one pending row per message, so a
+// later flip of the same flag replaces the earlier one instead of
+// queueing a stale push behind it.
+func (s *Store) RecordPendingFlagChanges(messages []*Message, flagType string, flagValue bool) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	if flagType != FlagTypeRead && flagType != FlagTypeStarred {
+		return fmt.Errorf("unknown flag type %q", flagType)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, m := range messages {
+		if _, err := s.db.Exec(`
+			INSERT INTO pending_flag_changes
+				(id, account_id, folder_id, message_id, uid, flag_type, flag_value, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (message_id, flag_type) DO UPDATE SET
+				account_id = excluded.account_id,
+				folder_id = excluded.folder_id,
+				uid = excluded.uid,
+				flag_value = excluded.flag_value,
+				created_at = excluded.created_at
+		`, uuid.New().String(), m.AccountID, m.FolderID, m.ID, m.UID, flagType, flagValue, now); err != nil {
+			return fmt.Errorf("failed to record pending flag change for message %s: %w", m.ID, err)
+		}
+	}
+	return nil
+}
+
+// DeletePendingFlagChanges removes the pending rows for the given
+// messages and flag type, after a successful push to the server.
+func (s *Store) DeletePendingFlagChanges(messageIDs []string, flagType string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(messageIDs))
+	args := make([]interface{}, 0, len(messageIDs)+1)
+	args = append(args, flagType)
+	for i, id := range messageIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	_, err := s.db.Exec(fmt.Sprintf(
+		"DELETE FROM pending_flag_changes WHERE flag_type = ? AND message_id IN (%s)",
+		strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return fmt.Errorf("failed to delete pending flag changes: %w", err)
+	}
+	return nil
+}
+
+// ListPendingFlagChanges returns every un-pushed local flag change,
+// oldest first.
+func (s *Store) ListPendingFlagChanges() ([]PendingFlagChange, error) {
+	rows, err := s.db.Query(`
+		SELECT id, account_id, folder_id, message_id, uid, flag_type, flag_value, created_at
+		FROM pending_flag_changes ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pending flag changes: %w", err)
+	}
+	defer rows.Close()
+	var out []PendingFlagChange
+	for rows.Next() {
+		var p PendingFlagChange
+		var createdAt string
+		if err := rows.Scan(&p.ID, &p.AccountID, &p.FolderID, &p.MessageID, &p.UID, &p.FlagType, &p.FlagValue, &createdAt); err != nil {
+			return nil, fmt.Errorf("failed to scan pending flag change: %w", err)
+		}
+		if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
+			p.CreatedAt = t
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// PendingFlagChangeCount returns the number of un-pushed local flag changes.
+func (s *Store) PendingFlagChangeCount() (int, error) {
+	var n int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM pending_flag_changes").Scan(&n); err != nil {
+		return 0, fmt.Errorf("failed to count pending flag changes: %w", err)
+	}
+	return n, nil
 }
 
 // MarkReadReceiptHandled marks a message's read receipt as handled (sent or ignored)

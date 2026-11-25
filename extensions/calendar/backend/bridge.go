@@ -334,6 +334,43 @@ func (b *CalendarBridge) Calendar_DeleteEvent(eventID, scope string, instanceUni
 	return nil
 }
 
+// Calendar_ListExhaustedWrites returns the offline-queue rows that used
+// up their retry budget (audit4 finding 21). Returns nil when the
+// extension is disabled.
+func (b *CalendarBridge) Calendar_ListExhaustedWrites() ([]ExhaustedWrite, error) {
+	if !b.gateEnabled() {
+		return nil, nil
+	}
+	if err := b.ensureInit(); err != nil {
+		return nil, err
+	}
+	return b.api.ListExhaustedWrites()
+}
+
+// Calendar_RetryExhaustedWrite resets an exhausted queued write's
+// attempt budget so the next Drain retries it.
+func (b *CalendarBridge) Calendar_RetryExhaustedWrite(id string) error {
+	if !b.gateEnabled() {
+		return nil
+	}
+	if err := b.ensureInit(); err != nil {
+		return err
+	}
+	return b.api.RetryExhaustedWrite(id)
+}
+
+// Calendar_DiscardExhaustedWrite drops an exhausted queued write
+// without pushing it.
+func (b *CalendarBridge) Calendar_DiscardExhaustedWrite(id string) error {
+	if !b.gateEnabled() {
+		return nil
+	}
+	if err := b.ensureInit(); err != nil {
+		return err
+	}
+	return b.api.DiscardExhaustedWrite(id)
+}
+
 // Calendar_ListSources returns all configured calendar sources. Returns
 // nil (empty result) when the extension is disabled — consistent with
 // Contacts_ListSources's behavior.
