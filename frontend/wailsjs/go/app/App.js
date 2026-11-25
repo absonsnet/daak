@@ -1274,6 +1274,10 @@ export function MarkAsUnread(arg1) {
   return window['go']['app']['App']['MarkAsUnread'](arg1);
 }
 
+export function MarkNotificationDeniedNoticeShown() {
+  return window['go']['app']['App']['MarkNotificationDeniedNoticeShown']();
+}
+
 export function MarkWholeFolder(arg1, arg2) {
   return window['go']['app']['App']['MarkWholeFolder'](arg1, arg2);
 }

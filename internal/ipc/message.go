@@ -38,6 +38,13 @@ const (
 	// another view mode in its switcher; the main window opens the
 	// message in that mode and the popup closes itself.
 	TypeViewerSwitch = "viewer_switch"
+
+	// TypeViewerFolderCountsChanged is sent by a viewer popup after
+	// a read flip changed folder unread counts (fourth-audit finding
+	// 47): the popup shares the database but lives in another
+	// process, so the main window's sidebar badge would otherwise
+	// stay stale until the next sync.
+	TypeViewerFolderCountsChanged = "viewer_folder_counts_changed"
 )
 
 // Message type constants for Main -> Composer (broadcast) communication
@@ -105,6 +112,15 @@ type ViewerSwitchPayload struct {
 	AccountID string `json:"account_id"`
 	FolderID  string `json:"folder_id"`
 	ThreadID  string `json:"thread_id"`
+}
+
+// ViewerFolderCountsChangedPayload carries the folders whose unread
+// counts a viewer popup just changed, with the new unread count per
+// folder. The main window re-reads the rows from the shared database
+// rather than trusting these numbers blindly — they are the signal,
+// the database is the source.
+type ViewerFolderCountsChangedPayload struct {
+	Counts map[string]int `json:"counts"`
 }
 
 // ThemeChangedPayload is the payload for TypeThemeChanged messages.

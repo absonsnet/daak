@@ -72,9 +72,15 @@ type fakeSenderFactory struct {
 	created int
 	// createErr fails NewSender (e.g. SMTP connect failure) when set.
 	createErr error
+	// onCreate, when set, runs inside NewSender before it returns —
+	// a test uses it to synchronise two concurrent dispatches.
+	onCreate func()
 }
 
 func (f *fakeSenderFactory) NewSender(_ context.Context, _ string) (hostmm.MailSender, error) {
+	if f.onCreate != nil {
+		f.onCreate()
+	}
 	if f.createErr != nil {
 		return nil, f.createErr
 	}

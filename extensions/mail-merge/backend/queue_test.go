@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -679,6 +680,80 @@ func TestQueueRetryFailedAndMaxAttempts(t *testing.T) {
 	}
 	if res.Sent != 1 {
 		t.Fatalf("retry dispatch %+v", res)
+	}
+}
+
+// TestQueueConnectFailureClaimsBeforeRecording (fourth-audit finding
+// 53): when SMTP cannot even be opened, two concurrent dispatches
+// (a background tick and a manual "Send unsent") must record the
+// failure once, not once each. The item is driven to one attempt
+// short of its max first, so the next failure flips it to failed:
+// without the claim both dispatches record that flip and the pair
+// reports Failed=2 for one item; with it only the dispatcher that
+// won the claim records, and the pair reports Failed=1. The barrier
+// in NewSender makes both dispatches list the due item before
+// either records, so the race is deterministic, not timing luck.
+func TestQueueConnectFailureClaimsBeforeRecording(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	fakeNow := time.Now().UTC().Truncate(time.Second)
+	env.bridge.nowFunc = func() time.Time { return fakeNow }
+	runID := startLaterRun(t, env, testBridgeRows()[:1])
+
+	env.factory.createErr = errors.New("dial tcp: connection refused")
+	// Drive the item to one attempt short of the max (default 3):
+	// two sequential connect failures, clock advanced past each
+	// backoff so the item is due again.
+	for i := 0; i < 2; i++ {
+		if _, err := env.bridge.MailMerge_SendUnsent(); err != nil {
+			t.Fatal(err)
+		}
+		fakeNow = fakeNow.Add(5 * time.Minute)
+	}
+	item := findQueueItem(t, env.bridge, runID, "john@example.com")
+	if item.Attempts != 2 {
+		t.Fatalf("setup: attempts = %d, want 2", item.Attempts)
+	}
+
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	env.factory.onCreate = func() {
+		entered <- struct{}{}
+		<-release
+	}
+
+	results := make([]DispatchResult, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res, err := env.bridge.MailMerge_SendUnsent()
+			if err != nil {
+				t.Errorf("SendUnsent: %v", err)
+			}
+			results[i] = res
+		}(i)
+	}
+	// Wait until both dispatches are inside NewSender, then let
+	// them both fail the connect at once.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			close(release)
+			t.Fatal("second dispatch never reached NewSender")
+		}
+	}
+	close(release)
+	wg.Wait()
+
+	totalFailed := results[0].Failed + results[1].Failed
+	if totalFailed != 1 {
+		t.Errorf("concurrent connect failures reported Failed=%d, want 1 (one item failed once)", totalFailed)
+	}
+	item = findQueueItem(t, env.bridge, runID, "john@example.com")
+	if item.Attempts != 3 || item.Status != QueueStatusFailed {
+		t.Errorf("item after concurrent failures = attempts %d status %q, want 3/failed", item.Attempts, item.Status)
 	}
 }
 

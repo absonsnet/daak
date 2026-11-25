@@ -29,12 +29,29 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 
 	a.syncMu.Lock()
 
-	// Check debounce - if last request for this folder was within 500ms, skip
+	// Check debounce - if last request for this folder was within
+	// 500ms, join the sync that is already running instead of
+	// silently succeeding (fourth-audit finding 60): a double press
+	// used to return success without doing anything, so the UI
+	// reported a sync that never ran. The join waits for the header
+	// phase only — the body fetch runs on after it in the background.
 	if lastReq, exists := a.syncLastRequest[syncKey]; exists {
 		if time.Since(lastReq) < time.Duration(debounceMs)*time.Millisecond {
+			done := a.syncHeaderDone[syncKey]
 			a.syncMu.Unlock()
-			log.Info().Str("account", accountID).Str("folder", folderID).Msg("SyncFolder debounced, skipping")
-			return nil // Silently ignore
+			if done != nil {
+				if a.ctx != nil {
+					select {
+					case <-done:
+					case <-a.ctx.Done():
+						return a.ctx.Err()
+					}
+				} else {
+					<-done
+				}
+			}
+			log.Info().Str("account", accountID).Str("folder", folderID).Msg("SyncFolder debounced, joined running sync")
+			return nil
 		}
 	}
 	a.syncLastRequest[syncKey] = time.Now()
@@ -53,6 +70,13 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 	ctx, cancel := context.WithCancel(a.ctx)
 	a.syncContexts[syncKey] = cancel
 
+	// Header-phase completion signal for a debounced second press to
+	// join on (finding 60). Closed in the defer below, which runs on
+	// every return — after the header sync, before the body fetch
+	// goroutine takes over.
+	headerDone := make(chan struct{})
+	a.syncHeaderDone[syncKey] = headerDone
+
 	a.syncMu.Unlock()
 
 	// NOTE: Don't cleanup syncContexts here - body sync runs in goroutine
@@ -65,6 +89,17 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 	// a newer sync's entry is never removed.
 	handedOff := false
 	defer func() {
+		// The header phase is over whenever SyncFolder returns: close
+		// the join channel first, so a debounced caller waiting on it
+		// resumes as soon as the headers landed. Identity-checked
+		// like the syncContexts cleanup so a newer sync's channel is
+		// never closed.
+		a.syncMu.Lock()
+		if ch, exists := a.syncHeaderDone[syncKey]; exists && ch == headerDone {
+			delete(a.syncHeaderDone, syncKey)
+			close(ch)
+		}
+		a.syncMu.Unlock()
 		if handedOff {
 			return
 		}

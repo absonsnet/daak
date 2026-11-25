@@ -42,19 +42,12 @@
   // state in the sidebar_expanded_accounts setting)
   let expandedAccounts = $state<Record<string, boolean>>({})
 
-  // True once the launch-time collapse below has run. The effect re-runs
-  // when the account list changes mid-session; only its first run with
-  // accounts present forces the collapse — later runs keep today's
-  // behaviour (stored set rules, pruned to existing accounts), so adding
-  // an account mid-session does not collapse what the user just opened.
-  let expandedInitDone = false
-
-  // Initialize expanded state from the persisted setting.
-  // On launch every account starts collapsed — the stored set from the
-  // previous session does NOT carry over, and a first run after the
-  // upgrade no longer expands the first account. Expanding an account
-  // with its chevron still works during a session; it just does not
-  // survive the next launch.
+  // Initialize expanded state from the persisted setting. The stored
+  // set from the previous session carries over (fourth-audit finding
+  // 56): the first run used to collapse everything, so the sidebar
+  // forgot which accounts you expanded on every launch even though
+  // Daak saves the state. With no stored set yet (first run after
+  // the upgrade), the first account expands, as before.
   $effect(() => {
     // Read version to create dependency - effect re-runs when UI state finishes loading
     const _version = getUIStateVersion()
@@ -62,18 +55,6 @@
     const ids = accountStore.accounts.map((acc) => acc.account.id)
     if (ids.length === 0) {
       expandedAccounts = {}
-      return
-    }
-
-    if (!expandedInitDone) {
-      // First run with accounts present: collapse everything.
-      setExpandedAccountIds([])
-      const collapsed: Record<string, boolean> = {}
-      for (const id of ids) {
-        collapsed[id] = false
-      }
-      expandedAccounts = collapsed
-      expandedInitDone = true
       return
     }
 
@@ -275,7 +256,18 @@
         MailMerge_GetQueueStats(),
         GetSendQueueStats(),
       ])
-      outboxCount = (mmStats?.queued ?? 0) + (sqStats?.pending ?? 0)
+      // The badge counts everything in the Outbox that still needs
+      // attention (fourth-audit finding 48): waiting Mail Merge and
+      // normal sends, failed sends of either kind, and normal sends
+      // that were delivered but never saved to Sent. Counting only
+      // the waiting rows used to drop the badge to zero on the one
+      // thing needing attention — a failed send.
+      outboxCount =
+        (mmStats?.queued ?? 0) +
+        (mmStats?.failed ?? 0) +
+        (sqStats?.pending ?? 0) +
+        (sqStats?.failed ?? 0) +
+        (sqStats?.sentUnsaved ?? 0)
     } catch (err) {
       console.error('Failed to load outbox count:', err)
     }

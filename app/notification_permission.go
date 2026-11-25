@@ -59,21 +59,34 @@ func (a *App) OpenNotificationSettings() error {
 }
 
 // CheckNotificationDeniedNotice reports whether the one-time
-// "notifications are blocked" notice should be shown now. It returns
-// true exactly once: the first time a denied permission is observed
-// while the notice flag is unset, and it records the flag so later
-// calls return false. The frontend calls this once at startup; the
-// permission-change callback (handleNotificationPermissionChange)
-// also routes through it for denials answered while the app is
-// running.
+// "notifications are blocked" notice should be shown now. It is a
+// PEEK, not a claim (fourth-audit finding 54): it returns true every
+// time a denied permission is observed while the notice flag is
+// unset, and only MarkNotificationDeniedNoticeShown persists the
+// flag — after the dialog has actually opened. Claiming here used
+// to mark the notice "already shown" the moment it was claimed, so
+// if the app closed before the dialog appeared, the notice never
+// came again.
 func (a *App) CheckNotificationDeniedNotice() (bool, error) {
-	return a.claimNotificationDeniedNotice()
+	return a.deniedNoticePending()
 }
 
-// claimNotificationDeniedNotice is the single claim operation for the
-// one-time denied notice: true only when the OS reports denied AND
-// the flag is unset; claiming persists the flag.
-func (a *App) claimNotificationDeniedNotice() (bool, error) {
+// MarkNotificationDeniedNoticeShown records that the one-time
+// "notifications are blocked" notice has actually been displayed.
+// The frontend calls it when the dialog opens — never before — so a
+// notice claimed but never shown (app closed first, another dialog
+// in the way) still fires on the next launch.
+func (a *App) MarkNotificationDeniedNoticeShown() error {
+	if a.settingsStore == nil {
+		return nil
+	}
+	return a.settingsStore.SetNotificationDeniedNoticeShown(true)
+}
+
+// deniedNoticePending is the single read behind the one-time denied
+// notice: true only when the OS reports denied AND the flag is
+// unset. It never writes.
+func (a *App) deniedNoticePending() (bool, error) {
 	if a.notifier == nil || a.settingsStore == nil {
 		return false, nil
 	}
@@ -84,23 +97,18 @@ func (a *App) claimNotificationDeniedNotice() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if shown {
-		return false, nil
-	}
-	if err := a.settingsStore.SetNotificationDeniedNoticeShown(true); err != nil {
-		return false, err
-	}
-	return true, nil
+	return !shown, nil
 }
 
 // handleNotificationPermissionChange is invoked by the notifier when
 // the OS reports a permission change (macOS: the user answered the
 // authorization prompt). A denial emits the
-// "notification:permission-denied" event; the frontend claims the
-// one-time notice via CheckNotificationDeniedNotice, so an event
-// emitted before the frontend mounts is not lost — the startup check
-// still claims it then. Non-denied changes are ignored here: the
-// Settings row shows the current state on its next load.
+// "notification:permission-denied" event; the frontend peeks at the
+// one-time notice via CheckNotificationDeniedNotice and marks it
+// shown when the dialog opens, so an event emitted before the
+// frontend mounts is not lost — the startup check still queues it
+// then. Non-denied changes are ignored here: the Settings row shows
+// the current state on its next load.
 func (a *App) handleNotificationPermissionChange(status notification.PermissionStatus) {
 	log := logging.WithComponent("app.notify")
 	if status != notification.PermissionDenied {

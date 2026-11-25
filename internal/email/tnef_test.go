@@ -94,6 +94,49 @@ func TestDecodeTNEFAttachments_Invalid(t *testing.T) {
 	}
 }
 
+// TestExtractAttachments_CorruptWinmailDat (fourth-audit finding 50): a
+// corrupt winmail.dat must still surface as one downloadable row named
+// winmail.dat, like the sync parser does. Before the fix this extractor
+// — the path a message opened from server search takes — returned
+// nothing on TNEF decode failure while the message still carried its
+// has_attachments flag, so the paperclip opened an empty list.
+func TestExtractAttachments_CorruptWinmailDat(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("From: a@example.com\r\n")
+	sb.WriteString("To: b@example.com\r\n")
+	sb.WriteString("Subject: corrupt tnef\r\n")
+	sb.WriteString("MIME-Version: 1.0\r\n")
+	sb.WriteString("Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n")
+	sb.WriteString("--BOUND\r\n")
+	sb.WriteString("Content-Type: text/plain\r\n\r\n")
+	sb.WriteString("hello\r\n")
+	sb.WriteString("--BOUND\r\n")
+	sb.WriteString("Content-Type: application/ms-tnef; name=\"winmail.dat\"\r\n")
+	sb.WriteString("Content-Transfer-Encoding: base64\r\n")
+	sb.WriteString("Content-Disposition: attachment; filename=\"winmail.dat\"\r\n\r\n")
+	sb.WriteString(b64wrap([]byte("not a tnef container at all")))
+	sb.WriteString("\r\n--BOUND--\r\n")
+
+	e := NewAttachmentExtractor()
+	atts, err := e.ExtractAttachments("msg-1", []byte(sb.String()))
+	if err != nil {
+		t.Fatalf("ExtractAttachments error: %v", err)
+	}
+	if len(atts) != 1 {
+		t.Fatalf("expected 1 attachment (the winmail.dat container), got %d", len(atts))
+	}
+	att := atts[0]
+	if att.Attachment.Filename != "winmail.dat" {
+		t.Errorf("filename = %q, want winmail.dat", att.Attachment.Filename)
+	}
+	if att.Attachment.ContentType != "application/ms-tnef" {
+		t.Errorf("content type = %q, want application/ms-tnef", att.Attachment.ContentType)
+	}
+	if !bytes.Equal(att.Content, []byte("not a tnef container at all")) {
+		t.Errorf("content = %q, want the raw container bytes", att.Content)
+	}
+}
+
 // TestExtractAttachmentContent_TNEF proves the download path resolves an inner
 // TNEF file by the same name the sync extractor would have stored.
 func TestExtractAttachmentContent_TNEF(t *testing.T) {

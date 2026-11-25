@@ -235,15 +235,28 @@ func (a *App) GetRunBackground() (bool, error) {
 // promises background mode without one is still a lie — and the
 // Settings toggle would show on while nothing can bring the window
 // back).
-func (a *App) SetRunBackground(enabled bool) error {
-	if !enabled {
-		if err := a.settingsStore.SetRunBackground(false); err != nil {
-			return err
-		}
-		return a.settingsStore.SetStartHidden(false)
-	}
+// requireTray starts the tray icon, refusing background mode when it
+// cannot start: background mode with no tray icon would strand the
+// window the first time it closes (the close paths hide only when
+// the tray is actually up, but a setting that promises background
+// mode without one is still a lie).
+func (a *App) requireTray() error {
 	if !a.startTray() {
 		return fmt.Errorf("could not start the system tray icon, so background mode was not enabled")
+	}
+	return nil
+}
+
+func (a *App) SetRunBackground(enabled bool) error {
+	if !enabled {
+		// Disabling also force-disables start_hidden, persisted
+		// together in one transaction (fourth-audit finding 57):
+		// the two-step save used to leave run_background off with
+		// start_hidden still on when the second write failed.
+		return a.settingsStore.SetRunBackgroundAndStartHidden(false, false)
+	}
+	if err := a.requireTray(); err != nil {
+		return err
 	}
 	return a.settingsStore.SetRunBackground(true)
 }
@@ -285,15 +298,17 @@ func (a *App) GetStartHidden() (bool, error) {
 
 // SetStartHidden sets whether Daak starts with the window hidden.
 // Enabling also force-enables run_background (start hidden requires background mode).
-// It goes through SetRunBackground so the tray is started on the
-// same path — and a tray that cannot start refuses the whole change
-// instead of writing run_background directly and leaving a hidden
-// window with no tray icon to bring it back.
+// The tray is started first — and a tray that cannot start refuses
+// the whole change instead of writing run_background directly and
+// leaving a hidden window with no tray icon to bring it back — and
+// both values are then persisted in one transaction (fourth-audit
+// finding 57), so the pair can never land half-applied.
 func (a *App) SetStartHidden(enabled bool) error {
 	if enabled {
-		if err := a.SetRunBackground(true); err != nil {
+		if err := a.requireTray(); err != nil {
 			return err
 		}
+		return a.settingsStore.SetRunBackgroundAndStartHidden(true, true)
 	}
 	return a.settingsStore.SetStartHidden(enabled)
 }
@@ -384,15 +399,14 @@ func (a *App) GetComposerMode() (string, error) {
 }
 
 // SetComposerMode sets the default compose mode.
-// Setting to "detached" also auto-sets mailto mode to "detached".
+// Setting to "detached" also auto-sets mailto mode to "detached",
+// persisted together in one transaction (fourth-audit finding 57)
+// so the pair can never land half-applied.
 func (a *App) SetComposerMode(mode string) error {
-	if err := a.settingsStore.SetComposerMode(mode); err != nil {
-		return err
-	}
 	if mode == "detached" {
-		return a.settingsStore.SetMailtoMode("detached")
+		return a.settingsStore.SetComposerModeAndMailtoMode(mode, "detached")
 	}
-	return nil
+	return a.settingsStore.SetComposerMode(mode)
 }
 
 // GetMailtoMode returns the external mailto link handling mode ("inline" or "detached")

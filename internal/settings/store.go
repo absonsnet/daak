@@ -227,6 +227,68 @@ func (s *Store) Get(key string) (string, error) {
 	return value, nil
 }
 
+// setKeys writes several settings in one transaction: either all of
+// them land or none does (fourth-audit finding 57). Paired settings
+// used to be saved in two steps, so a failure on the second write
+// left the first already stored — half-applied state the UI then
+// reported as the whole change.
+func (s *Store) setKeys(pairs ...[2]string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin settings transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, p := range pairs {
+		if _, err := tx.Exec(`
+			INSERT INTO settings (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value
+		`, p[0], p[1]); err != nil {
+			return fmt.Errorf("failed to set setting %s: %w", p[0], err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit settings transaction: %w", err)
+	}
+	for _, p := range pairs {
+		s.log.Debug().Str("key", p[0]).Str("value", p[1]).Msg("Setting updated")
+	}
+	return nil
+}
+
+func boolString(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+// SetRunBackgroundAndStartHidden persists run_background and
+// start_hidden together: disabling background mode also
+// force-disables start_hidden, and the two must never land
+// separately.
+func (s *Store) SetRunBackgroundAndStartHidden(runBackground, startHidden bool) error {
+	return s.setKeys(
+		[2]string{KeyRunBackground, boolString(runBackground)},
+		[2]string{KeyStartHidden, boolString(startHidden)},
+	)
+}
+
+// SetComposerModeAndMailtoMode persists composer_mode and mailto_mode
+// together: setting the composer to detached also auto-sets mailto
+// mode to detached, and the two must never land separately.
+func (s *Store) SetComposerModeAndMailtoMode(mode, mailtoMode string) error {
+	if mode != ComposerModeInline && mode != ComposerModeDetached {
+		return fmt.Errorf("invalid composer mode: %s (must be 'inline' or 'detached')", mode)
+	}
+	if mailtoMode != ComposerModeInline && mailtoMode != ComposerModeDetached {
+		return fmt.Errorf("invalid mailto mode: %s (must be 'inline' or 'detached')", mailtoMode)
+	}
+	return s.setKeys(
+		[2]string{KeyComposerMode, mode},
+		[2]string{KeyMailtoMode, mailtoMode},
+	)
+}
+
 // Set sets a setting value
 func (s *Store) Set(key, value string) error {
 	_, err := s.db.Exec(`

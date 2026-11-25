@@ -1225,6 +1225,17 @@ func sameAddressPtr(a, b *smtp.Address) bool {
 // The mail was delivered; only its Sent copy is missing, so the
 // warning names the subject and recipient for the user to check.
 func (s *sendQueueService) RecordMailMergeSentSaveFailure(accountID, subject, recipient, fromAddress string, saveErr error) {
+	s.RecordSentSaveFailure(accountID, subject, recipient, fromAddress, saveErr)
+}
+
+// RecordSentSaveFailure records a persistent "sent but not saved to
+// Sent" warning for a delivered mail whose Sent-folder save failed —
+// the same warning the queue worker records for normal sends and
+// RecordMailMergeSentSaveFailure records for Mail Merge rows. The
+// mailto unsubscribe path (fourth-audit finding 46) uses it: the
+// unsubscribe email was delivered, so the warning names its subject
+// and recipient for the user to check.
+func (s *sendQueueService) RecordSentSaveFailure(accountID, subject, recipient, fromAddress string, saveErr error) {
 	s.recordSentSaveFailure(sendqueue.Item{
 		AccountID:   accountID,
 		Kind:        sendqueue.KindMessage,

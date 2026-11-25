@@ -78,6 +78,11 @@ type Scheduler struct {
 	// Track syncing accounts to prevent concurrent syncs
 	syncing   map[string]bool
 	syncingMu sync.Mutex
+	// syncDone holds one done channel per in-progress account sync,
+	// closed when that sync finishes (fourth-audit finding 55): a
+	// caller that finds a sync already running waits on it instead
+	// of dropping its event. Guarded by syncingMu.
+	syncDone map[string]chan struct{}
 
 	// Per-account cancellation for running syncs
 	syncCancels  map[string]context.CancelFunc
@@ -93,8 +98,44 @@ func NewScheduler(engine *Engine, accountStore *account.Store, folderStore *fold
 		log:           logging.WithComponent("sync-scheduler"),
 		checkInterval: 1 * time.Minute, // Check every minute if any account is due
 		syncing:       make(map[string]bool),
+		syncDone:      make(map[string]chan struct{}),
 		syncCancels:   make(map[string]context.CancelFunc),
 	}
+}
+
+// syncWaitForInProgressTimeout bounds how long a blocking sync waits
+// for an already-running sync on the same account before giving up
+// (fourth-audit finding 55). Five minutes covers a real sync; a
+// hung sync past that still drops the event, but the scheduled sync
+// is the backstop — and the wait is logged, never silent.
+const syncWaitForInProgressTimeout = 5 * time.Minute
+
+// beginAccountSync claims the account for a sync and returns the done
+// channel the owner must close via endAccountSync. ok is false when a
+// sync is already running; done is then that sync's channel, so the
+// caller can wait for it instead of dropping its work.
+func (s *Scheduler) beginAccountSync(accountID string) (done chan struct{}, ok bool) {
+	s.syncingMu.Lock()
+	defer s.syncingMu.Unlock()
+	if s.syncing[accountID] {
+		return s.syncDone[accountID], false
+	}
+	done = make(chan struct{})
+	s.syncing[accountID] = true
+	s.syncDone[accountID] = done
+	return done, true
+}
+
+// endAccountSync releases a claim made by beginAccountSync and wakes
+// any waiter on its done channel.
+func (s *Scheduler) endAccountSync(accountID string, done chan struct{}) {
+	s.syncingMu.Lock()
+	delete(s.syncing, accountID)
+	if cur, exists := s.syncDone[accountID]; exists && cur == done {
+		delete(s.syncDone, accountID)
+	}
+	s.syncingMu.Unlock()
+	close(done)
 }
 
 // SetNewMailCallback sets the callback for new mail notifications
@@ -255,14 +296,11 @@ func (s *Scheduler) isSyncDue(acc *account.Account) bool {
 // syncAccountInbox syncs the INBOX for an account
 func (s *Scheduler) syncAccountInbox(acc *account.Account) {
 	// Prevent concurrent syncs for the same account
-	s.syncingMu.Lock()
-	if s.syncing[acc.ID] {
-		s.syncingMu.Unlock()
+	done, ok := s.beginAccountSync(acc.ID)
+	if !ok {
 		s.log.Info().Str("account", acc.Name).Msg("Sync already in progress, skipping")
 		return
 	}
-	s.syncing[acc.ID] = true
-	s.syncingMu.Unlock()
 
 	// Create a cancellable context with timeout for this sync operation
 	// 30 minute timeout prevents syncs from running forever if connection hangs
@@ -278,9 +316,7 @@ func (s *Scheduler) syncAccountInbox(acc *account.Account) {
 		delete(s.syncCancels, acc.ID)
 		s.syncCancelMu.Unlock()
 
-		s.syncingMu.Lock()
-		delete(s.syncing, acc.ID)
-		s.syncingMu.Unlock()
+		s.endAccountSync(acc.ID, done)
 	}()
 
 	s.log.Info().Str("account", acc.Name).Msg("Starting scheduled sync for INBOX")
@@ -472,15 +508,31 @@ func (s *Scheduler) SyncAccountInboxBlocking(accountID string) (*NewMailInfo, er
 		return nil, err
 	}
 
-	// Prevent concurrent syncs for the same account
-	s.syncingMu.Lock()
-	if s.syncing[acc.ID] {
-		s.syncingMu.Unlock()
-		s.log.Info().Str("account", acc.Name).Msg("Sync already in progress, skipping")
-		return nil, nil
+	// Claim the account, waiting for an already-running sync instead
+	// of dropping this one (fourth-audit finding 55): an IDLE event
+	// that arrives mid-sync used to return nil, nil, which the
+	// caller read as "no new mail" and the notification was lost.
+	// The wait is bounded — a sync still running after the timeout
+	// drops the event, loudly, with the scheduled sync as backstop.
+	var done chan struct{}
+	for {
+		var ok bool
+		done, ok = s.beginAccountSync(acc.ID)
+		if ok {
+			break
+		}
+		if done == nil {
+			s.log.Info().Str("account", acc.Name).Msg("Sync already in progress, skipping")
+			return nil, nil
+		}
+		s.log.Info().Str("account", acc.Name).Msg("Sync already in progress, waiting for it to finish")
+		select {
+		case <-done:
+		case <-time.After(syncWaitForInProgressTimeout):
+			s.log.Warn().Str("account", acc.Name).Msg("Timed out waiting for in-progress sync, dropping IDLE event")
+			return nil, nil
+		}
 	}
-	s.syncing[acc.ID] = true
-	s.syncingMu.Unlock()
 
 	// Create a cancellable context with timeout for this sync operation
 	// 30 minute timeout prevents syncs from running forever if connection hangs
@@ -496,9 +548,7 @@ func (s *Scheduler) SyncAccountInboxBlocking(accountID string) (*NewMailInfo, er
 		delete(s.syncCancels, acc.ID)
 		s.syncCancelMu.Unlock()
 
-		s.syncingMu.Lock()
-		delete(s.syncing, acc.ID)
-		s.syncingMu.Unlock()
+		s.endAccountSync(acc.ID, done)
 	}()
 
 	// Get the INBOX folder

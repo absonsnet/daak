@@ -124,9 +124,34 @@ func (a *App) handleIPCMessage(clientID string, msg ipc.Message) {
 			"threadId":  payload.ThreadID,
 		})
 
+	case ipc.TypeViewerFolderCountsChanged:
+		var payload ipc.ViewerFolderCountsChangedPayload
+		if err := msg.ParsePayload(&payload); err != nil {
+			log.Error().Err(err).Msg("Failed to parse viewer_folder_counts_changed payload")
+			return
+		}
+		a.handleViewerFolderCountsChanged(payload)
+
 	default:
 		log.Warn().Str("type", msg.Type).Msg("Unknown IPC message type")
 	}
+}
+
+// handleViewerFolderCountsChanged re-reads the folders a viewer popup
+// just adjusted (the popup shares the database but lives in another
+// process, so the main window's counts are stale until told) and
+// emits folders:countsChanged so the sidebar badge and the OS badge
+// refresh (fourth-audit finding 47). The rows are re-read from the
+// database rather than trusting the payload — the payload is the
+// signal, the database is the source.
+func (a *App) handleViewerFolderCountsChanged(payload ipc.ViewerFolderCountsChangedPayload) {
+	counts := make(map[string]int, len(payload.Counts))
+	for folderID := range payload.Counts {
+		if f, err := a.folderStore.Get(folderID); err == nil && f != nil {
+			counts[folderID] = f.UnreadCount
+		}
+	}
+	a.emitFolderCountsChanged(counts)
 }
 
 // handleComposerMessageQueued is called when a detached composer

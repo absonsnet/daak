@@ -881,7 +881,11 @@ func (s *Store) Create(m *Message) error {
 // keys have no ON UPDATE CASCADE, so changing id fails outright), and reset
 // received_at to "now" on every re-sync. received_at is therefore first-seen
 // time, set on insert only; thread_id is computed by finalizeSavedHeaders
-// after the save.
+// after the save. read_receipt_handled is local-only state too (fourth-audit
+// finding 58): a header re-sync carries the fresh message's default (false),
+// so overwriting it would reset an already-answered receipt and prompt
+// again — a batch retry after a partial save, or a server UID reuse,
+// would re-ask a question the user already answered.
 func (s *Store) Upsert(m *Message) error {
 	// Reuse the stored id on conflict: it is the primary key referenced by
 	// attachment/reaction rows, and the caller (header sync) needs m.ID to
@@ -924,7 +928,7 @@ func (s *Store) Upsert(m *Message) error {
 			is_answered=excluded.is_answered, is_forwarded=excluded.is_forwarded,
 			is_draft=excluded.is_draft, is_deleted=excluded.is_deleted,
 			size=excluded.size,
-			read_receipt_to=excluded.read_receipt_to, read_receipt_handled=excluded.read_receipt_handled,
+			read_receipt_to=excluded.read_receipt_to,
 			list_unsubscribe=excluded.list_unsubscribe,
 			list_unsubscribe_post=excluded.list_unsubscribe_post,
 			category=excluded.category, sub_category=excluded.sub_category,
@@ -1278,6 +1282,27 @@ func (s *Store) ExistsInFolder(messageID string, folderType string, accountID st
 	`, normalizeMessageID(messageID), folderType, accountID).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("failed to check message in folder type: %w", err)
+	}
+	return count > 0, nil
+}
+
+// ExistsByUIDInFolderType is the UID twin of ExistsInFolder: it reports
+// whether a message with this UID exists in a folder of the given type
+// for the account. Used by the Gmail Trash/Spam delete guard
+// (fourth-audit finding 59) for messages with no Message-ID header —
+// the Message-ID check cannot match those at all, so without this the
+// guard was skipped and a Trash/Spam-hidden message was deleted
+// locally. UID + account is unique per folder in Gmail's IMAP view,
+// and the folder-type join keeps the match to the Trash/Spam label.
+func (s *Store) ExistsByUIDInFolderType(uid uint32, folderType string, accountID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM messages m
+		JOIN folders f ON m.folder_id = f.id
+		WHERE m.uid = ? AND f.folder_type = ? AND m.account_id = ?
+	`, uid, folderType, accountID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to check message UID in folder type: %w", err)
 	}
 	return count > 0, nil
 }
@@ -2643,12 +2668,12 @@ func (s *Store) ListConversationsByFolder(folderID string, offset, limit int, so
 			MAX(date) as latest_date,
 			GROUP_CONCAT(id) as message_ids,
 			MAX(CASE WHEN smime_encrypted = 1 OR pgp_encrypted = 1 THEN 1 ELSE 0 END) as is_encrypted,
-			(SELECT m2.extract_kind FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as extract_kind,
-			(SELECT m2.extract_value FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as extract_value,
-			(SELECT m2.extract_rule FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as extract_rule,
-			(SELECT m2.id FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as extract_message_id,
-			(SELECT m2.category FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as category,
-			(SELECT m2.sub_category FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as sub_category,
+			(SELECT m2.extract_kind FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as extract_kind,
+			(SELECT m2.extract_value FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as extract_value,
+			(SELECT m2.extract_rule FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as extract_rule,
+			(SELECT m2.id FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as extract_message_id,
+			(SELECT m2.category FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as category,
+			(SELECT m2.sub_category FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as sub_category,
 			%s as participants_json
 		FROM messages m
 		WHERE folder_id = ? AND is_hidden = 0`+categoryClause+`

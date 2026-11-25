@@ -355,6 +355,7 @@ type App struct {
 	// Sync management - tracks active syncs per account for cancel-and-restart
 	syncContexts    map[string]context.CancelFunc // keyed by "accountID:folderID"
 	syncLastRequest map[string]time.Time          // last sync request time for debounce
+	syncHeaderDone  map[string]chan struct{}      // closed when a sync's header phase finishes, for a debounced second press to join on (finding 60)
 	syncCancelled   bool                          // set by CancelAllSyncs to stop SyncAllComplete loop
 	wakeSyncing     bool                          // guards syncAfterWake against concurrent calls
 	syncMu          goSync.Mutex                  // protects sync maps
@@ -952,6 +953,7 @@ func (a *App) Startup(ctx context.Context) {
 	// Initialize sync context tracking for cancel-and-restart
 	a.syncContexts = make(map[string]context.CancelFunc)
 	a.syncLastRequest = make(map[string]time.Time)
+	a.syncHeaderDone = make(map[string]chan struct{})
 	a.ownFlagChangeAt = make(map[string]time.Time)
 	a.ownExpungeAt = make(map[string]time.Time)
 	a.draftSyncContexts = make(map[string]context.CancelFunc)

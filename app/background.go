@@ -643,7 +643,22 @@ func (a *App) sendSystemNotification(info sync.NewMailInfo, subject, fromName, f
 			},
 		})
 		if err != nil {
-			log.Debug().Err(err).Msg("Failed to send notification")
+			// A failed notification used to be only a debug log, so
+			// new mail arrived with no trace anywhere (fourth-audit
+			// finding 54): log it at warning level and emit an
+			// in-app fallback, so the user still sees the mail
+			// arrived even when the desktop notification is lost.
+			log.Warn().Err(err).
+				Str("title", title).
+				Str("accountID", info.AccountID).
+				Msg("Failed to send new-mail notification")
+			if a.ctx != nil {
+				wailsRuntime.EventsEmit(a.ctx, "notification:failed", map[string]interface{}{
+					"title":     title,
+					"body":      body,
+					"accountId": info.AccountID,
+				})
+			}
 		}
 	}
 }

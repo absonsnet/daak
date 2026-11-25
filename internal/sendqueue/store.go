@@ -99,6 +99,11 @@ type Stats struct {
 	Sent      int `json:"sent"`
 	Failed    int `json:"failed"`
 	Cancelled int `json:"cancelled"`
+	// SentUnsaved counts delivered mail whose Sent-folder save failed
+	// (fourth-audit finding 48): the Outbox badge must include them —
+	// like failed rows, they need the user's attention — instead of
+	// dropping the badge to zero.
+	SentUnsaved int `json:"sentUnsaved"`
 }
 
 // Store wraps the main DB for the send_queue table.
@@ -343,6 +348,8 @@ func (s *Store) Stats() (Stats, error) {
 			st.Sent = n
 		case StatusFailed:
 			st.Failed = n
+		case StatusSentUnsaved:
+			st.SentUnsaved = n
 		case StatusCancelled:
 			st.Cancelled = n
 		}
