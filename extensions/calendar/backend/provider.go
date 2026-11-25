@@ -189,6 +189,32 @@ var (
 	ErrTransport = errors.New("calendar: transport-level failure")
 )
 
+// serverCopyVerdict is the outcome of re-fetching the server's current
+// copy of an event and comparing it with the locally stored version.
+// It answers the question an empty local ETag (or a 412) leaves open: did
+// the server move because of our own stale/missing ETag, or because
+// someone else changed the event?
+//
+//   - serverCopyUnchanged: server copy is substantively identical to the
+//     stored version — an unconditional write is safe.
+//   - serverCopyChanged: someone else changed it — refuse, surface
+//     ErrConflict.
+//   - serverCopyGone: the resource no longer exists server-side. For a
+//     PUT that is a change (do not recreate a deleted event); for a
+//     DELETE it is already the desired end state, so the delete may
+//     proceed.
+//   - serverCopyUnknown: the comparison could not be made (no store, no
+//     local row, fetch failed, unparseable body) — refuse, surface
+//     ErrConflict. Unknown is never treated as unchanged.
+type serverCopyVerdict int
+
+const (
+	serverCopyUnchanged serverCopyVerdict = iota
+	serverCopyChanged
+	serverCopyGone
+	serverCopyUnknown
+)
+
 // ProviderDeps groups the host-supplied dependencies a Provider may need.
 // Each impl takes what it needs:
 //   - localProvider: nothing.

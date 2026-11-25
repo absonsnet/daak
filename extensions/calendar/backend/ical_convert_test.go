@@ -3,6 +3,7 @@ package backend
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 const sampleNonRecurringICS = `BEGIN:VCALENDAR
@@ -111,6 +112,87 @@ func TestParseCalendarObject_EmptyInput(t *testing.T) {
 	_, err := ParseCalendarObject("")
 	if err == nil {
 		t.Fatal("expected error for empty input")
+	}
+}
+
+// R6: the parser must capture STATUS, SEQUENCE, ORGANIZER, CATEGORIES,
+// EXDATE, and VALARMs — the fields the old "unchanged" check never saw.
+const sampleFullICS = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:full-1@example.com
+DTSTAMP:20261124T000000Z
+DTSTART:20261124T100000Z
+DTEND:20261124T110000Z
+SUMMARY:Team sync
+STATUS:CONFIRMED
+SEQUENCE:3
+CATEGORIES:MEETING,TEAM
+ORGANIZER;CN=Boss:mailto:boss@example.com
+RRULE:FREQ=WEEKLY;BYDAY=MO
+EXDATE:20261207T100000Z
+EXDATE:20261214T100000Z,20261221T100000Z
+BEGIN:VALARM
+TRIGGER:-PT15M
+ACTION:DISPLAY
+DESCRIPTION:Reminder
+END:VALARM
+BEGIN:VALARM
+TRIGGER:-PT1H
+ACTION:DISPLAY
+DESCRIPTION:Early reminder
+END:VALARM
+END:VEVENT
+END:VCALENDAR
+`
+
+func TestParseCalendarObject_R6Fields(t *testing.T) {
+	parsed, err := ParseCalendarObject(sampleFullICS)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	m := parsed.Master
+	if m.Status != "CONFIRMED" {
+		t.Errorf("Status = %q, want CONFIRMED", m.Status)
+	}
+	if m.Sequence != 3 {
+		t.Errorf("Sequence = %d, want 3", m.Sequence)
+	}
+	if m.Organizer == nil || m.Organizer.Email != "boss@example.com" || m.Organizer.CommonName != "Boss" {
+		t.Errorf("Organizer = %+v, want boss@example.com / Boss", m.Organizer)
+	}
+	wantCats := []string{"MEETING", "TEAM"}
+	if len(m.Categories) != len(wantCats) {
+		t.Fatalf("Categories = %v, want %v", m.Categories, wantCats)
+	}
+	for i, c := range wantCats {
+		if m.Categories[i] != c {
+			t.Errorf("Categories[%d] = %q, want %q", i, m.Categories[i], c)
+		}
+	}
+	// EXDATEs: 2026-12-07, -14, -21 at 10:00 UTC.
+	wantEx := []int64{
+		time.Date(2026, 12, 7, 10, 0, 0, 0, time.UTC).Unix(),
+		time.Date(2026, 12, 14, 10, 0, 0, 0, time.UTC).Unix(),
+		time.Date(2026, 12, 21, 10, 0, 0, 0, time.UTC).Unix(),
+	}
+	if len(m.ExceptionDates) != len(wantEx) {
+		t.Fatalf("ExceptionDates = %v, want %v", m.ExceptionDates, wantEx)
+	}
+	for i, u := range wantEx {
+		if m.ExceptionDates[i] != u {
+			t.Errorf("ExceptionDates[%d] = %d, want %d", i, m.ExceptionDates[i], u)
+		}
+	}
+	if len(m.AlarmFingerprints) != 2 {
+		t.Fatalf("AlarmFingerprints = %v, want 2 entries", m.AlarmFingerprints)
+	}
+	if !strings.Contains(m.AlarmFingerprints[0], "-900") && !strings.Contains(m.AlarmFingerprints[1], "-900") {
+		t.Errorf("no 15-minute alarm fingerprint in %v", m.AlarmFingerprints)
+	}
+	if !strings.Contains(m.AlarmFingerprints[0], "-3600") && !strings.Contains(m.AlarmFingerprints[1], "-3600") {
+		t.Errorf("no 1-hour alarm fingerprint in %v", m.AlarmFingerprints)
 	}
 }
 

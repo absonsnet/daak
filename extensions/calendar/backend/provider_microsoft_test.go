@@ -6,6 +6,7 @@ package backend
 // googleAPIBase.
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -552,7 +553,11 @@ func TestMicrosoftProvider_DeleteRemote_404Idempotent(t *testing.T) {
 	p := newTestMicrosoftProvider(srv.URL)
 	src := Source{ID: "src-m1", Type: SourceTypeMicrosoft, AccountID: "acct-1"}
 	cal := Calendar{ID: "cal-m1", URL: "calendar-id-abc"}
-	ev := Event{ProviderEventID: "missing"}
+	// ETag set so the empty-ETag re-fetch gate does not run: this test
+	// verifies only that a 404 on the DELETE itself is idempotent. The
+	// empty-ETag + already-gone path is covered by
+	// TestMicrosoftProvider_DeleteRemote_EmptyETag_GoneServerCopyProceeds.
+	ev := Event{ProviderEventID: "missing", ETag: `W/"current"`}
 	if err := p.DeleteRemote(t.Context(), src, cal, ev); err != nil {
 		t.Errorf("DeleteRemote on 404 should be idempotent, got %v", err)
 	}
@@ -725,5 +730,278 @@ func TestSynthesizeICalUIDs(t *testing.T) {
 	plan := planEventSync(rows, map[string]string{})
 	if len(plan.process) != 2 {
 		t.Errorf("plan.process = %d, want 2 (synthesized + real)", len(plan.process))
+	}
+}
+
+// --- R7: empty local ETag ---------------------------------------------------
+//
+// A Microsoft update/delete with no known local ETag — and the pre-write
+// ETag refresh also coming back empty — must re-fetch the server copy
+// (full GET → Graph→ICS translation → comparison against the locally
+// stored blob, with cancelled occurrences folded in) before writing
+// unconditionally, and refuse with ErrConflict when the server copy moved
+// or cannot be verified.
+
+// seedMicrosoftStoredEvent stores a Microsoft event as of the last sync
+// (empty local ETag — the R7 scenario) and returns the source + calendar
+// to call the provider with, the server-side event JSON, and the stored
+// ICS blob.
+func seedMicrosoftStoredEvent(t *testing.T, store *Store) (Source, Calendar, graphEvent, string) {
+	t.Helper()
+	base := graphEvent{
+		ID:       "evt-ms1",
+		ICalUID:  "evt-uid-1@daak-microsoft",
+		Subject:  "Project sync",
+		Body:     &graphBody{ContentType: "text", Content: "Weekly project status"},
+		Location: &graphLocation{DisplayName: "Room 4B"},
+		Start: &graphTimePoint{
+			DateTime: "2026-06-10T21:00:00.0000000",
+			TimeZone: "UTC",
+		},
+		End: &graphTimePoint{
+			DateTime: "2026-06-10T22:00:00.0000000",
+			TimeZone: "UTC",
+		},
+	}
+	blob, err := translateGraphEventToICS(base)
+	if err != nil {
+		t.Fatalf("translateGraphEventToICS: %v", err)
+	}
+	srcID, calID := "src-m-r7", "cal-m-r7"
+	now := time.Now().Unix()
+	if err := store.WithTx(func(tx *sql.Tx) error {
+		if err := store.CreateSourceTx(tx, Source{
+			ID: srcID, Type: SourceTypeMicrosoft, Name: "Test",
+			Enabled: true, Writable: true, CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+		return store.CreateCalendarTx(tx, Calendar{
+			ID: calID, SourceID: srcID, URL: "calendar-id-abc",
+			DisplayName: "Calendar", Visible: true, CreatedAt: now,
+		})
+	}); err != nil {
+		t.Fatalf("seed source/calendar: %v", err)
+	}
+	parsed, err := ParseCalendarObject(blob)
+	if err != nil {
+		t.Fatalf("parse seed ICS: %v", err)
+	}
+	stored := parsed.Master
+	stored.ID = "ev-ms1"
+	stored.CalendarID = calID
+	stored.ETag = ""
+	stored.ProviderEventID = "evt-ms1"
+	stored.ICSBlob = blob
+	if err := store.WithTx(func(tx *sql.Tx) error {
+		return store.UpsertEventTx(tx, stored)
+	}); err != nil {
+		t.Fatalf("seed stored event: %v", err)
+	}
+	src := Source{ID: srcID, Type: SourceTypeMicrosoft, AccountID: "acct-1"}
+	cal := Calendar{ID: calID, URL: "calendar-id-abc"}
+	return src, cal, base, blob
+}
+
+// msR7Request records one request the fake Graph server saw.
+type msR7Request struct {
+	method   string
+	path     string
+	rawQuery string
+	ifMatch  string
+}
+
+// msR7Server serves a configurable server copy on the plain GET and
+// records every request. The ETag-refresh GET ($select=id) answers without
+// an etag — the R7 scenario — and the master-detail GET answers with no
+// cancelled/exception occurrences.
+type msR7Server struct {
+	srv       *httptest.Server
+	requests  []msR7Request
+	getEvent  graphEvent
+	getStatus int // 0 = 200
+}
+
+func newMSR7Server(t *testing.T, getEvent graphEvent, getStatus int) *msR7Server {
+	t.Helper()
+	ms := &msR7Server{getEvent: getEvent, getStatus: getStatus}
+	ms.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.Body.Close()
+		ms.requests = append(ms.requests, msR7Request{
+			method:   r.Method,
+			path:     r.URL.Path,
+			rawQuery: r.URL.RawQuery,
+			ifMatch:  r.Header.Get("If-Match"),
+		})
+		switch r.Method {
+		case http.MethodGet:
+			if ms.getStatus != 0 {
+				w.WriteHeader(ms.getStatus)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case strings.Contains(r.URL.RawQuery, "cancelledOccurrences"):
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id": "evt-ms1", "cancelledOccurrences": []string{},
+					"exceptionOccurrences": []graphEvent{},
+				})
+			case r.URL.RawQuery == "$select=id":
+				_ = json.NewEncoder(w).Encode(map[string]string{"id": "evt-ms1"})
+			default:
+				_ = json.NewEncoder(w).Encode(ms.getEvent)
+			}
+		case http.MethodPatch:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"id": "evt-ms1", "@odata.etag": `W/"new"`,
+			})
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	return ms
+}
+
+func (ms *msR7Server) countMethod(method string) int {
+	n := 0
+	for _, req := range ms.requests {
+		if req.method == method {
+			n++
+		}
+	}
+	return n
+}
+
+func TestMicrosoftProvider_PushEvent_EmptyETag_UnchangedServerCopyProceeds(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, blob := seedMicrosoftStoredEvent(t, store)
+	ms := newMSR7Server(t, base, 0)
+	defer ms.srv.Close()
+	p := microsoftProvider{store: store, auth: fakeMSAuth{target: ms.srv.URL}}
+
+	ev := Event{
+		UID:             base.ICalUID,
+		ProviderEventID: "evt-ms1",
+		ETag:            "",
+		ICSBlob:         strings.Replace(blob, "SUMMARY:Project sync", "SUMMARY:Project sync (my edit)", 1),
+	}
+	result, err := p.PushEvent(t.Context(), src, cal, ev)
+	if err != nil {
+		t.Fatalf("PushEvent: %v", err)
+	}
+	if result.ETag != `W/"new"` {
+		t.Errorf("ETag = %q, want %q", result.ETag, `W/"new"`)
+	}
+	// ETag refresh GET ($select=id) + verdict GETs, then exactly one
+	// unconditional PATCH — and that PATCH must carry no If-Match.
+	if got := ms.countMethod(http.MethodPatch); got != 1 {
+		t.Fatalf("server saw %d PATCHes, want 1; requests=%+v", got, ms.requests)
+	}
+	for _, req := range ms.requests {
+		if req.method == http.MethodPatch && req.ifMatch != "" {
+			t.Errorf("PATCH carried If-Match %q, want none (no local ETag, refresh empty)", req.ifMatch)
+		}
+	}
+	if got := ms.countMethod(http.MethodGet); got < 2 {
+		t.Fatalf("server saw %d GETs, want >= 2 (etag refresh + verdict re-fetch); requests=%+v", got, ms.requests)
+	}
+}
+
+func TestMicrosoftProvider_PushEvent_EmptyETag_ChangedServerCopyIsConflict(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, blob := seedMicrosoftStoredEvent(t, store)
+	changed := base
+	changed.Subject = "Project sync (moved by someone else)"
+	ms := newMSR7Server(t, changed, 0)
+	defer ms.srv.Close()
+	p := microsoftProvider{store: store, auth: fakeMSAuth{target: ms.srv.URL}}
+
+	ev := Event{
+		UID:             base.ICalUID,
+		ProviderEventID: "evt-ms1",
+		ETag:            "",
+		ICSBlob:         strings.Replace(blob, "SUMMARY:Project sync", "SUMMARY:Project sync (my edit)", 1),
+	}
+	_, err := p.PushEvent(t.Context(), src, cal, ev)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("PushEvent err = %v, want ErrConflict", err)
+	}
+	if got := ms.countMethod(http.MethodPatch); got != 0 {
+		t.Fatalf("server saw %d PATCHes, want 0 (changed copy must not be overwritten blindly); requests=%+v", got, ms.requests)
+	}
+}
+
+func TestMicrosoftProvider_PushEvent_EmptyETag_GetFailsIsConflict(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, blob := seedMicrosoftStoredEvent(t, store)
+	ms := newMSR7Server(t, base, http.StatusInternalServerError)
+	defer ms.srv.Close()
+	p := microsoftProvider{store: store, auth: fakeMSAuth{target: ms.srv.URL}}
+
+	ev := Event{
+		UID:             base.ICalUID,
+		ProviderEventID: "evt-ms1",
+		ETag:            "",
+		ICSBlob:         strings.Replace(blob, "SUMMARY:Project sync", "SUMMARY:Project sync (my edit)", 1),
+	}
+	_, err := p.PushEvent(t.Context(), src, cal, ev)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("PushEvent err = %v, want ErrConflict", err)
+	}
+	if got := ms.countMethod(http.MethodPatch); got != 0 {
+		t.Fatalf("server saw %d PATCHes, want 0 (unverifiable copy must not be overwritten); requests=%+v", got, ms.requests)
+	}
+}
+
+func TestMicrosoftProvider_DeleteRemote_EmptyETag_UnchangedProceeds(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, _ := seedMicrosoftStoredEvent(t, store)
+	ms := newMSR7Server(t, base, 0)
+	defer ms.srv.Close()
+	p := microsoftProvider{store: store, auth: fakeMSAuth{target: ms.srv.URL}}
+
+	ev := Event{UID: base.ICalUID, ProviderEventID: "evt-ms1", ETag: ""}
+	if err := p.DeleteRemote(t.Context(), src, cal, ev); err != nil {
+		t.Fatalf("DeleteRemote: %v", err)
+	}
+	if got := ms.countMethod(http.MethodDelete); got != 1 {
+		t.Fatalf("server saw %d DELETEs, want 1; requests=%+v", got, ms.requests)
+	}
+}
+
+func TestMicrosoftProvider_DeleteRemote_EmptyETag_GoneServerCopyProceeds(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, _ := seedMicrosoftStoredEvent(t, store)
+	ms := newMSR7Server(t, base, http.StatusNotFound)
+	defer ms.srv.Close()
+	p := microsoftProvider{store: store, auth: fakeMSAuth{target: ms.srv.URL}}
+
+	ev := Event{UID: base.ICalUID, ProviderEventID: "evt-ms1", ETag: ""}
+	if err := p.DeleteRemote(t.Context(), src, cal, ev); err != nil {
+		t.Fatalf("DeleteRemote: %v", err)
+	}
+	if got := ms.countMethod(http.MethodDelete); got != 1 {
+		t.Fatalf("server saw %d DELETEs, want 1 (already-gone copy is a no-op delete); requests=%+v", got, ms.requests)
+	}
+}
+
+func TestMicrosoftProvider_DeleteRemote_EmptyETag_ChangedIsConflict(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, _ := seedMicrosoftStoredEvent(t, store)
+	changed := base
+	changed.Subject = "Project sync (moved by someone else)"
+	ms := newMSR7Server(t, changed, 0)
+	defer ms.srv.Close()
+	p := microsoftProvider{store: store, auth: fakeMSAuth{target: ms.srv.URL}}
+
+	ev := Event{UID: base.ICalUID, ProviderEventID: "evt-ms1", ETag: ""}
+	if err := p.DeleteRemote(t.Context(), src, cal, ev); !errors.Is(err, ErrConflict) {
+		t.Fatalf("DeleteRemote err = %v, want ErrConflict", err)
+	}
+	if got := ms.countMethod(http.MethodDelete); got != 0 {
+		t.Fatalf("server saw %d DELETEs, want 0; requests=%+v", got, ms.requests)
 	}
 }

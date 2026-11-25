@@ -29,6 +29,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -562,6 +563,92 @@ func fetchMicrosoftEventETag(ctx context.Context, client *http.Client, providerE
 	return probe.ETag
 }
 
+// errMicrosoftEventNotFound marks a 404/410 from a single-event GET: the
+// server copy is gone.
+var errMicrosoftEventNotFound = errors.New("microsoft event not found")
+
+// fetchMicrosoftEvent GETs one Graph event resource in full (subject,
+// body, times, recurrence, reminder, attendees, organiser). Non-200
+// (other than 404/410) is an error — a copy we cannot read cannot prove
+// anything about the server state.
+func (p microsoftProvider) fetchMicrosoftEvent(ctx context.Context, client *http.Client, eventID string) (*graphEvent, error) {
+	u := microsoftGraphBase + "/me/events/" + url.PathEscape(eventID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build get request: %w", err)
+	}
+	resp, err := doGraphRequest(ctx, client, req)
+	if err != nil {
+		return nil, fmt.Errorf("graph get event: %w", err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound, http.StatusGone:
+		return nil, errMicrosoftEventNotFound
+	default:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("graph get event %d %s: %s",
+			resp.StatusCode, resp.Status, strings.TrimSpace(string(body)))
+	}
+	var out graphEvent
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode graph event: %w", err)
+	}
+	return &out, nil
+}
+
+// microsoftServerCopyVerdict re-fetches the server's current copy of the
+// event (full GET → Graph→ICS translation → field-wise comparison against
+// the locally stored blob, with cancelled occurrences folded in and
+// RECURRENCE-ID overrides compared) and reports whether an unconditional
+// write is safe. Mirrors caldavProvider.serverCopyVerdict; see there for
+// the verdict meanings. A removed/tombstoned server copy counts as gone:
+// an update must not resurrect it, a delete is already done.
+func (p microsoftProvider) microsoftServerCopyVerdict(ctx context.Context, client *http.Client, cal Calendar, ev Event) serverCopyVerdict {
+	if p.store == nil {
+		return serverCopyUnknown
+	}
+	id, err := p.lookupEventIDByUID(cal.ID, ev.UID)
+	if err != nil || id == "" {
+		return serverCopyUnknown
+	}
+	stored, err := p.store.GetEvent(id)
+	if err != nil || stored == nil || stored.ICSBlob == "" {
+		return serverCopyUnknown
+	}
+	fetched, err := p.fetchMicrosoftEvent(ctx, client, ev.ProviderEventID)
+	if err != nil {
+		if errors.Is(err, errMicrosoftEventNotFound) {
+			return serverCopyGone
+		}
+		return serverCopyUnknown
+	}
+	if fetched.Status != nil {
+		return serverCopyGone
+	}
+	blob, err := translateGraphEventToICS(*fetched)
+	if err != nil {
+		return serverCopyUnknown
+	}
+	serverEv := Event{UID: ev.UID, ICSBlob: blob}
+	fillDenormalizedFieldsFromICS(&serverEv, blob)
+	// Same folding sync applies: cancellations become EXDATE on the blob,
+	// modified instances become overrides.
+	serverEv, serverOverrides := p.applyMasterExceptions(ctx, client, cal, ev.ProviderEventID, serverEv)
+	if !compareServerICS(serverEv.ICSBlob, stored.ICSBlob) {
+		return serverCopyChanged
+	}
+	storedOverrides, err := p.store.ListOverrides(id)
+	if err != nil {
+		return serverCopyUnknown
+	}
+	if !sameOverrides(serverOverrides, storedOverrides) {
+		return serverCopyChanged
+	}
+	return serverCopyUnchanged
+}
+
 func (p microsoftProvider) PushEvent(ctx context.Context, src Source, cal Calendar, ev Event) (PushResult, error) {
 	client, err := p.httpClient(src)
 	if err != nil {
@@ -605,6 +692,16 @@ func (p microsoftProvider) PushEvent(ctx context.Context, src Source, cal Calend
 	req.Header.Set("Content-Type", "application/json")
 	if ev.ProviderEventID != "" && ev.ETag != "" {
 		req.Header.Set("If-Match", ev.ETag)
+	}
+	// Update with no known local ETag — and the pre-PATCH refresh above
+	// also came back empty. A bare PATCH would overwrite any concurrent
+	// edit with no 412 ever possible. Re-fetch the server copy first and
+	// write unconditionally ONLY when it is proven identical to the
+	// locally stored version; otherwise refuse with ErrConflict.
+	if ev.ProviderEventID != "" && ev.ETag == "" {
+		if v := p.microsoftServerCopyVerdict(ctx, client, cal, ev); v != serverCopyUnchanged {
+			return PushResult{}, ErrConflict
+		}
 	}
 
 	resp, err := doGraphRequest(ctx, client, req)
@@ -684,6 +781,17 @@ func (p microsoftProvider) DeleteRemote(ctx context.Context, src Source, cal Cal
 	}
 	if ev.ETag != "" {
 		req.Header.Set("If-Match", ev.ETag)
+	}
+	// Delete with no known local ETag — and the refresh above also came
+	// back empty. Re-fetch and compare first (same gate as PushEvent)
+	// instead of sending a bare DELETE. A server copy that is already
+	// gone means the delete is a no-op success, so it may proceed.
+	if ev.ETag == "" {
+		switch v := p.microsoftServerCopyVerdict(ctx, client, cal, ev); v {
+		case serverCopyUnchanged, serverCopyGone:
+		default:
+			return ErrConflict
+		}
 	}
 
 	resp, err := doGraphRequest(ctx, client, req)
