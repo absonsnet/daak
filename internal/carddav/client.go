@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -248,6 +249,9 @@ func tryListAddressbooksAt(ctx context.Context, httpClient webdav.HTTPClient, ur
 			Path:        ab.Path,
 			Name:        ab.Name,
 			Description: ab.Description,
+			// Optimistic until the privilege probe below reports:
+			// an inconclusive probe must not mark a book read-only.
+			Writable: true,
 		}
 		if info.Name == "" {
 			// Use the last path segment as the name
@@ -256,11 +260,99 @@ func tryListAddressbooksAt(ctx context.Context, httpClient webdav.HTTPClient, ur
 				info.Name = parts[len(parts)-1]
 			}
 		}
+		// Per-book writability (R22): ask the server what the
+		// current user may do in this book. A probe failure leaves
+		// the optimistic default in place — the save path still
+		// falls through on a 403 and learns the real value then.
+		if writable, known := probeAddressbookWritable(ctx, httpClient, resolveURL(urlStr, ab.Path)); known {
+			info.Writable = writable
+			info.WritableKnown = true
+		}
 		result = append(result, info)
-		log.Debug().Str("path", ab.Path).Str("name", ab.Name).Msg("Found addressbook")
+		log.Debug().Str("path", ab.Path).Str("name", ab.Name).Bool("writable", info.Writable).Bool("writableKnown", info.WritableKnown).Msg("Found addressbook")
 	}
 
 	return result, nil
+}
+
+// probeAddressbookWritable issues a Depth-0 PROPFIND for
+// DAV:current-user-privilege-set on one address book and reports
+// whether the current user holds a write privilege there (RFC 3744:
+// `write` covers creating/modifying resources; `bind` covers
+// creating new members; `write-content` covers modifying them).
+// It returns (writable, known): known is false when the server gave
+// no privilege signal at all (missing property, unparsable body, or
+// a failed request) — the caller keeps the optimistic default then.
+// known is true only when a privilege set was actually read: empty
+// of any write privilege means the book is read-only for this user.
+func probeAddressbookWritable(ctx context.Context, httpClient webdav.HTTPClient, addressbookURL string) (bool, bool) {
+	const body = `<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><current-user-privilege-set/></prop></propfind>`
+	req, err := http.NewRequestWithContext(ctx, "PROPFIND", addressbookURL, strings.NewReader(body))
+	if err != nil {
+		return false, false
+	}
+	req.Header.Set("Depth", "0")
+	req.Header.Set("Content-Type", "application/xml; charset=utf-8")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMultiStatus {
+		return false, false
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return false, false
+	}
+	return parseCurrentUserPrivilegeSet(raw)
+}
+
+// parseCurrentUserPrivilegeSet reads a PROPFIND multistatus body and
+// reports whether any returned current-user-privilege-set contains a
+// write privilege. The second return is false when no privilege set
+// was present in the body at all (or the body did not parse), so the
+// caller can distinguish "server says read-only" from "server said
+// nothing". Privilege names are matched in any namespace: servers
+// vary in prefix, and encoding/xml reports the resolved URI in
+// Name.Space, so only the local name is compared.
+func parseCurrentUserPrivilegeSet(body []byte) (writable bool, known bool) {
+	var ms struct {
+		XMLName  xml.Name `xml:"multistatus"`
+		Response []struct {
+			Propstat []struct {
+				Prop struct {
+					PrivilegeSet struct {
+						Privilege []struct {
+							Names []xml.Name `xml:",any"`
+						} `xml:"privilege"`
+					} `xml:"current-user-privilege-set"`
+				} `xml:"prop"`
+			} `xml:"propstat"`
+		} `xml:"response"`
+	}
+	if err := xml.Unmarshal(body, &ms); err != nil {
+		return false, false
+	}
+	for _, r := range ms.Response {
+		for _, ps := range r.Propstat {
+			privs := ps.Prop.PrivilegeSet.Privilege
+			if len(privs) == 0 {
+				continue
+			}
+			known = true
+			for _, p := range privs {
+				for _, name := range p.Names {
+					switch name.Local {
+					case "write", "write-content", "bind", "all":
+						return true, true
+					}
+				}
+			}
+		}
+	}
+	return false, known
 }
 
 // resolveURL resolves a potentially relative URL against a base URL
@@ -586,6 +678,27 @@ func (e *ErrPreconditionFailed) Error() string {
 	return fmt.Sprintf("carddav: precondition failed for %s (server etag: %q)", e.Href, e.ServerETag)
 }
 
+// ErrForbidden signals a CardDAV PUT/DELETE 403 — the server refused
+// the write, which is how a read-only address book answers (R22).
+// Callers type-check it (errors.As) to distinguish "this book will
+// not take writes — try the next writable book and remember this one
+// is read-only" from transient failures. The local state is NOT
+// mutated on this error, same as ErrPreconditionFailed.
+type ErrForbidden struct {
+	Href   string
+	Status int // the HTTP status received (403, or 405 for the same refusal shape)
+}
+
+func (e *ErrForbidden) Error() string {
+	return fmt.Sprintf("carddav: forbidden writing %s (server status %d)", e.Href, e.Status)
+}
+
+// isWriteRefused reports whether err is (or wraps) an ErrForbidden.
+func IsWriteForbidden(err error) bool {
+	var forbidden *ErrForbidden
+	return errors.As(err, &forbidden)
+}
+
 // PutContact writes a vCard to the server at href under the given addressbook
 // path. If-Match honors the caller-supplied ETag (exact match — 412 on
 // mismatch). Returns the server's new ETag from the response (best-effort —
@@ -626,6 +739,13 @@ func (c *Client) PutContact(addressbookPath, href, ifMatchETag string, ifNoneMat
 	if resp.StatusCode == http.StatusPreconditionFailed {
 		return "", &ErrPreconditionFailed{Href: href, ServerETag: resp.Header.Get("ETag")}
 	}
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusMethodNotAllowed {
+		// 403 is how a read-only address book refuses a write (R22);
+		// 405 is the same refusal from servers that reject PUT on a
+		// collection they serve read-only. Typed so callers can fall
+		// through to the next writable book instead of failing the save.
+		return "", &ErrForbidden{Href: href, Status: resp.StatusCode}
+	}
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", fmt.Errorf("PUT %s: unexpected status %d: %s", fullURL, resp.StatusCode, strings.TrimSpace(string(body)))
@@ -656,6 +776,9 @@ func (c *Client) DeleteContact(addressbookPath, href, ifMatchETag string) error 
 
 	if resp.StatusCode == http.StatusPreconditionFailed {
 		return &ErrPreconditionFailed{Href: href, ServerETag: resp.Header.Get("ETag")}
+	}
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusMethodNotAllowed {
+		return &ErrForbidden{Href: href, Status: resp.StatusCode}
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		// Already gone — treat as success (idempotent).

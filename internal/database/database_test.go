@@ -231,6 +231,10 @@ func TestMigrationV32_LocalRecordIDsRewrittenToUUIDs(t *testing.T) {
 			t.Fatalf("drop send_queue.%s for re-migrate: %v", col, err)
 		}
 	}
+	// And v55's writable on contact_source_addressbooks.
+	if _, err := db.Exec(`ALTER TABLE contact_source_addressbooks DROP COLUMN writable`); err != nil {
+		t.Fatalf("drop contact_source_addressbooks.writable for re-migrate: %v", err)
+	}
 
 	// Re-run migrations — migration 32 should rewrite the seeded local- id.
 	if err := db.Migrate(); err != nil {
@@ -416,6 +420,10 @@ func TestMigrationV33_CleansExistingOrphans(t *testing.T) {
 		if _, err := db.Exec(`ALTER TABLE send_queue DROP COLUMN ` + col); err != nil {
 			t.Fatalf("drop send_queue.%s for re-migrate: %v", col, err)
 		}
+	}
+	// And v55's writable on contact_source_addressbooks.
+	if _, err := db.Exec(`ALTER TABLE contact_source_addressbooks DROP COLUMN writable`); err != nil {
+		t.Fatalf("drop contact_source_addressbooks.writable for re-migrate: %v", err)
 	}
 
 	// Seed: orphan state row whose addressbook doesn't exist. Pre-migration,
@@ -690,12 +698,18 @@ func TestMigrationV54_DedupesDuplicateActiveDraftRows(t *testing.T) {
 	db := openTestDB(t)
 
 	// Rewind to the v53 schema: drop the v54 index and its
-	// migration record, so Migrate() re-applies v54 below.
+	// migration record, so Migrate() re-applies v54 below. Clear the
+	// v55 marker too — Migrate keys off MAX(version), so leaving it
+	// would skip v54 — and drop v55's writable column so its
+	// re-application's ADD COLUMN doesn't collide.
 	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_send_queue_draft_active`); err != nil {
 		t.Fatalf("drop v54 index for re-migrate: %v", err)
 	}
-	if _, err := db.Exec(`DELETE FROM migrations WHERE version = 54`); err != nil {
-		t.Fatalf("delete v54 migration record: %v", err)
+	if _, err := db.Exec(`DELETE FROM migrations WHERE version >= 54`); err != nil {
+		t.Fatalf("delete v54+ migration records: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE contact_source_addressbooks DROP COLUMN writable`); err != nil {
+		t.Fatalf("drop contact_source_addressbooks.writable for re-migrate: %v", err)
 	}
 
 	// Seed two live rows for the same draft, plus a failed row for
@@ -756,5 +770,49 @@ func TestMigrationV54_DedupesDuplicateActiveDraftRows(t *testing.T) {
 			'2026-11-25T00:00:00Z', '2026-11-25T00:00:00Z', '2026-11-25T00:03:00Z')
 	`); err == nil {
 		t.Fatalf("inserting a second live row for draft-1 succeeded, want a UNIQUE constraint failure")
+	}
+}
+
+// TestMigrationV55_AddsAddressbookWritable (re-audit R22): the
+// per-address-book writability column exists after migration, and
+// pre-existing addressbook rows default to writable — the old
+// behaviour is preserved until a discovery probe or a 403 PUT
+// proves a book read-only.
+func TestMigrationV55_AddsAddressbookWritable(t *testing.T) {
+	db := openTestDB(t)
+
+	// Rewind v55: drop the column and its marker, so Migrate()
+	// re-applies it below.
+	if _, err := db.Exec(`ALTER TABLE contact_source_addressbooks DROP COLUMN writable`); err != nil {
+		t.Fatalf("drop writable for re-migrate: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM migrations WHERE version = 55`); err != nil {
+		t.Fatalf("delete v55 migration record: %v", err)
+	}
+
+	// Seed a pre-v55 addressbook row (no writable value to insert).
+	if _, err := db.Exec(`
+		INSERT INTO contact_sources (id, name, type, url, enabled, sync_interval, created_at)
+		VALUES ('src-55', 'Test DAV', 'carddav', 'https://example/', 1, 60, '2026-11-25T00:00:00Z')
+	`); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO contact_source_addressbooks (id, source_id, path, name, enabled)
+		VALUES ('ab-55', 'src-55', '/ab/', 'Book', 1)
+	`); err != nil {
+		t.Fatalf("seed addressbook: %v", err)
+	}
+
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("re-migrate to v55: %v", err)
+	}
+
+	var writable int
+	if err := db.QueryRow(`SELECT writable FROM contact_source_addressbooks WHERE id = 'ab-55'`).Scan(&writable); err != nil {
+		t.Fatalf("query writable: %v", err)
+	}
+	if writable != 1 {
+		t.Fatalf("pre-existing addressbook writable = %d, want 1 (default writable)", writable)
 	}
 }
