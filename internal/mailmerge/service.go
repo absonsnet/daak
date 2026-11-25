@@ -432,7 +432,7 @@ func (s *Service) RenderForQueue(ctx context.Context, req RunRequest, onQueued f
 		}
 		raw, err := bm.msg.ToRFC822()
 		if err != nil {
-			emit(RowResult{Index: origIndex, Email: bm.email, Status: RowFailed, Error: fmt.Sprintf("build message: %v", err), Timestamp: now})
+			emit(RowResult{Index: origIndex, Email: bm.email, Status: RowFailed, Error: fmt.Sprintf("build message: %v", err), Timestamp: now, MessageID: bm.msg.MessageID})
 			continue
 		}
 		// Sign at RENDER time: the queued bytes are fixed at queue
@@ -442,7 +442,7 @@ func (s *Service) RenderForQueue(ctx context.Context, req RunRequest, onQueued f
 		if req.Template.Sign {
 			signed, _, signErr := s.deps.MessageSigner.SignMessage(req.AccountID, bm.fromAddr.Address, raw)
 			if signErr != nil {
-				emit(RowResult{Index: origIndex, Email: bm.email, Status: RowFailed, Error: fmt.Sprintf("sign: %v", signErr), Timestamp: now})
+				emit(RowResult{Index: origIndex, Email: bm.email, Status: RowFailed, Error: fmt.Sprintf("sign: %v", signErr), Timestamp: now, MessageID: bm.msg.MessageID})
 				continue
 			}
 			raw = signed
@@ -459,12 +459,12 @@ func (s *Service) RenderForQueue(ctx context.Context, req RunRequest, onQueued f
 				To:       addressStrings(bm.toAddrs),
 				Raw:      raw,
 			}); err != nil {
-				emit(RowResult{Index: origIndex, Email: bm.email, Status: RowFailed, Error: fmt.Sprintf("enqueue: %v", err), Timestamp: now})
+				emit(RowResult{Index: origIndex, Email: bm.email, Status: RowFailed, Error: fmt.Sprintf("enqueue: %v", err), Timestamp: now, MessageID: bm.msg.MessageID})
 				continue
 			}
 		}
 		seenTo[strings.ToLower(strings.TrimSpace(bm.email))] = true
-		emit(RowResult{Index: origIndex, Email: bm.email, Status: RowQueued, Timestamp: now})
+		emit(RowResult{Index: origIndex, Email: bm.email, Status: RowQueued, Timestamp: now, MessageID: bm.msg.MessageID})
 	}
 	return out, nil
 }
@@ -494,11 +494,22 @@ func (s *Service) OpenRawSender(ctx context.Context, accountID string) (*RawSend
 }
 
 // Send transmits one already-rendered queued message, then saves it to
-// Sent the same way a normal send does. A Sent-save failure must NOT
-// fail the send (the message is already out).
-func (rs *RawSender) Send(ctx context.Context, m QueuedMessage) error {
+// Sent the same way a normal send does. afterSMTP (nil-safe) runs the
+// moment SMTP accepts the mail, BEFORE the Sent save — the same hook
+// pattern the normal queue uses (app/sendqueue.go): the caller clears
+// the queue row there, because a crash during the (slow, network)
+// Sent save must not leave a row the stale-claim reset re-queues and
+// re-sends. A Sent-save failure must NOT fail the send (the message
+// is already out).
+func (rs *RawSender) Send(ctx context.Context, m QueuedMessage, afterSMTP func()) error {
 	if err := rs.sender.SendMail(m.From, m.To, m.Raw); err != nil {
 		return err
+	}
+	// SMTP accepted the mail: record that durably before any
+	// post-send work (the Sent save below). See sendMessageWithHook's
+	// doc comment in app/compose.go.
+	if afterSMTP != nil {
+		afterSMTP()
 	}
 	if rs.saver != nil {
 		if err := rs.saver.SaveToSent(ctx, rs.accountID, m.Raw); err != nil {
@@ -627,6 +638,19 @@ func (s *Service) buildMessage(req RunRequest, row map[string]string, origIndex 
 		Subject:     rendered.Subject,
 		Attachments: append(append([]smtp.Attachment{}, globalAtts...), rowAtts...),
 	}
+	// One Message-ID per row, assigned here at render time: the
+	// identity of this row's mail is fixed before anything is sent,
+	// so a retry after a lost SMTP acknowledgement rebuilds the same
+	// mail with the same Message-ID instead of minting a fresh one
+	// the server cannot recognise as a duplicate. A resumed run (or
+	// a held-row batch) carries the ID assigned on the first attempt
+	// in req.MessageIDs; a fresh render mints one, exactly as
+	// QueueSend does for normal sends.
+	if id := messageIDForRow(req, origIndex); id != "" {
+		msg.MessageID = id
+	} else {
+		msg.MessageID = smtp.NewMessageID()
+	}
 	if req.Template.IsPlainText {
 		msg.TextBody = rendered.BodyText
 	} else {
@@ -652,14 +676,22 @@ func (s *Service) buildMessage(req RunRequest, row map[string]string, origIndex 
 	return &builtMessage{msg: msg, fromAddr: *fromAddr, toAddrs: toAddrs, email: email}, nil
 }
 
+// messageIDForRow returns the Message-ID a previous attempt assigned
+// to the row at this position in req.Rows ("" when none was assigned
+// — a fresh render mints one in buildMessage). Out-of-range lookups
+// (a stale MessageIDs slice from an older stored request) are "".
+func messageIDForRow(req RunRequest, index int) string {
+	if index >= 0 && index < len(req.MessageIDs) {
+		return strings.TrimSpace(req.MessageIDs[index])
+	}
+	return ""
+}
+
 // processRow renders, validates and delivers one row, returning its
 // RowResult. seenTo/sentAttempted are updated by the caller-visible
 // side effects (duplicate suppression, cap counting).
 func (s *Service) processRow(ctx context.Context, req RunRequest, row map[string]string, origIndex int, globalAtts []smtp.Attachment, sender MailSender, seenTo map[string]bool, sentAttempted *int, capLimit int) RowResult {
 	now := time.Now()
-	fail := func(err string) RowResult {
-		return RowResult{Index: origIndex, Status: RowFailed, Error: err, Timestamp: now}
-	}
 
 	bm, bad := s.buildMessage(req, row, origIndex, globalAtts, seenTo)
 	if bad != nil {
@@ -667,6 +699,14 @@ func (s *Service) processRow(ctx context.Context, req RunRequest, row map[string
 	}
 	dupKey := strings.ToLower(strings.TrimSpace(bm.email))
 	email := bm.email
+	// The Message-ID assigned at render time rides on every outcome
+	// of this row — sent, held, or failed — so the run log persists
+	// it and a resumed run rebuilds the same mail with the same
+	// identity.
+	messageID := bm.msg.MessageID
+	fail := func(err string) RowResult {
+		return RowResult{Index: origIndex, Email: email, Status: RowFailed, Error: err, Timestamp: now, MessageID: messageID}
+	}
 
 	// Duplicate suppression marks an address ONLY once its row has
 	// actually succeeded (draft saved / message sent). Marking before
@@ -687,10 +727,10 @@ func (s *Service) processRow(ctx context.Context, req RunRequest, row map[string
 			return fail(fmt.Sprintf("save draft: %v", err))
 		}
 		markSeen()
-		return RowResult{Index: origIndex, Email: email, Status: RowDraftSaved, Timestamp: now}
+		return RowResult{Index: origIndex, Email: email, Status: RowDraftSaved, Timestamp: now, MessageID: messageID}
 	case "send":
 		if req.CapEnabled && *sentAttempted >= capLimit {
-			return RowResult{Index: origIndex, Email: email, Status: RowHeld, Error: "held — over cap", Timestamp: now}
+			return RowResult{Index: origIndex, Email: email, Status: RowHeld, Error: "held — over cap", Timestamp: now, MessageID: messageID}
 		}
 		raw, err := bm.msg.ToRFC822()
 		if err != nil {
@@ -721,7 +761,7 @@ func (s *Service) processRow(ctx context.Context, req RunRequest, row map[string
 				slog.Warn().Err(err).Str("email", email).Msg("Failed to save sent message to Sent folder")
 			}
 		}
-		return RowResult{Index: origIndex, Email: email, Status: RowSent, Timestamp: now}
+		return RowResult{Index: origIndex, Email: email, Status: RowSent, Timestamp: now, MessageID: messageID}
 	default:
 		return fail(fmt.Sprintf("unknown deliver mode %q", req.DeliverMode))
 	}

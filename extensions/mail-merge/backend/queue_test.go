@@ -796,3 +796,56 @@ func queueMessageID(raw string) string {
 	}
 	return ""
 }
+
+// TestQueueRowDeletedBeforeSentSave is the re-audit R4 regression
+// test: when a queued item is dispatched, its queue row must already
+// be gone at the moment the Sent save runs — the row is cleared by
+// the afterSMTP hook the instant SMTP accepts, before the Sent save,
+// so a crash during the save cannot leave a 'sending' row the
+// stale-claim reset re-queues and re-sends.
+func TestQueueRowDeletedBeforeSentSave(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	// Observe the queue at the exact moment the Sent save runs.
+	rowGoneAtSave := false
+	savesSeen := 0
+	env.sent.onSave = func() {
+		savesSeen++
+		items, err := env.bridge.MailMerge_ListQueue()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if len(items) == 0 {
+			rowGoneAtSave = true
+		}
+	}
+
+	runID := startLaterRun(t, env, testBridgeRows()[:1])
+	res, err := env.bridge.MailMerge_SendUnsent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Sent != 1 {
+		t.Fatalf("dispatch %+v, want 1 sent", res)
+	}
+	if savesSeen != 1 {
+		t.Fatalf("Sent saves %d, want 1", savesSeen)
+	}
+	if !rowGoneAtSave {
+		t.Fatal("queue row was still present when the Sent save ran — it must be cleared at SMTP acceptance, before the Sent save")
+	}
+	items, err := env.bridge.MailMerge_ListQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("queue after dispatch %+v, want empty", items)
+	}
+	run, err := env.bridge.MailMerge_GetRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.SentCount != 1 {
+		t.Fatalf("run after dispatch %+v, want 1 sent", run)
+	}
+}

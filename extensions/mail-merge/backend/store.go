@@ -100,6 +100,16 @@ DELETE FROM mailmerge_queue_items WHERE status IN ('sent', 'cancelled');
 ALTER TABLE mailmerge_runs ADD COLUMN error TEXT NOT NULL DEFAULT '';
 `,
 	},
+	{
+		// v5 (v0.7.39, re-audit R3): the run log records the
+		// Message-ID assigned when each row was rendered, so a
+		// resumed run (or a held-row batch) rebuilds the same mail
+		// with the same identity instead of minting a fresh one.
+		Version: 5,
+		SQL: `
+ALTER TABLE mailmerge_run_rows ADD COLUMN message_id TEXT NOT NULL DEFAULT '';
+`,
+	},
 }
 
 // Store wraps the per-extension DB for the Mail Merge extension. Lives
@@ -210,12 +220,13 @@ func (s *Store) UpdateRunStatusAndCounts(run *hostmm.Run) error {
 // in place by batch operations, hence INSERT ... ON CONFLICT).
 func (s *Store) SaveRowResult(runID string, r hostmm.RowResult) error {
 	_, err := s.DB().Exec(`
-		INSERT INTO mailmerge_run_rows (run_id, row_index, email, status, error, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO mailmerge_run_rows (run_id, row_index, email, status, error, message_id, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(run_id, row_index) DO UPDATE SET
 			email = excluded.email, status = excluded.status,
-			error = excluded.error, timestamp = excluded.timestamp
-	`, runID, r.Index, r.Email, r.Status, r.Error, r.Timestamp.UTC().Format(time.RFC3339Nano))
+			error = excluded.error, message_id = excluded.message_id,
+			timestamp = excluded.timestamp
+	`, runID, r.Index, r.Email, r.Status, r.Error, r.MessageID, r.Timestamp.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("mail-merge: save run row: %w", err)
 	}
@@ -244,7 +255,7 @@ func (s *Store) GetRun(runID string) (*hostmm.Run, error) {
 		run.CreatedAt = t
 	}
 	rows, err := s.DB().Query(`
-		SELECT row_index, email, status, error, timestamp
+		SELECT row_index, email, status, error, message_id, timestamp
 		FROM mailmerge_run_rows WHERE run_id = ? ORDER BY row_index ASC
 	`, runID)
 	if err != nil {
@@ -254,7 +265,7 @@ func (s *Store) GetRun(runID string) (*hostmm.Run, error) {
 	for rows.Next() {
 		var r hostmm.RowResult
 		var ts string
-		if err := rows.Scan(&r.Index, &r.Email, &r.Status, &r.Error, &ts); err != nil {
+		if err := rows.Scan(&r.Index, &r.Email, &r.Status, &r.Error, &r.MessageID, &ts); err != nil {
 			return nil, fmt.Errorf("mail-merge: scan run row: %w", err)
 		}
 		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
