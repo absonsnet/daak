@@ -74,3 +74,76 @@ func TestTrayStartStopIdempotent(t *testing.T) {
 		t.Fatal("Start/Stop did not return within 10s")
 	}
 }
+
+// Re-audit finding R18: a tray whose run loop has exited must report
+// as not alive, so the close paths fall back to a real quit instead of
+// hiding the window on the strength of the once-only started flag.
+// The exit is simulated by closing done directly: that is exactly the
+// state the onExit callback — and, on Windows, the Run-return path —
+// leaves behind once the loop has ended.
+func TestTrayExitedIsNotAlive(t *testing.T) {
+	// A tray that never started is not alive, and Done is nil
+	// (a nil channel blocks forever in a select: never exits).
+	tr := New()
+	if tr.Alive() {
+		t.Fatal("never-started tray: got alive, want not alive")
+	}
+	if tr.Done() != nil {
+		t.Fatal("never-started tray: Done() is not nil, want nil")
+	}
+
+	// A started tray with its loop still running is alive, and Done
+	// stays open.
+	tr.mu.Lock()
+	tr.started = true
+	tr.done = make(chan struct{})
+	tr.mu.Unlock()
+	if !tr.Alive() {
+		t.Fatal("started tray with open done: got not alive, want alive")
+	}
+	select {
+	case <-tr.Done():
+		t.Fatal("started tray with open done: Done() closed, want open")
+	default:
+	}
+
+	// Once the loop has exited, the tray is dead: Alive is false and
+	// Done is closed.
+	close(tr.done)
+	if tr.Alive() {
+		t.Fatal("exited tray: got alive, want not alive")
+	}
+	select {
+	case <-tr.Done():
+	default:
+		t.Fatal("exited tray: Done() still open, want closed")
+	}
+}
+
+// A later Start after the tray has died returns false: the dead tray
+// cannot be restarted in-process, so the caller must not believe it
+// is back. A Start while the tray is still alive stays a no-op true.
+func TestTrayStartAfterDeathReturnsFalse(t *testing.T) {
+	noop := func() {}
+
+	// Live tray: idempotent Start returns true.
+	live := New()
+	live.mu.Lock()
+	live.started = true
+	live.done = make(chan struct{})
+	live.mu.Unlock()
+	if ok := live.Start(nil, nil, noop, noop, noop, noop, noop); !ok {
+		t.Fatal("Start on a live tray: got false, want true")
+	}
+
+	// Dead tray: Start returns false.
+	dead := New()
+	dead.mu.Lock()
+	dead.started = true
+	dead.done = make(chan struct{})
+	close(dead.done)
+	dead.mu.Unlock()
+	if ok := dead.Start(nil, nil, noop, noop, noop, noop, noop); ok {
+		t.Fatal("Start on a dead tray: got true, want false")
+	}
+}
