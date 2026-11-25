@@ -1,8 +1,14 @@
 package auth
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	coreapi "github.com/absonsnet/daak/internal/core/api/v1"
 	"github.com/absonsnet/daak/internal/credentials"
@@ -266,6 +272,141 @@ func TestHTTPClientForExtension_NoManifestOAuthRoutesToExtension(t *testing.T) {
 	}
 	if string(consentErr.ClientConfigID) != "google-myext" {
 		t.Errorf("ClientConfigID: got %q, want google-myext", consentErr.ClientConfigID)
+	}
+}
+
+// TestBrokerConcurrentRefreshSingleFlight (audit finding R11): concurrent
+// extension requests through DIFFERENT http.Clients (each with its own
+// bearerRefreshTransport instance) for one account with an expired token
+// must result in exactly one token-endpoint call and no spurious re-auth
+// error.
+//
+// Before the fix the refresh lock lived on the transport, so each client
+// had its own lock and both refreshed; with rotating refresh tokens the
+// second refresh failed invalid_grant on the already-rotated token even
+// though a valid token had just been stored. The broker now shares one
+// lock per (account, client config) across its transports, and a caller
+// that re-reads a changed access token under that lock retries with the
+// fresh token instead of refreshing again. The stub token endpoint models
+// rotation (accepts refresh-1 once, then rejects it with invalid_grant),
+// and the 100ms handler delay widens the overlap window.
+func TestBrokerConcurrentRefreshSingleFlight(t *testing.T) {
+	broker, credStore, db := newTestBroker(t)
+	insertTestAccount(t, db, "acct-r11")
+
+	if err := credStore.SetOAuthTokens("acct-r11", &credentials.OAuthTokens{
+		Provider:     "custom",
+		AccessToken:  "access-old",
+		RefreshToken: "refresh-1",
+		ExpiresAt:    time.Now().Add(-1 * time.Hour),
+		Scopes:       []string{"scope1"},
+	}); err != nil {
+		t.Fatalf("set tokens: %v", err)
+	}
+
+	var calls atomic.Int32
+	var mu sync.Mutex
+	acceptedRefreshToken := "refresh-1"
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		ok := r.Form.Get("refresh_token") == acceptedRefreshToken
+		if ok {
+			// Rotate: the presented token is now spent.
+			acceptedRefreshToken = "refresh-2"
+		}
+		mu.Unlock()
+		if !ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"Token has been expired or revoked."}`))
+			return
+		}
+		// Hold the refresh in flight so the other callers overlap it.
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "access-new",
+			"refresh_token": "refresh-2",
+			"expires_in":    3600,
+			"token_type":    "Bearer",
+		})
+	}))
+	t.Cleanup(tokenSrv.Close)
+
+	if err := credStore.SetCustomOAuthProvider("acct-r11", credentials.CustomOAuthProvider{
+		AuthURL:  "https://auth.example.com/authorize",
+		TokenURL: tokenSrv.URL,
+		Scopes:   []string{"scope1"},
+		ClientID: "test-client-id",
+	}); err != nil {
+		t.Fatalf("set custom provider: %v", err)
+	}
+
+	// API server: only the refreshed access token is accepted.
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer access-new" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(apiSrv.Close)
+
+	const callers = 8
+	clients := make([]*http.Client, callers)
+	for i := range clients {
+		c, err := broker.HTTPClient("acct-r11", []coreapi.AuthScope{{Resource: "scope1"}})
+		if err != nil {
+			t.Fatalf("HTTPClient %d: %v", i, err)
+		}
+		clients[i] = c
+	}
+
+	var wg sync.WaitGroup
+	statuses := make([]int, callers)
+	errs := make([]error, callers)
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			resp, err := clients[i].Get(apiSrv.URL)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer resp.Body.Close()
+			statuses[i] = resp.StatusCode
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("caller %d: request returned error: %v (spurious re-auth failure)", i, err)
+		}
+		if statuses[i] != http.StatusOK {
+			t.Errorf("caller %d: status = %d, want 200", i, statuses[i])
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("token endpoint calls = %d, want exactly 1", got)
+	}
+
+	stored, err := credStore.GetOAuthTokens("acct-r11")
+	if err != nil {
+		t.Fatalf("GetOAuthTokens after refresh: %v", err)
+	}
+	if stored.AccessToken != "access-new" || stored.RefreshToken != "refresh-2" {
+		t.Errorf("stored tokens = access %q refresh %q, want access-new / refresh-2", stored.AccessToken, stored.RefreshToken)
 	}
 }
 
