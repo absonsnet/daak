@@ -777,6 +777,22 @@ export namespace app {
 		    return a;
 		}
 	}
+	export class NotificationPermissionInfo {
+	    status: string;
+	    platform: string;
+	    canOpenSystemSettings: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new NotificationPermissionInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.status = source["status"];
+	        this.platform = source["platform"];
+	        this.canOpenSystemSettings = source["canOpenSystemSettings"];
+	    }
+	}
 	export class OAuthBuildStatus {
 	    google: boolean;
 	    microsoft: boolean;
@@ -967,11 +983,11 @@ export namespace app {
 	    draftId: string;
 	    delaySeconds: number;
 	    sendAt: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new QueueSendResult(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.queueId = source["queueId"];
@@ -1128,6 +1144,22 @@ export namespace app {
 	        this.name = source["name"];
 	    }
 	}
+	export class UndoSendResult {
+	    queueId: string;
+	    accountId: string;
+	    draftId: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new UndoSendResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.queueId = source["queueId"];
+	        this.accountId = source["accountId"];
+	        this.draftId = source["draftId"];
+	    }
+	}
 	export class UnsubscribeResult {
 	    method: string;
 	    url: string;
@@ -1178,22 +1210,6 @@ export namespace app {
 	        this.isSpam = source["isSpam"];
 	        this.senderEmail = source["senderEmail"];
 	        this.senderName = source["senderName"];
-	    }
-	}
-	export class UndoSendResult {
-	    queueId: string;
-	    accountId: string;
-	    draftId: string;
-
-	    static createFrom(source: any = {}) {
-	        return new UndoSendResult(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.queueId = source["queueId"];
-	        this.accountId = source["accountId"];
-	        this.draftId = source["draftId"];
 	    }
 	}
 	export class ViewMode {
@@ -1440,6 +1456,11 @@ export namespace backend {
 	    rruleText?: string;
 	    transparency?: string;
 	    visibility?: string;
+	    status?: string;
+	    sequence?: number;
+	    categories?: string[];
+	    exceptionDates?: number[];
+	    alarmFingerprints?: string[];
 	    attendees?: Attendee[];
 	    organizer?: Organizer;
 	
@@ -1466,6 +1487,11 @@ export namespace backend {
 	        this.rruleText = source["rruleText"];
 	        this.transparency = source["transparency"];
 	        this.visibility = source["visibility"];
+	        this.status = source["status"];
+	        this.sequence = source["sequence"];
+	        this.categories = source["categories"];
+	        this.exceptionDates = source["exceptionDates"];
+	        this.alarmFingerprints = source["alarmFingerprints"];
 	        this.attendees = this.convertValues(source["attendees"], Attendee);
 	        this.organizer = this.convertValues(source["organizer"], Organizer);
 	    }
@@ -1608,6 +1634,11 @@ export namespace backend {
 	    rruleText?: string;
 	    transparency?: string;
 	    visibility?: string;
+	    status?: string;
+	    sequence?: number;
+	    categories?: string[];
+	    exceptionDates?: number[];
+	    alarmFingerprints?: string[];
 	    attendees?: Attendee[];
 	    organizer?: Organizer;
 	    instanceStartUnix: number;
@@ -1637,6 +1668,11 @@ export namespace backend {
 	        this.rruleText = source["rruleText"];
 	        this.transparency = source["transparency"];
 	        this.visibility = source["visibility"];
+	        this.status = source["status"];
+	        this.sequence = source["sequence"];
+	        this.categories = source["categories"];
+	        this.exceptionDates = source["exceptionDates"];
+	        this.alarmFingerprints = source["alarmFingerprints"];
 	        this.attendees = this.convertValues(source["attendees"], Attendee);
 	        this.organizer = this.convertValues(source["organizer"], Organizer);
 	        this.instanceStartUnix = source["instanceStartUnix"];
@@ -2766,6 +2802,7 @@ export namespace mailmerge {
 	    email: string;
 	    status: string;
 	    error?: string;
+	    messageId?: string;
 	    // Go type: time
 	    timestamp: any;
 	
@@ -2779,6 +2816,7 @@ export namespace mailmerge {
 	        this.email = source["email"];
 	        this.status = source["status"];
 	        this.error = source["error"];
+	        this.messageId = source["messageId"];
 	        this.timestamp = this.convertValues(source["timestamp"], null);
 	    }
 	
@@ -2814,6 +2852,7 @@ export namespace mailmerge {
 	    heldCount: number;
 	    queuedCount: number;
 	    rows: RowResult[];
+	    error?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Run(source);
@@ -2833,6 +2872,7 @@ export namespace mailmerge {
 	        this.heldCount = source["heldCount"];
 	        this.queuedCount = source["queuedCount"];
 	        this.rows = this.convertValues(source["rows"], RowResult);
+	        this.error = source["error"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -2912,6 +2952,7 @@ export namespace mailmerge {
 	export class RunRequest {
 	    template: Template;
 	    rows: any[];
+	    messageIds?: string[];
 	    sourceKind: string;
 	    deliverMode: string;
 	    pauseSeconds: number;
@@ -2931,6 +2972,7 @@ export namespace mailmerge {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.template = this.convertValues(source["template"], Template);
 	        this.rows = source["rows"];
+	        this.messageIds = source["messageIds"];
 	        this.sourceKind = source["sourceKind"];
 	        this.deliverMode = source["deliverMode"];
 	        this.pauseSeconds = source["pauseSeconds"];
@@ -2974,6 +3016,7 @@ export namespace mailmerge {
 	    skippedCount: number;
 	    heldCount: number;
 	    queuedCount: number;
+	    error?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new RunSummary(source);
@@ -2992,6 +3035,7 @@ export namespace mailmerge {
 	        this.skippedCount = source["skippedCount"];
 	        this.heldCount = source["heldCount"];
 	        this.queuedCount = source["queuedCount"];
+	        this.error = source["error"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -3696,7 +3740,7 @@ export namespace platform {
 }
 
 export namespace sendqueue {
-
+	
 	export class Item {
 	    id: string;
 	    accountId: string;
@@ -3719,11 +3763,11 @@ export namespace sendqueue {
 	    createdAt: any;
 	    // Go type: time
 	    sentAt?: any;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Item(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -3744,7 +3788,7 @@ export namespace sendqueue {
 	        this.createdAt = this.convertValues(source["createdAt"], null);
 	        this.sentAt = this.convertValues(source["sentAt"], null);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -3769,11 +3813,11 @@ export namespace sendqueue {
 	    sent: number;
 	    failed: number;
 	    cancelled: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Stats(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.total = source["total"];
@@ -3785,6 +3829,7 @@ export namespace sendqueue {
 	}
 
 }
+
 export namespace settings {
 	
 	export class AllowlistEntry {
@@ -4004,6 +4049,7 @@ export namespace smtp {
 	    attachments: Attachment[];
 	    in_reply_to?: string;
 	    references?: string[];
+	    message_id?: string;
 	    request_read_receipt: boolean;
 	    sign_message: boolean;
 	    encrypt_message: boolean;
@@ -4027,6 +4073,7 @@ export namespace smtp {
 	        this.attachments = this.convertValues(source["attachments"], Attachment);
 	        this.in_reply_to = source["in_reply_to"];
 	        this.references = source["references"];
+	        this.message_id = source["message_id"];
 	        this.request_read_receipt = source["request_read_receipt"];
 	        this.sign_message = source["sign_message"];
 	        this.encrypt_message = source["encrypt_message"];

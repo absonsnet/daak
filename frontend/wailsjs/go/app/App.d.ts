@@ -16,6 +16,7 @@ import {imap} from '../models';
 import {settings} from '../models';
 import {pgp} from '../models';
 import {smime} from '../models';
+import {sendqueue} from '../models';
 import {appstate} from '../models';
 import {platform} from '../models';
 import {sync} from '../models';
@@ -137,6 +138,8 @@ export function CancelContactSourceOAuthFlow():Promise<void>;
 export function CancelFolderSync(arg1:string,arg2:string):Promise<void>;
 
 export function CancelOAuthFlow():Promise<void>;
+
+export function CheckNotificationDeniedNotice():Promise<boolean>;
 
 export function CheckRecipientCerts(arg1:Array<string>):Promise<Record<string, boolean>>;
 
@@ -384,6 +387,8 @@ export function GetMicrosoftSharedMailboxes(arg1:string):Promise<Array<account.A
 
 export function GetNativeTitleBar():Promise<boolean>;
 
+export function GetNotificationPermissionStatus():Promise<app.NotificationPermissionInfo>;
+
 export function GetOAuthBuildStatus():Promise<app.OAuthBuildStatus>;
 
 export function GetOAuthCredsChoices(arg1:string,arg2:string):Promise<app.OAuthCredsChoices>;
@@ -410,19 +415,21 @@ export function GetReadReceiptResponsePolicy():Promise<string>;
 
 export function GetRunBackground():Promise<boolean>;
 
-export function GetSaveRecipientsToAccountContacts():Promise<boolean>;
-
 export function GetSMIMECertificateForEmail(arg1:string,arg2:string):Promise<smime.Certificate>;
 
 export function GetSMIMEEncryptPolicy(arg1:string):Promise<string>;
 
 export function GetSMIMESignPolicy(arg1:string):Promise<string>;
 
+export function GetSaveRecipientsToAccountContacts():Promise<boolean>;
+
 export function GetSearchCount(arg1:string,arg2:string,arg3:string,arg4:string):Promise<number>;
 
 export function GetSearchCountUnifiedFolder(arg1:string,arg2:string,arg3:string):Promise<number>;
 
 export function GetSearchCountUnifiedInbox(arg1:string,arg2:string):Promise<number>;
+
+export function GetSendQueueStats():Promise<sendqueue.Stats>;
 
 export function GetSenderCategoryOverrides():Promise<Array<app.SenderCategoryOverride>>;
 
@@ -447,8 +454,6 @@ export function GetSpellcheckCustomWords():Promise<Array<string>>;
 export function GetSpellcheckEnabled():Promise<boolean>;
 
 export function GetSpellcheckLanguages():Promise<Array<string>>;
-
-export function GetSendQueueStats():Promise<sendqueue.Stats>;
 
 export function GetStartHidden():Promise<boolean>;
 
@@ -491,6 +496,8 @@ export function GetUnsubscribeStatuses(arg1:Array<string>):Promise<Array<app.Uns
 export function GetWindowControlsLayout():Promise<platform.WindowControlsLayout>;
 
 export function GetWindowControlsSide():Promise<string>;
+
+export function HandleSingleInstanceCommand(arg1:string):Promise<void>;
 
 export function HasPGPKey(arg1:string):Promise<boolean>;
 
@@ -658,6 +665,8 @@ export function OpenFile(arg1:string):Promise<void>;
 
 export function OpenFolder(arg1:string):Promise<void>;
 
+export function OpenNotificationSettings():Promise<void>;
+
 export function OpenURL(arg1:string):Promise<void>;
 
 export function OpenViewerWindow(arg1:string,arg2:string,arg3:string):Promise<void>;
@@ -824,11 +833,11 @@ export function SetReadReceiptResponsePolicy(arg1:string):Promise<void>;
 
 export function SetRunBackground(arg1:boolean):Promise<void>;
 
-export function SetSaveRecipientsToAccountContacts(arg1:boolean):Promise<void>;
-
 export function SetSMIMEEncryptPolicy(arg1:string,arg2:string):Promise<void>;
 
 export function SetSMIMESignPolicy(arg1:string,arg2:string):Promise<void>;
+
+export function SetSaveRecipientsToAccountContacts(arg1:boolean):Promise<void>;
 
 export function SetSenderAutoDelete(arg1:string,arg2:string,arg3:boolean):Promise<void>;
 
@@ -914,9 +923,9 @@ export function Trash(arg1:Array<string>):Promise<boolean>;
 
 export function Undo():Promise<string>;
 
-export function Unstar(arg1:Array<string>):Promise<void>;
-
 export function UndoSend(arg1:string):Promise<app.UndoSendResult>;
+
+export function Unstar(arg1:Array<string>):Promise<void>;
 
 export function UnsubscribeFolder(arg1:string,arg2:string):Promise<void>;
 

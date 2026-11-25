@@ -643,6 +643,12 @@ func (a *App) initNotifications(ctx context.Context) {
 
 	a.notifier = notification.New(platform.AppName, a.useDirectDBus)
 
+	// Permission changes (macOS: the user answered the authorization
+	// prompt). A denial emits "notification:permission-denied" so the
+	// frontend can show the one-time notice; see
+	// handleNotificationPermissionChange.
+	a.notifier.SetPermissionChangeHandler(a.handleNotificationPermissionChange)
+
 	// Set click handler. Dispatcher routes based on which NotificationData
 	// fields are populated: ExtensionID set → extension click (raise window
 	// + emit `extension:open` so frontend switches rail tab and processes

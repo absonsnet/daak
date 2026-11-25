@@ -614,6 +614,16 @@
     "startHiddenHelp": "Launch with the window hidden",
     "showUnreadBadge": "Show unread badge on app and tray icons",
     "showUnreadBadgeHelp": "Show the unread count on the Dock or taskbar icon and the tray icon",
+    "notifications": "Notifications",
+    "notificationPermissionBlocked": "Notifications are blocked in System Settings",
+    "notificationPermissionBlockedHelp": "Daak can't show new-mail notifications until you allow them. Open System Settings to turn them back on.",
+    "notificationPermissionOn": "Notifications are on",
+    "notificationPermissionOnHelp": "New-mail notifications will appear as macOS notifications.",
+    "notificationPermissionNotDetermined": "Notifications haven't been requested yet",
+    "notificationPermissionNotDeterminedHelp": "Daak will ask for permission to show notifications.",
+    "notificationPermissionUnknown": "Notification permission couldn't be checked",
+    "notificationPermissionUnknownHelp": "Daak couldn't ask macOS whether notifications are allowed.",
+    "openNotificationSettings": "Open System Settings",
     "startup": "Startup",
     "autostartOnLogin": "Autostart on login",
     "autostartHelp": "Automatically start Daak when you log in",
@@ -1048,6 +1058,13 @@
     "termsOfUse": "Terms of Use",
     "agreeLabel": "I have read and agree to the Terms of Use and Privacy Policy",
     "accept": "Accept & Continue"
+  },
+  "notificationDenied": {
+    "title": "Notifications are blocked",
+    "intro": "Daak doesn't have permission to show notifications on this Mac, so you won't see new-mail notifications. You can turn them back on in System Settings.",
+    "howTo": "Open System Settings, go to Notifications, find Daak in the list, and turn on Allow Notifications.",
+    "openSettings": "Open System Settings",
+    "notNow": "Not now"
   },
   "oauthMissing": {
     "title": "OAuth credentials missing",

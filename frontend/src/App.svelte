@@ -16,6 +16,7 @@
   import SpellSuggestionMenu from './lib/spellcheck/SpellSuggestionMenu.svelte'
   import TermsDialog from './lib/components/TermsDialog.svelte'
   import OAuthMissingDialog from './lib/components/OAuthMissingDialog.svelte'
+  import NotificationDeniedDialog from './lib/components/NotificationDeniedDialog.svelte'
   import WhatsNewDialog from './lib/components/WhatsNewDialog.svelte'
   import CertificateDialog from './lib/components/settings/CertificateDialog.svelte'
   import ExtensionSettingsDialog from './lib/components/settings/ExtensionSettingsDialog.svelte'
@@ -50,7 +51,7 @@
   import { dispatchExtensionShortcut } from '$lib/stores/extensionShortcuts.svelte'
   import { initLayout, getLayoutMode, getResponsiveView, showViewer, hideViewer, showSidebar, hideSidebar, isResponsive } from '$lib/stores/layout.svelte'
   // @ts-ignore - wailsjs path
-  import { PrepareReply, GetPendingMailto, GetDraft, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, GetTermsAccepted, SetTermsAccepted, RefreshWindowConstraints, AcceptCertificate, GetStartHiddenActive, CloseWindow, QuitApp, OpenComposerWindow, OpenViewerWindow, GetSystemTheme, NotifyStartupComplete, GetOAuthBuildStatus, GetOAuthWarningDisabled, SetOAuthWarningDisabled, GetLastSeenVersion, SetLastSeenVersion, GetAppInfo, SetShowMessagePreviewPane, GetConversation, GetSpecialFolder, UndoSend } from '../wailsjs/go/app/App.js'
+  import { PrepareReply, GetPendingMailto, GetDraft, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, GetTermsAccepted, SetTermsAccepted, RefreshWindowConstraints, AcceptCertificate, GetStartHiddenActive, CloseWindow, QuitApp, OpenComposerWindow, OpenViewerWindow, GetSystemTheme, NotifyStartupComplete, GetOAuthBuildStatus, GetOAuthWarningDisabled, SetOAuthWarningDisabled, GetLastSeenVersion, SetLastSeenVersion, GetAppInfo, SetShowMessagePreviewPane, GetConversation, GetSpecialFolder, UndoSend, CheckNotificationDeniedNotice, OpenNotificationSettings } from '../wailsjs/go/app/App.js'
   // @ts-ignore - wailsjs path
   import { smtp, folder, certificate } from '../wailsjs/go/models'
   // @ts-ignore - wailsjs runtime
@@ -389,6 +390,12 @@
   let whatsNewVersion = $state('')
   let pendingWhatsNew = $state(false)
 
+  // One-time notification-denied notice state (R28). The backend claims
+  // the notice once via CheckNotificationDeniedNotice; this dialog is
+  // the only surface for it.
+  let showNotificationDeniedDialog = $state(false)
+  let pendingNotificationDenied = $state(false)
+
   // Certificate TOFU state (for background sync cert errors)
   let showCertDialog = $state(false)
   let pendingCertificate = $state<certificate.CertificateInfo | null>(null)
@@ -444,9 +451,9 @@
     showWhatsNewDialog = false
   }
 
-  // Reactive sequencing: Terms → OAuth warning → What's New.
-  // Each gates on the previous being closed so users see them one at a
-  // time, never stacked.
+  // Reactive sequencing: Terms → OAuth warning → What's New →
+  // notification-denied notice. Each gates on the previous being closed
+  // so users see them one at a time, never stacked.
   $effect(() => {
     if (!showTermsDialog && pendingOAuthWarning && !showOAuthMissingDialog) {
       showOAuthMissingDialog = true
@@ -460,6 +467,29 @@
       pendingWhatsNew = false
     }
   })
+
+  $effect(() => {
+    if (!showTermsDialog && !showOAuthMissingDialog && !showWhatsNewDialog && pendingNotificationDenied && !showNotificationDeniedDialog) {
+      showNotificationDeniedDialog = true
+      pendingNotificationDenied = false
+    }
+  })
+
+  // Notification-denied notice actions: open the OS Notifications
+  // settings page (macOS deep link), then close; or just dismiss —
+  // the Settings row keeps showing the blocked state.
+  async function handleNotificationDeniedOpenSettings() {
+    try {
+      await OpenNotificationSettings()
+    } catch (err) {
+      console.error('Failed to open notification settings:', err)
+    }
+    showNotificationDeniedDialog = false
+  }
+
+  function dismissNotificationDeniedDialog() {
+    showNotificationDeniedDialog = false
+  }
 
   // Certificate TOFU handlers for background sync
   async function handleBgCertAcceptOnce() {
@@ -557,6 +587,21 @@
         selectedConversationAccountId: data.accountId,
         selectedConversationFolderId: data.folderId,
       })
+    })
+
+    // Notification permission denied (R28): the backend emits this when
+    // the user answers the macOS authorization prompt with "Don't
+    // Allow". Claim the one-time notice — the claim returns true
+    // exactly once, so a denial observed before mount (caught by the
+    // startup check) can never double-fire here.
+    EventsOn('notification:permission-denied', async () => {
+      try {
+        if (await CheckNotificationDeniedNotice()) {
+          pendingNotificationDenied = true
+        }
+      } catch (err) {
+        console.error('Failed to check notification denied notice:', err)
+      }
     })
 
     // Generic extension-routed notification clicks. The host switches the
@@ -724,6 +769,19 @@
       }
     } catch (err) {
       console.error('Failed to check What\'s New state:', err)
+    }
+
+    // Notification-denied notice (R28): if the OS notification
+    // permission is denied and the one-time notice has never been
+    // shown, claim it now so the dialog opens (deferred via $effect
+    // so Terms / OAuth / What's New resolve first). The backend
+    // returns true exactly once, so this never re-fires.
+    try {
+      if (await CheckNotificationDeniedNotice()) {
+        pendingNotificationDenied = true
+      }
+    } catch (err) {
+      console.error('Failed to check notification denied notice:', err)
     }
 
     // Load persisted UI state
@@ -2310,6 +2368,16 @@
 <WhatsNewDialog
   bind:open={showWhatsNewDialog}
   onAcknowledge={acknowledgeWhatsNew}
+/>
+
+<!-- One-time notification-denied notice (R28). Fires once when the OS
+     notification permission is denied — at startup via
+     CheckNotificationDeniedNotice, or live when the user answers the
+     macOS authorization prompt (notification:permission-denied event). -->
+<NotificationDeniedDialog
+  bind:open={showNotificationDeniedDialog}
+  onOpenSettings={handleNotificationDeniedOpenSettings}
+  onDismiss={dismissNotificationDeniedDialog}
 />
 
 <!-- Certificate TOFU Dialog (for background sync cert errors) -->
