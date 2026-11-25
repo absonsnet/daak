@@ -2647,12 +2647,12 @@ func (s *Store) ListConversationsByFolder(folderID string, offset, limit int, so
 			MAX(date) as latest_date,
 			GROUP_CONCAT(id) as message_ids,
 			MAX(CASE WHEN smime_encrypted = 1 OR pgp_encrypted = 1 THEN 1 ELSE 0 END) as is_encrypted,
-			(SELECT m2.extract_kind FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as extract_kind,
-			(SELECT m2.extract_value FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as extract_value,
-			(SELECT m2.extract_rule FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as extract_rule,
-			(SELECT m2.id FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as extract_message_id,
-			(SELECT m2.category FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as category,
-			(SELECT m2.sub_category FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id ORDER BY m2.date DESC LIMIT 1) as sub_category,
+			(SELECT m2.extract_kind FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as extract_kind,
+			(SELECT m2.extract_value FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as extract_value,
+			(SELECT m2.extract_rule FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as extract_rule,
+			(SELECT m2.id FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as extract_message_id,
+			(SELECT m2.category FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as category,
+			(SELECT m2.sub_category FROM messages m2 WHERE COALESCE(m2.thread_id, m2.id) = COALESCE(m.thread_id, m.id) AND m2.account_id = m.account_id AND m2.folder_id = m.folder_id ORDER BY m2.date DESC LIMIT 1) as sub_category,
 			%s as participants_json
 		FROM messages m
 		WHERE folder_id = ? AND is_hidden = 0`+categoryClause+`
