@@ -1636,4 +1636,16 @@ var migrations = []Migration{
 				WHERE draft_id <> '' AND status IN ('pending', 'sending');
 		`,
 	},
+	{
+		Version: 55,
+		SQL: `
+			-- Re-audit R22: writability was tracked per source only, so a
+			-- read-only first address book made the auto-add fail while
+			-- the second (writable) book was never tried. Record
+			-- writability per address book. Existing rows default to
+			-- writable: that preserves the old behaviour until a
+			-- discovery probe or a 403 PUT proves a book read-only.
+			ALTER TABLE contact_source_addressbooks ADD COLUMN writable INTEGER NOT NULL DEFAULT 1;
+		`,
+	},
 }

@@ -873,6 +873,27 @@ func (a *App) Startup(ctx context.Context) {
 		microsoftContactsSyncer: contact.NewMicrosoftContactsSyncer(),
 		getContactSourceToken:   a.getValidContactSourceOAuthToken,
 		msContactsSourceCache:   make(map[string]string),
+		// R22: a CardDAV auto-add that fails in every address book
+		// must reach the user, not just a log line — the local
+		// collected copy still lands, so otherwise nothing looks
+		// wrong. The closure reads a.ctx / a.notifier lazily: the
+		// notifier is only built later in Startup (initNotifications).
+		onCardDAVAutoAddFailure: func(sourceID, accountID string, emails []string, err error) {
+			if a.ctx != nil {
+				wailsRuntime.EventsEmit(a.ctx, "contacts:auto-add-failed", map[string]interface{}{
+					"sourceId":  sourceID,
+					"accountId": accountID,
+					"emails":    emails,
+					"error":     err.Error(),
+				})
+			}
+			if a.notifier != nil {
+				_, _ = a.notifier.Show(notification.Notification{
+					Title: "New contacts were not saved to your address book",
+					Body:  fmt.Sprintf("%d new contact(s) could not be saved to the CardDAV address book (%v). They were still saved locally in Daak.", len(emails), err),
+				})
+			}
+		},
 	}
 
 	// Undo Send: build the queue service now that composeOps exists,

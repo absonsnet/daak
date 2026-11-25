@@ -80,6 +80,16 @@ type composeOps struct {
 	microsoftContactsSyncer *contact.MicrosoftContactsSyncer
 	getContactSourceToken   func(sourceID string) (string, error)
 
+	// onCardDAVAutoAddFailure, when non-nil, is called (once per send
+	// batch) when one or more recipients could not be saved to any
+	// address book of the sending account's CardDAV source (R22).
+	// Production wires it to a user-visible warning (Wails event +
+	// desktop notification); tests set it to capture the failure.
+	// Nil means log-only — the detached composer/viewer leave it nil
+	// because their sends go through the main process queue, where
+	// the save (and the warning) happens.
+	onCardDAVAutoAddFailure func(sourceID, accountID string, emails []string, err error)
+
 	// msContactsSourceCache maps mail account IDs to their Microsoft
 	// contacts source IDs (see microsoftContactsSourceForAccount).
 	msContactsSourceCache   map[string]string

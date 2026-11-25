@@ -334,16 +334,25 @@ func (s *Store) GetSourcesWithErrors() ([]*SourceError, error) {
 // Addressbook CRUD
 // ============================================================================
 
-// CreateAddressbook creates a new addressbook for a source
+// CreateAddressbook creates a new addressbook for a source. The book
+// starts writable (R22): discovery or a later 403 PUT can prove it
+// read-only, but an unprobed book must not be assumed read-only.
 func (s *Store) CreateAddressbook(sourceID, path, name string, enabled bool) (*Addressbook, error) {
+	return s.CreateAddressbookWritable(sourceID, path, name, enabled, true)
+}
+
+// CreateAddressbookWritable creates a new addressbook for a source with
+// an explicit per-book writability (R22) — used when discovery probed
+// the book's current-user-privilege-set.
+func (s *Store) CreateAddressbookWritable(sourceID, path, name string, enabled, writable bool) (*Addressbook, error) {
 	id := uuid.New().String()
 
 	query := `
-		INSERT INTO contact_source_addressbooks (id, source_id, path, name, enabled)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO contact_source_addressbooks (id, source_id, path, name, enabled, writable)
+		VALUES (?, ?, ?, ?, ?, ?)
 	`
 
-	_, err := s.db.Exec(query, id, sourceID, path, name, enabled)
+	_, err := s.db.Exec(query, id, sourceID, path, name, enabled, writable)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create addressbook: %w", err)
 	}
@@ -354,13 +363,31 @@ func (s *Store) CreateAddressbook(sourceID, path, name string, enabled bool) (*A
 		Path:     path,
 		Name:     name,
 		Enabled:  enabled,
+		Writable: writable,
 	}, nil
+}
+
+// SetAddressbookWritable records what the server has shown about one
+// address book (R22): false once discovery found no write privilege
+// for it, or a PUT to it came back 403. The save path uses it to skip
+// known read-only books instead of failing on them every send.
+func (s *Store) SetAddressbookWritable(id string, writable bool) error {
+	result, err := s.db.Exec(`UPDATE contact_source_addressbooks SET writable = ? WHERE id = ?`, writable, id)
+	if err != nil {
+		return fmt.Errorf("failed to update addressbook writable: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("addressbook not found: %s", id)
+	}
+	s.log.Info().Str("id", id).Bool("writable", writable).Msg("Addressbook writable updated")
+	return nil
 }
 
 // GetAddressbook returns an addressbook by ID
 func (s *Store) GetAddressbook(id string) (*Addressbook, error) {
 	query := `
-		SELECT id, source_id, path, name, enabled, sync_token, last_synced_at
+		SELECT id, source_id, path, name, enabled, writable, sync_token, last_synced_at
 		FROM contact_source_addressbooks
 		WHERE id = ?
 	`
@@ -371,7 +398,7 @@ func (s *Store) GetAddressbook(id string) (*Addressbook, error) {
 
 	err := s.db.QueryRow(query, id).Scan(
 		&ab.ID, &ab.SourceID, &ab.Path, &ab.Name, &ab.Enabled,
-		&syncToken, &lastSyncedAt)
+		&ab.Writable, &syncToken, &lastSyncedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -421,7 +448,7 @@ func (s *Store) GetSourceIDForRecord(recordID string) (string, error) {
 // ListAddressbooks returns all addressbooks for a source
 func (s *Store) ListAddressbooks(sourceID string) ([]*Addressbook, error) {
 	query := `
-		SELECT id, source_id, path, name, enabled, sync_token, last_synced_at
+		SELECT id, source_id, path, name, enabled, writable, sync_token, last_synced_at
 		FROM contact_source_addressbooks
 		WHERE source_id = ?
 		ORDER BY name ASC
@@ -441,7 +468,7 @@ func (s *Store) ListAddressbooks(sourceID string) ([]*Addressbook, error) {
 
 		err := rows.Scan(
 			&ab.ID, &ab.SourceID, &ab.Path, &ab.Name, &ab.Enabled,
-			&syncToken, &lastSyncedAt)
+			&ab.Writable, &syncToken, &lastSyncedAt)
 		if err != nil {
 			continue
 		}
@@ -462,7 +489,7 @@ func (s *Store) ListAddressbooks(sourceID string) ([]*Addressbook, error) {
 // ListEnabledAddressbooks returns all enabled addressbooks for a source
 func (s *Store) ListEnabledAddressbooks(sourceID string) ([]*Addressbook, error) {
 	query := `
-		SELECT id, source_id, path, name, enabled, sync_token, last_synced_at
+		SELECT id, source_id, path, name, enabled, writable, sync_token, last_synced_at
 		FROM contact_source_addressbooks
 		WHERE source_id = ? AND enabled = 1
 		ORDER BY name ASC
@@ -482,7 +509,7 @@ func (s *Store) ListEnabledAddressbooks(sourceID string) ([]*Addressbook, error)
 
 		err := rows.Scan(
 			&ab.ID, &ab.SourceID, &ab.Path, &ab.Name, &ab.Enabled,
-			&syncToken, &lastSyncedAt)
+			&ab.Writable, &syncToken, &lastSyncedAt)
 		if err != nil {
 			continue
 		}
