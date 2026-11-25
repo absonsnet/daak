@@ -3415,6 +3415,110 @@ func (s *Store) DeleteTempUIDs(folderID string) error {
 	return nil
 }
 
+// ConfirmedRealCopies returns the subset of the given RFC822 Message-IDs
+// that have a row in folderID carrying a real (positive) server UID. It
+// confirms a destination sync actually fetched the server copies of
+// just-moved messages before their temp rows are deleted (re-audit
+// finding R15): the sync inserts the server copy as a new row (Upsert keys
+// on folder_id + uid, and the temp row's negative UID never matches), so
+// the temp and real rows coexist until cleanup. Message-IDs are compared
+// normalized (angle brackets stripped), matching GetIDsByMessageIDs, and
+// are returned normalized. IDs with no real row are absent from the map —
+// the caller must keep those temp rows.
+func (s *Store) ConfirmedRealCopies(folderID string, rfc822MessageIDs []string) (map[string]bool, error) {
+	unique := make(map[string]struct{})
+	for _, mid := range rfc822MessageIDs {
+		if norm := normalizeMessageID(mid); norm != "" {
+			unique[norm] = struct{}{}
+		}
+	}
+	out := make(map[string]bool, len(unique))
+	if len(unique) == 0 {
+		return out, nil
+	}
+
+	placeholders := make([]string, 0, len(unique))
+	args := make([]interface{}, 0, len(unique)+1)
+	args = append(args, folderID)
+	for mid := range unique {
+		placeholders = append(placeholders, "?")
+		args = append(args, mid)
+	}
+
+	rows, err := s.db.Query(fmt.Sprintf(
+		`SELECT DISTINCT REPLACE(REPLACE(message_id, '<', ''), '>', '')
+		 FROM messages
+		 WHERE folder_id = ? AND uid > 0
+		 AND REPLACE(REPLACE(message_id, '<', ''), '>', '') IN (%s)`,
+		strings.Join(placeholders, ", "),
+	), args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check for real copies: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var mid string
+		if err := rows.Scan(&mid); err != nil {
+			return nil, fmt.Errorf("failed to scan real copy: %w", err)
+		}
+		out[mid] = true
+	}
+	return out, rows.Err()
+}
+
+// HasRealCopies reports whether every given RFC822 Message-ID has a row in
+// folderID carrying a real (positive) server UID. An empty list, or any ID
+// with no real row, returns false — the caller must keep the temp rows.
+func (s *Store) HasRealCopies(folderID string, rfc822MessageIDs []string) (bool, error) {
+	confirmed, err := s.ConfirmedRealCopies(folderID, rfc822MessageIDs)
+	if err != nil {
+		return false, err
+	}
+	unique := make(map[string]struct{})
+	for _, mid := range rfc822MessageIDs {
+		if norm := normalizeMessageID(mid); norm != "" {
+			unique[norm] = struct{}{}
+		}
+	}
+	return len(confirmed) == len(unique) && len(unique) > 0, nil
+}
+
+// DeleteTempUIDsForMessageIDs removes the temporary negative-UID rows for
+// the given RFC822 Message-IDs in a folder, leaving temp rows for other
+// in-flight moves untouched. Unlike the folder-wide DeleteTempUIDs it only
+// deletes rows whose server copy has already been confirmed present by
+// HasRealCopies — callers must check first (re-audit finding R15).
+func (s *Store) DeleteTempUIDsForMessageIDs(folderID string, rfc822MessageIDs []string) error {
+	unique := make(map[string]struct{})
+	for _, mid := range rfc822MessageIDs {
+		if norm := normalizeMessageID(mid); norm != "" {
+			unique[norm] = struct{}{}
+		}
+	}
+	if len(unique) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, 0, len(unique))
+	args := make([]interface{}, 0, len(unique)+1)
+	args = append(args, folderID)
+	for mid := range unique {
+		placeholders = append(placeholders, "?")
+		args = append(args, mid)
+	}
+
+	_, err := s.db.Exec(fmt.Sprintf(
+		`DELETE FROM messages
+		 WHERE folder_id = ? AND uid < 0
+		 AND REPLACE(REPLACE(message_id, '<', ''), '>', '') IN (%s)`,
+		strings.Join(placeholders, ", "),
+	), args...)
+	if err != nil {
+		return fmt.Errorf("failed to delete temp UID messages: %w", err)
+	}
+	return nil
+}
+
 // ExpandToFolderCopies returns ids plus the ids of every other row in the same
 // account+folder that shares a non-empty Message-ID with one of them (real
 // server rows only, uid > 0). The viewer merges such copies into one message

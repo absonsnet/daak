@@ -792,9 +792,12 @@ func (v *ViewerApp) syncFlagsToIMAP(messages []*message.Message, folderID, flagT
 
 // moveMessagesToFolder moves messages locally first, then syncs the move to
 // IMAP (COPY + DELETE) in the background. Unlike App.MoveToFolder it does
-// not push an undo command — this process has no undo stack — and it does
-// not sync the destination folder afterwards; the main window's sync
-// reconciles the moved messages on its next pass.
+// not push an undo command — this process has no undo stack — but like it,
+// it then syncs the destination folder and deletes the temp rows only once
+// the real server rows are confirmed there (re-audit finding R15). Without
+// that step a move from a popup left the temp rows behind, so the message
+// appeared twice, and a second move sent a bogus UID MOVE for the
+// placeholder.
 func (v *ViewerApp) moveMessagesToFolder(messageIDs []string, destFolderID string) error {
 	if len(messageIDs) == 0 {
 		return nil
@@ -839,14 +842,48 @@ func (v *ViewerApp) moveMessagesToFolder(messageIDs []string, destFolderID strin
 
 	go func() {
 		defer recoverPanic("viewer.actions", "move messages on IMAP")
+		log := logging.WithComponent("viewer")
+		var movedOK []*message.Message
 		for sourceFolderID, msgs := range byFolder {
 			if err := v.moveMessagesOnIMAP(msgs, sourceFolderID, destFolder); err != nil {
-				log := logging.WithComponent("viewer")
 				log.Error().Err(err).Str("sourceFolderID", sourceFolderID).Str("destFolderID", destFolderID).Msg("Failed to move messages on IMAP")
+				continue
 			}
+			movedOK = append(movedOK, msgs...)
+		}
+		if len(movedOK) == 0 {
+			return
+		}
+		// Sync the destination folder so the moved messages get their
+		// real server UIDs, then delete the temp rows only for the
+		// messages whose server copy the sync confirmed (re-audit
+		// finding R15). A failed sync, or an unconfirmed copy, keeps
+		// the temp rows — and with them the message's local state.
+		// Sources whose IMAP move failed are not cleaned up at all:
+		// their server copy was never made.
+		if _, err := cleanupMovedTempUIDs(v.messageStore, destFolderID, movedOK, func() error {
+			return v.syncDestinationFolder(accountID, destFolderID)
+		}); err != nil {
+			log.Warn().Err(err).Str("destFolderID", destFolderID).Msg("Keeping temp UIDs after move: destination not reconciled")
 		}
 	}()
 	return nil
+}
+
+// syncDestinationFolder runs the header sync for the destination folder —
+// the viewer's minimal equivalent of App.SyncFolder (re-audit finding
+// R15). The viewer process has no debounce/cancel registry, sender
+// rules, or background body fetch; those belong to the main window, which
+// runs its own sync pass anyway. The header sync is what fetches the
+// moved messages' real server UIDs, which is all the post-move cleanup
+// needs. It reuses the viewer's sync engine (constructed in Startup,
+// never started) and the same SyncMessages call App.SyncFolder makes.
+func (v *ViewerApp) syncDestinationFolder(accountID, destFolderID string) error {
+	syncPeriodDays := 30 // default (0 means all messages), as in App.SyncFolder
+	if acc, err := v.accountStore.Get(accountID); err == nil && acc != nil {
+		syncPeriodDays = acc.SyncPeriodDays
+	}
+	return v.syncEngine.SyncMessages(v.ctx, accountID, destFolderID, syncPeriodDays, false)
 }
 
 // moveMessagesOnIMAP copies messages to the destination mailbox and deletes

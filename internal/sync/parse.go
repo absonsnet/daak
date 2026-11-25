@@ -236,8 +236,11 @@ func (e *Engine) parseMultipartBody(mr gomessage.MultipartReader, result *Parsed
 		// they aren't lost; the downloader resolves them by the same Title. Must run
 		// before the disposition=="attachment" branch (winmail.dat has that
 		// disposition). part.Body is already transfer-decoded by go-message.
+		// A signature part named winmail.dat is not a TNEF container, so
+		// the filename disjunct excludes signature types (R16 hardening;
+		// the ms-tnef content type itself can never be a signature part).
 		if contentType == "application/ms-tnef" ||
-			(disposition == "attachment" && strings.EqualFold(dispParams["filename"], "winmail.dat")) {
+			(disposition == "attachment" && !isSignaturePart(contentType) && strings.EqualFold(dispParams["filename"], "winmail.dat")) {
 			// Read maxPartSize+1 so a part landing exactly on the cap is
 			// not misread as truncated (finding 26).
 			raw, _ := io.ReadAll(io.LimitReader(part.Body, maxPartSize+1))
@@ -282,8 +285,13 @@ func (e *Engine) parseMultipartBody(mr gomessage.MultipartReader, result *Parsed
 			continue
 		}
 
-		// Handle file attachments
-		if disposition == "attachment" {
+		// Handle file attachments. Signature parts are not attachments:
+		// when verification fails the signature part stays in the raw
+		// message, and counting it would store a phantom attachment with
+		// no download source (re-audit finding R16). A failed signature
+		// falls through to the text-part walk below, which ignores it
+		// (only text/plain and text/html become body text).
+		if disposition == "attachment" && !isSignaturePart(contentType) {
 			result.HasAttachments = true
 			// If the attachment has a Content-ID, it's meant to be displayed inline in the HTML
 			// (referenced via cid:contentID), even if Content-Disposition says "attachment"
@@ -417,6 +425,16 @@ func (e *Engine) parseSinglePartBody(entity *gomessage.Entity, result *ParsedBod
 	contentID := strings.Trim(entity.Header.Get("Content-ID"), "<>")
 	isNonTextBody := contentType != "" && !strings.HasPrefix(contentType, "text/") &&
 		!isSignaturePart(contentType)
+	// A lone signature part is neither an attachment nor body text:
+	// when verification fails it stays in the raw message, and counting
+	// it would store a phantom attachment with no download source and
+	// set has_attachments, which also excludes the message from
+	// re-fetch (re-audit finding R16). Without this guard the
+	// disposition disjunct below still matched it even though
+	// isNonTextBody already excludes signatures.
+	if isSignaturePart(contentType) {
+		return
+	}
 	if disposition == "attachment" || isNonTextBody {
 		result.HasAttachments = true
 		isInline := disposition == "inline" || contentID != ""
@@ -635,6 +653,15 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 		disposition, _, _ := mime.ParseMediaType(entity.Header.Get("Content-Disposition"))
 		isNonTextBody := contentType != "" && !strings.HasPrefix(contentType, "text/") &&
 			!isSignaturePart(contentType)
+		// A lone signature part is neither an attachment nor body text —
+		// same gap as the modern single-part branch (re-audit finding
+		// R16): the disposition disjunct below matched it even though
+		// isNonTextBody already excludes signatures. The existing
+		// single-part-signature test only covered the no-disposition
+		// case, where isNonTextBody alone saved it.
+		if isSignaturePart(contentType) {
+			return "", "", false, false
+		}
 		if disposition == "attachment" || isNonTextBody {
 			hasAttachments = true
 			return "", "", true, false
