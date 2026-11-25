@@ -829,16 +829,21 @@ func (s *Store) Create(m *Message) error {
 		Uint32("uid", m.UID).
 		Msg("Creating message in store")
 
+	// body_truncated is persisted here (re-audit finding R20): the
+	// server-search path builds the row with a truncated body already
+	// in hand and never issues an UpdateBody for a non-encrypted
+	// message, so dropping the flag here stored a cut-short body as
+	// complete with no banner.
 	query := `
 		INSERT INTO messages (
 			id, account_id, folder_id, uid, message_id, in_reply_to, references_list, thread_id,
 			subject, from_name, from_email, to_list, cc_list, bcc_list, reply_to, date,
 			snippet, is_read, is_starred, is_answered, is_forwarded, is_draft, is_deleted,
-			size, has_attachments, body_text, body_html, body_fetched,
+			size, has_attachments, body_text, body_html, body_fetched, body_truncated,
 			read_receipt_to, read_receipt_handled, received_at,
 			list_unsubscribe, list_unsubscribe_post, category, sub_category,
 			extract_kind, extract_value, extract_rule
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	_, err := s.db.Exec(query,
@@ -849,7 +854,7 @@ func (s *Store) Create(m *Message) error {
 		m.Date, nullString(m.Snippet),
 		m.IsRead, m.IsStarred, m.IsAnswered, m.IsForwarded, m.IsDraft, m.IsDeleted,
 		m.Size, m.HasAttachments,
-		nullString(m.BodyText), nullString(m.BodyHTML), m.BodyFetched,
+		nullString(m.BodyText), nullString(m.BodyHTML), m.BodyFetched, m.BodyTruncated,
 		nullString(m.ReadReceiptTo), m.ReadReceiptHandled,
 		m.ReceivedAt,
 		nullString(m.ListUnsubscribe), m.ListUnsubscribePost,

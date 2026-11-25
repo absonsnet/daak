@@ -608,11 +608,18 @@ func (v *ViewerApp) GetMessageSource(messageID string) (string, error) {
 	if msg == nil {
 		return "", fmt.Errorf("message not found: %s", messageID)
 	}
-	rawBytes, err := v.syncEngine.FetchRawMessage(v.ctx, msg.AccountID, msg.FolderID, msg.UID)
+	rawBytes, truncated, err := v.syncEngine.FetchRawMessageWithTruncation(v.ctx, msg.AccountID, msg.FolderID, msg.UID)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch message source: %w", err)
 	}
-	return string(rawBytes), nil
+	// R20: disclose a source cut at the 50 MB cap (mirrors
+	// App.GetMessageSource) instead of showing a partial source as
+	// if it were whole.
+	source := string(rawBytes)
+	if truncated {
+		source += "\n\n[Daak: message source truncated — only the first 50 MB were fetched from the server.]"
+	}
+	return source, nil
 }
 
 // FetchMessageBody fetches the body for a message on-demand.

@@ -382,7 +382,14 @@ func (e *Engine) FetchServerMessage(ctx context.Context, accountID, folderID str
 			rfc822Size = data.Size
 		case imapclient.FetchItemDataBodySection:
 			if data.Literal != nil {
-				lr := io.LimitReader(data.Literal, maxMessageSize)
+				// Read with a maxMessageSize+1 limit so a message that
+				// lands exactly on the cap is not misread as truncated
+				// (finding 26 / R20): only a read past the cap means
+				// bytes were cut. capRawBytes trims the probe byte and
+				// reports the cut; the flag is carried into the row
+				// below instead of silently storing a partial body as
+				// complete.
+				lr := io.LimitReader(data.Literal, maxMessageSize+1)
 				rawBytes, err = io.ReadAll(lr)
 				if err != nil {
 					e.log.Warn().Err(err).Uint32("uid", uint32(fetchedUID)).Msg("Failed to read body literal")
@@ -405,8 +412,13 @@ func (e *Engine) FetchServerMessage(ctx context.Context, accountID, folderID str
 		return nil, fmt.Errorf("message expunged during fetch (no envelope)")
 	}
 
+	// Trim the +1 probe byte read above and learn whether the BODY[]
+	// literal was cut at the 50 MB cap (R20). The flag travels into
+	// buildMessageFromStreamedData, so the row it creates carries it.
+	rawBytes, literalTruncated := capRawBytes(rawBytes)
+
 	// Build and save message
-	m := e.buildMessageFromStreamedData(accountID, folderID, fetchedUID, envelope, flags, rfc822Size, rawBytes)
+	m := e.buildMessageFromStreamedData(accountID, folderID, fetchedUID, envelope, flags, rfc822Size, rawBytes, literalTruncated)
 	m.BodyFetched = true
 
 	// Create does not store the raw S/MIME/PGP bodies, and an encrypted
@@ -417,8 +429,18 @@ func (e *Engine) FetchServerMessage(ctx context.Context, accountID, folderID str
 	// so a later body pass retries it instead of stranding a permanently
 	// blank row.
 	var parsed *ParsedBody
+	isEncrypted := false
 	if len(rawBytes) > 0 {
 		parsed = e.parseMessageBodyFull(rawBytes, "", 30*time.Second)
+		if parsed != nil && (parsed.SMIMEEncrypted || parsed.PGPEncrypted) {
+			isEncrypted = true
+			// R19: the encrypted payload is the message itself, not an
+			// attachment. The legacy parser no longer flags it, but
+			// clear the flag here too so the row Create below can never
+			// persist a paperclip for it, whatever the legacy parse
+			// reported, and the extractor below is skipped outright.
+			m.HasAttachments = false
+		}
 		if parsed != nil &&
 			((parsed.SMIMEEncrypted && len(parsed.SMIMERawBody) == 0) ||
 				(parsed.PGPEncrypted && len(parsed.PGPRawBody) == 0)) {
@@ -438,6 +460,13 @@ func (e *Engine) FetchServerMessage(ctx context.Context, accountID, folderID str
 		}
 	}
 
+	// The modern parse can flag a per-part truncation the legacy parse
+	// missed; either cut means the stored body is only the first part
+	// of the message (R20). Set it before Create, which now persists it.
+	if parsed != nil && parsed.Truncated {
+		m.BodyTruncated = true
+	}
+
 	if err := e.messageStore.Create(m); err != nil {
 		return nil, fmt.Errorf("failed to save message: %w", err)
 	}
@@ -449,6 +478,10 @@ func (e *Engine) FetchServerMessage(ctx context.Context, accountID, folderID str
 			BodyText:       m.BodyText,
 			Snippet:        m.Snippet,
 			HasAttachments: m.HasAttachments,
+			// R20: carry the truncation flag through this second write —
+			// an unset Truncated here would clear the flag Create just
+			// persisted for an encrypted message cut short.
+			Truncated:      m.BodyTruncated,
 			SMIMERawBody:   parsed.SMIMERawBody,
 			SMIMEEncrypted: parsed.SMIMEEncrypted,
 			PGPRawBody:     parsed.PGPRawBody,
@@ -461,7 +494,9 @@ func (e *Engine) FetchServerMessage(ctx context.Context, accountID, folderID str
 	// Extract and store attachments. Replace, don't append (same class
 	// as the on-demand fetch in fetch.go): a plain Create doubles the
 	// rows if this message's attachments were already stored.
-	if m.HasAttachments && len(rawBytes) > 0 && e.attachmentStore != nil {
+	// R19: never extract for an encrypted message — its parts are the
+	// encrypted payload, not downloadable files.
+	if m.HasAttachments && !isEncrypted && len(rawBytes) > 0 && e.attachmentStore != nil {
 		attachments, err := e.attachExtractor.ExtractAttachments(m.ID, rawBytes)
 		if err != nil {
 			e.log.Debug().Err(err).Str("messageId", m.ID).Msg("Failed to extract attachments")
