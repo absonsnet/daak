@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1289,5 +1290,104 @@ func TestSendMessageReturnsSentSaveError(t *testing.T) {
 	h.sentSaveErr = nil
 	if _, err, sentSaveErr := h.svc.ops.sendMessage(context.Background(), "acc-1", testComposeMessage(), nil); err != nil || sentSaveErr != nil {
 		t.Fatalf("sendMessage with a working save = %v, %v, want nil, nil", err, sentSaveErr)
+	}
+}
+
+// TestQueueReactionConcurrentPicksQueueOnce (fourth-audit finding 13):
+// two reactions picked at the same instant — here, two concurrent
+// QueueReaction calls for the same message — must leave exactly one
+// live reaction row behind, never two that both dispatch.
+func TestQueueReactionConcurrentPicksQueueOnce(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	raw := []byte("From: me@example.com\r\nTo: alice@example.com\r\n\r\nreaction bytes")
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = h.svc.QueueReaction("acc-1",
+				smtp.Address{Name: "Me", Address: "me@example.com"},
+				[]string{"alice@example.com"}, raw, "Re: hello", "alice@example.com", "msg-1")
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("QueueReaction %d: %v", i, err)
+		}
+	}
+	var n int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM send_queue WHERE kind = 'reaction' AND reaction_message_id = 'msg-1' AND status IN ('pending', 'sending')`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("live reaction rows for msg-1 = %d, want 1", n)
+	}
+}
+
+// TestQueueReactionConflictRetryReplacesPending (fourth-audit finding
+// 13): when the unique index rejects an insert because another
+// process queued a reaction for the same message first, the pending
+// row is replaced and the insert retried — the caller never sees a
+// raw database error.
+func TestQueueReactionConflictRetryReplacesPending(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	seed := sendqueue.Item{
+		ID: "other-proc", AccountID: "acc-1", Kind: sendqueue.KindReaction,
+		ReactionMessageID: "msg-1", RawMessage: []byte("old reaction"),
+		Status: sendqueue.StatusPending, MaxAttempts: sendqueue.DefaultMaxAttempts,
+		SendAt: h.now, DueAt: h.now, CreatedAt: h.now,
+	}
+	if err := h.svc.store.Enqueue(seed); err != nil {
+		t.Fatal(err)
+	}
+	replacement := sendqueue.Item{
+		ID: "new-one", AccountID: "acc-1", Kind: sendqueue.KindReaction,
+		ReactionMessageID: "msg-1", RawMessage: []byte("new reaction"),
+		Status: sendqueue.StatusPending, MaxAttempts: sendqueue.DefaultMaxAttempts,
+		SendAt: h.now, DueAt: h.now, CreatedAt: h.now,
+	}
+	if err := h.svc.enqueueReactionWithConflictRetry(replacement, "msg-1"); err != nil {
+		t.Fatalf("conflict retry: %v", err)
+	}
+	got, err := h.svc.store.ActiveReaction("msg-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ID != "new-one" {
+		t.Fatalf("active reaction = %+v, want the replacement row new-one", got)
+	}
+}
+
+// TestQueueReactionConflictRetryRejectsSending: the same conflict
+// against a row already being dispatched is a rejection, not a
+// replace — a reaction in flight cannot be recalled.
+func TestQueueReactionConflictRetryRejectsSending(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	seed := sendqueue.Item{
+		ID: "sending-one", AccountID: "acc-1", Kind: sendqueue.KindReaction,
+		ReactionMessageID: "msg-1", RawMessage: []byte("old reaction"),
+		Status: sendqueue.StatusPending, MaxAttempts: sendqueue.DefaultMaxAttempts,
+		SendAt: h.now, DueAt: h.now, CreatedAt: h.now,
+	}
+	if err := h.svc.store.Enqueue(seed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`UPDATE send_queue SET status = 'sending' WHERE id = 'sending-one'`); err != nil {
+		t.Fatal(err)
+	}
+	replacement := sendqueue.Item{
+		ID: "new-one", AccountID: "acc-1", Kind: sendqueue.KindReaction,
+		ReactionMessageID: "msg-1", RawMessage: []byte("new reaction"),
+		Status: sendqueue.StatusPending, MaxAttempts: sendqueue.DefaultMaxAttempts,
+		SendAt: h.now, DueAt: h.now, CreatedAt: h.now,
+	}
+	err := h.svc.enqueueReactionWithConflictRetry(replacement, "msg-1")
+	if err == nil {
+		t.Fatal("conflict retry against a sending row should fail")
+	}
+	if !strings.Contains(err.Error(), "already being sent") {
+		t.Fatalf("error %q, want 'already being sent'", err)
 	}
 }

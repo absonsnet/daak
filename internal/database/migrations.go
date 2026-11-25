@@ -1648,4 +1648,41 @@ var migrations = []Migration{
 			ALTER TABLE contact_source_addressbooks ADD COLUMN writable INTEGER NOT NULL DEFAULT 1;
 		`,
 	},
+	{
+		Version: 56,
+		SQL: `
+			-- Fourth-audit finding 13: replacing a pending reaction
+			-- is check-then-delete-then-queue, not atomic across
+			-- processes — two windows picking a reaction in the
+			-- same instant could both pass the check and enqueue
+			-- two rows that both dispatch. A partial unique index
+			-- on send_queue (reaction_message_id) for live reaction
+			-- rows makes the guard atomic, mirroring migration 54's
+			-- draft_id index: a concurrent second insert fails the
+			-- constraint, and QueueReaction re-checks and retries
+			-- (replace-if-pending, reject-if-sending) instead of
+			-- surfacing a raw database error. The predicate MUST
+			-- be kind-scoped with a non-empty reaction_message_id:
+			-- ordinary sends carry reaction_message_id '' and must
+			-- never collide. Failed rows are outside the predicate
+			-- on purpose: a failed reaction stays in the Outbox
+			-- for Retry and does not block a new reaction.
+			-- Pre-existing duplicate live rows (queued before this
+			-- fix) would break the index build, so keep only the
+			-- oldest live row per reacted-to message and drop the
+			-- rest first.
+			DELETE FROM send_queue
+			WHERE kind = 'reaction' AND status IN ('pending', 'sending') AND reaction_message_id <> ''
+			  AND EXISTS (
+				SELECT 1 FROM send_queue b
+				WHERE b.kind = 'reaction' AND b.reaction_message_id = send_queue.reaction_message_id
+				  AND b.status IN ('pending', 'sending')
+				  AND (b.created_at < send_queue.created_at
+				    OR (b.created_at = send_queue.created_at AND b.id < send_queue.id))
+			  );
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_send_queue_reaction_active
+				ON send_queue (reaction_message_id)
+				WHERE kind = 'reaction' AND reaction_message_id <> '' AND status IN ('pending', 'sending');
+		`,
+	},
 }
