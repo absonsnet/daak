@@ -118,6 +118,21 @@ func isBodyTruncated(receivedBytes int64, parsedTruncated bool) bool {
 	return parsedTruncated || receivedBytes > maxMessageSize
 }
 
+// capRawBytes trims a BODY[] literal read with a maxMessageSize+1 limit
+// to maxMessageSize and reports whether bytes were cut (re-audit finding
+// R20). A message landing exactly on the cap is not truncated — only a
+// read past the cap means the bytes in hand are only the first part of
+// the message. Shared by the server-search path and the raw-message
+// fetch (view-source), which previously both read with a bare
+// maxMessageSize limit and silently cut over-cap messages with no
+// signal at all.
+func capRawBytes(raw []byte) ([]byte, bool) {
+	if int64(len(raw)) > maxMessageSize {
+		return raw[:maxMessageSize], true
+	}
+	return raw, false
+}
+
 // FetchMessageBody fetches the body for a single message on-demand.
 // Uses streaming fetch internally to avoid blocking on .Collect().
 func (e *Engine) FetchMessageBody(ctx context.Context, accountID, messageID string) (*message.Message, error) {
@@ -1132,35 +1147,46 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 }
 
 // FetchRawMessage fetches the raw RFC822 content of a message from the IMAP server.
-// Uses streaming fetch to avoid blocking on .Collect().
+// Uses streaming fetch internally to avoid blocking on .Collect().
 func (e *Engine) FetchRawMessage(ctx context.Context, accountID, folderID string, uid uint32) ([]byte, error) {
+	raw, _, err := e.FetchRawMessageWithTruncation(ctx, accountID, folderID, uid)
+	return raw, err
+}
+
+// FetchRawMessageWithTruncation is FetchRawMessage plus whether the
+// returned bytes were cut at the 50 MB cap (R20). The literal is read
+// with a maxMessageSize+1 limit and trimmed by capRawBytes, so a message
+// landing exactly on the cap is not misread as truncated. View-source
+// uses this to disclose a cut source; other callers use FetchRawMessage
+// and ignore the flag.
+func (e *Engine) FetchRawMessageWithTruncation(ctx context.Context, accountID, folderID string, uid uint32) ([]byte, bool, error) {
 	// UID 0 is never a real server UID (a just-moved message has no server
 	// UID yet — see GetMessageUIDAndFolder). Refuse rather than issuing a
 	// fetch the server cannot answer.
 	if uid == 0 {
-		return nil, fmt.Errorf("cannot fetch raw message without a server UID")
+		return nil, false, fmt.Errorf("cannot fetch raw message without a server UID")
 	}
 
 	// Get folder path
 	f, err := e.folderStore.Get(folderID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get folder: %w", err)
+		return nil, false, fmt.Errorf("failed to get folder: %w", err)
 	}
 	if f == nil {
-		return nil, fmt.Errorf("folder not found: %s", folderID)
+		return nil, false, fmt.Errorf("folder not found: %s", folderID)
 	}
 
 	// Get a connection from the pool
 	conn, err := e.pool.GetConnection(ctx, accountID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get connection: %w", err)
+		return nil, false, fmt.Errorf("failed to get connection: %w", err)
 	}
 	defer e.pool.Release(conn)
 
 	// Select the mailbox
 	_, err = conn.Client().SelectMailbox(ctx, f.Path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to select mailbox: %w", err)
+		return nil, false, fmt.Errorf("failed to select mailbox: %w", err)
 	}
 
 	// Fetch the raw message
@@ -1184,7 +1210,7 @@ func (e *Engine) FetchRawMessage(ctx context.Context, accountID, folderID string
 	msg := fetchCmd.Next()
 	if msg == nil {
 		fetchCmd.Close()
-		return nil, fmt.Errorf("message not found: UID %d", uid)
+		return nil, false, fmt.Errorf("message not found: UID %d", uid)
 	}
 
 	// Extract body section from streamed message
@@ -1196,11 +1222,11 @@ func (e *Engine) FetchRawMessage(ctx context.Context, accountID, folderID string
 
 		if data, ok := item.(imapclient.FetchItemDataBodySection); ok {
 			if data.Literal != nil {
-				lr := io.LimitReader(data.Literal, maxMessageSize)
+				lr := io.LimitReader(data.Literal, maxMessageSize+1)
 				rawBytes, err = io.ReadAll(lr)
 				if err != nil {
 					fetchCmd.Close()
-					return nil, fmt.Errorf("failed to read message body: %w", err)
+					return nil, false, fmt.Errorf("failed to read message body: %w", err)
 				}
 				break
 			}
@@ -1210,15 +1236,21 @@ func (e *Engine) FetchRawMessage(ctx context.Context, accountID, folderID string
 	fetchCmd.Close()
 
 	if len(rawBytes) == 0 {
-		return nil, fmt.Errorf("message body not found: UID %d", uid)
+		return nil, false, fmt.Errorf("message body not found: UID %d", uid)
 	}
 
-	return rawBytes, nil
+	// Trim the +1 probe byte; the flag says whether the source in hand
+	// is only the first part of the message (R20).
+	rawBytes, truncated := capRawBytes(rawBytes)
+	return rawBytes, truncated, nil
 }
 
 // buildMessageFromStreamedData constructs a Message from streamed IMAP data.
 // Used by FetchServerMessage for server search results.
-func (e *Engine) buildMessageFromStreamedData(accountID, folderID string, uid imap.UID, envelope *imap.Envelope, flags []imap.Flag, rfc822Size int64, rawBytes []byte) *message.Message {
+// literalTruncated reports that the BODY[] literal was cut at the 50 MB
+// cap before parsing (R20); it is OR-ed with the per-part truncation the
+// legacy parser reports, so either cut flags the stored body partial.
+func (e *Engine) buildMessageFromStreamedData(accountID, folderID string, uid imap.UID, envelope *imap.Envelope, flags []imap.Flag, rfc822Size int64, rawBytes []byte, literalTruncated bool) *message.Message {
 	m := &message.Message{
 		AccountID:  accountID,
 		FolderID:   folderID,
@@ -1251,7 +1283,10 @@ func (e *Engine) buildMessageFromStreamedData(accountID, folderID string, uid im
 		bodyText, bodyHTML, hasAttachments, truncated := e.parseMessageBody(rawBytes)
 		m.BodyText = bodyText
 		m.HasAttachments = hasAttachments
-		m.BodyTruncated = truncated
+		// Truncation is the OR of the per-part cap (legacy parse) and
+		// the whole-message literal cap (R20): either cut means the
+		// stored body is only the first part of the message.
+		m.BodyTruncated = truncated || literalTruncated
 
 		// Sanitize HTML
 		if bodyHTML != "" {

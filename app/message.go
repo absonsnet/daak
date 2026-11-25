@@ -47,12 +47,21 @@ func (a *App) GetMessageSource(messageID string) (string, error) {
 	}
 
 	// Fetch raw message from IMAP
-	rawBytes, err := a.syncEngine.FetchRawMessage(a.ctx, msg.AccountID, msg.FolderID, msg.UID)
+	rawBytes, truncated, err := a.syncEngine.FetchRawMessageWithTruncation(a.ctx, msg.AccountID, msg.FolderID, msg.UID)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch message source: %w", err)
 	}
 
-	return string(rawBytes), nil
+	// R20: a source cut at the 50 MB cap must say so — otherwise the
+	// panel shows a partial message as if it were the whole source.
+	// The note is appended as a clearly delimited trailer so the raw
+	// bytes above it stay verbatim.
+	source := string(rawBytes)
+	if truncated {
+		// "50 MB" mirrors the sync engine's maxMessageSize cap.
+		source += "\n\n[Daak: message source truncated — only the first 50 MB were fetched from the server.]"
+	}
+	return source, nil
 }
 
 // FetchMessageBody fetches the body for a message on-demand.
