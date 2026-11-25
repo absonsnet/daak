@@ -168,3 +168,117 @@ func TestParseMessageBody_SinglePartSignatureNotAttachment(t *testing.T) {
 		t.Fatalf("hasAttachments = true, want false for single-part signature")
 	}
 }
+
+// Re-audit finding R16: the modern parser (parseMessageBodyInternal) never
+// called isSignaturePart at two attachment-classification sites, so a
+// signed message whose signature fails verification — the S/MIME or PGP
+// verifier leaves the wrapper in place, so the signature part is walked
+// as an ordinary part — was stored with a phantom attachment (the
+// signature itself, with no download source) and has_attachments = 1,
+// which also excluded it from re-fetch. testEngine has no verifiers, so
+// these raws exercise exactly that failed/unverified path.
+
+func signedMultipartRaw(t *testing.T, sigType, extraPart string) string {
+	t.Helper()
+	raw := "From: a@example.com\r\n" +
+		"To: b@example.com\r\n" +
+		"Subject: Signed\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/signed; boundary=\"SIG\"; protocol=\"" + sigType + "\"\r\n" +
+		"\r\n" +
+		"--SIG\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"Signed body\r\n" +
+		"--SIG\r\n" +
+		"Content-Type: " + sigType + "; name=\"signature\"\r\n" +
+		"Content-Disposition: attachment; filename=\"signature\"\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"AAECAwQFBgc=\r\n" +
+		extraPart +
+		"--SIG--\r\n"
+	return raw
+}
+
+func TestParseMessageBodyInternal_SignedMultipartFailedVerificationNoAttachments(t *testing.T) {
+	for _, sigType := range []string{"application/pkcs7-signature", "application/pgp-signature"} {
+		parsed := testEngine().parseMessageBodyInternal([]byte(signedMultipartRaw(t, sigType, "")), "msg-1")
+		if len(parsed.Attachments) != 0 {
+			t.Fatalf("[%s] attachments = %d, want 0 (signature part is not an attachment)", sigType, len(parsed.Attachments))
+		}
+		if parsed.HasAttachments {
+			t.Fatalf("[%s] HasAttachments = true, want false", sigType)
+		}
+		if !strings.Contains(parsed.BodyText, "Signed body") {
+			t.Fatalf("[%s] BodyText = %q, want it to contain the signed text", sigType, parsed.BodyText)
+		}
+	}
+}
+
+// A signed message that also carries a real attachment still counts
+// exactly that one file — the fix must exclude signatures, not everything
+// in a multipart/signed message.
+func TestParseMessageBodyInternal_SignedMultipartRealAttachmentStillCounted(t *testing.T) {
+	extra := "--SIG\r\n" +
+		"Content-Type: application/pdf; name=\"doc.pdf\"\r\n" +
+		"Content-Disposition: attachment; filename=\"doc.pdf\"\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"JVBERi0xLjQK\r\n"
+	parsed := testEngine().parseMessageBodyInternal([]byte(signedMultipartRaw(t, "application/pkcs7-signature", extra)), "msg-1")
+	if len(parsed.Attachments) != 1 {
+		t.Fatalf("attachments = %d, want 1 (only the real PDF)", len(parsed.Attachments))
+	}
+	if parsed.Attachments[0].Filename != "doc.pdf" {
+		t.Fatalf("attachment filename = %q, want %q", parsed.Attachments[0].Filename, "doc.pdf")
+	}
+	if !parsed.HasAttachments {
+		t.Fatalf("HasAttachments = false, want true for the real attachment")
+	}
+}
+
+// Modern single-part branch: a lone signature part with an explicit
+// attachment disposition is neither an attachment nor body text.
+func TestParseMessageBodyInternal_SinglePartSignatureNotAttachment(t *testing.T) {
+	raw := "From: a@example.com\r\n" +
+		"To: b@example.com\r\n" +
+		"Subject: Sig\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: application/pgp-signature; name=\"signature.asc\"\r\n" +
+		"Content-Disposition: attachment; filename=\"signature.asc\"\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"AAECAwQFBgc=\r\n"
+
+	parsed := testEngine().parseMessageBodyInternal([]byte(raw), "msg-1")
+	if len(parsed.Attachments) != 0 {
+		t.Fatalf("attachments = %d, want 0", len(parsed.Attachments))
+	}
+	if parsed.HasAttachments {
+		t.Fatalf("HasAttachments = true, want false for single-part signature")
+	}
+	if parsed.BodyText != "" {
+		t.Fatalf("BodyText = %q, want empty (signature bytes are not body text)", parsed.BodyText)
+	}
+}
+
+// Legacy single-part branch, same gap: the pre-existing test only covered
+// the no-disposition case, where isNonTextBody alone saved it. With an
+// explicit attachment disposition the signature was counted.
+func TestParseMessageBody_SinglePartSignatureWithDispositionNotAttachment(t *testing.T) {
+	raw := "From: a@example.com\r\n" +
+		"To: b@example.com\r\n" +
+		"Subject: Sig\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: application/pkcs7-signature; name=\"smime.p7s\"\r\n" +
+		"Content-Disposition: attachment; filename=\"smime.p7s\"\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"AAECAwQFBgc=\r\n"
+
+	_, _, hasAttachments, _ := testEngine().parseMessageBody([]byte(raw))
+	if hasAttachments {
+		t.Fatalf("hasAttachments = true, want false for single-part signature with attachment disposition")
+	}
+}
