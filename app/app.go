@@ -233,6 +233,12 @@ type App struct {
 	// Credentials (keyring with fallback)
 	credStore *credentials.Store
 
+	// saveContactSourceTokensOverride, when non-nil, replaces the
+	// credential store write in getValidContactSourceOAuthToken. Nil in
+	// production; tests set it to inject a token-save failure
+	// (audit finding R12).
+	saveContactSourceTokensOverride func(sourceID string, tokens *credentials.OAuthTokens) error
+
 	// Certificate trust store (TOFU)
 	certStore *certificate.Store
 
@@ -1482,8 +1488,27 @@ func (a *App) getValidContactSourceOAuthToken(sourceID string) (string, error) {
 			tokens.RefreshToken = newTokenResp.RefreshToken
 		}
 
-		if err := a.credStore.SetContactSourceOAuthTokens(sourceID, tokens); err != nil {
-			log.Warn().Err(err).Msg("Failed to save refreshed contact source OAuth tokens")
+		// Persist the refreshed tokens (audit finding R12): same poison
+		// as the mail path in composeOps.getValidOAuthToken — the provider
+		// has already rotated the refresh token, so a swallowed save
+		// failure leaves the revoked token in storage and the next
+		// refresh fails invalid_grant. Retry, then fail loudly with the
+		// distinct tokens-save-failed event (not a re-auth prompt: the
+		// grant is fine).
+		saveTokens := func() error { return a.credStore.SetContactSourceOAuthTokens(sourceID, tokens) }
+		if a.saveContactSourceTokensOverride != nil {
+			saveTokens = func() error { return a.saveContactSourceTokensOverride(sourceID, tokens) }
+		}
+		if err := saveRefreshedTokensWithRetry(saveTokens); err != nil {
+			log.Error().Err(err).
+				Str("source_id", sourceID).
+				Msg("Failed to save refreshed contact source OAuth tokens after retries")
+			emitOAuthEvent(a.ctx, "oauth:tokens-save-failed", map[string]interface{}{
+				"sourceId": sourceID,
+				"provider": tokens.Provider,
+				"error":    err.Error(),
+			})
+			return "", fmt.Errorf("contact source OAuth tokens refreshed but could not be saved: %w (sign-in is still valid — retry, and re-authorize only if asked)", err)
 		}
 
 		log.Info().
