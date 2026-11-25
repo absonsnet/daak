@@ -20,6 +20,8 @@
   import { toasts } from '$lib/stores/toast'
   import { Button } from '$lib/components/ui/button'
   import { Input } from '$lib/components/ui/input'
+  import { Label } from '$lib/components/ui/label'
+  import Switch from '$lib/components/ui/switch/Switch.svelte'
   import {
     MailMerge_CancelQueuedItem,
     MailMerge_CancelQueuedRun,
@@ -49,12 +51,13 @@
 
   let items = $state<MailMergeQueuedItem[]>([])
   let stats = $state<MailMergeQueueStats | null>(null)
-  let config = $state<MailMergeQueueConfig>({ perHour: 100, paused: false })
+  let config = $state<MailMergeQueueConfig>({ perHour: 100, paused: false, countNormalSends: false })
   let runs = $state<MailMergeRunSummary[]>([])
   let loading = $state(true)
   let loadError = $state('')
   let actionBusy = $state('')
   let perHourDraft = $state(100)
+  let countNormalSendsDraft = $state(false)
   let pollTimer: ReturnType<typeof setInterval> | null = null
 
   const queuedItems = $derived(items.filter((i) => i.status === 'queued' || i.status === 'sending'))
@@ -95,8 +98,9 @@
       ])
       items = normalizeQueueItems((queue as MailMergeQueuedItem[]) || [])
       stats = normalizeQueueStats(st as MailMergeQueueStats)
-      config = (cfg as MailMergeQueueConfig) || { perHour: 100, paused: false }
+      config = (cfg as MailMergeQueueConfig) || { perHour: 100, paused: false, countNormalSends: false }
       perHourDraft = config.perHour
+      countNormalSendsDraft = config.countNormalSends ?? false
       runs = (runList as MailMergeRunSummary[]) || []
       loadError = ''
     } catch (err) {
@@ -165,7 +169,7 @@
       toasts.error('The per-hour limit must be at least 1.')
       return
     }
-    await runAction('save-config', () => MailMerge_SaveQueueConfig({ perHour: perHourDraft, paused: config.paused }))
+    await runAction('save-config', () => MailMerge_SaveQueueConfig({ perHour: perHourDraft, paused: config.paused, countNormalSends: countNormalSendsDraft }))
   }
 
   function itemsForRun(runId: string): MailMergeQueuedItem[] {
@@ -235,10 +239,27 @@
             {actionBusy === 'send-unsent' ? 'Sending…' : 'Send unsent now'}
           </Button>
         </div>
+        <div class="flex flex-wrap items-center gap-3 pt-1">
+          <Switch id="mm-queue-count-normal" bind:checked={countNormalSendsDraft} />
+          <Label for="mm-queue-count-normal" class="text-sm">
+            Count ordinary emails I send toward this hourly limit too
+          </Label>
+        </div>
         <p class="text-xs text-muted-foreground">
           Pausing stops the automatic hourly dispatch only — Send Unsent still sends on demand. The per-hour limit is
           shared across all runs: once it is reached, the next batch goes out when the oldest send in the window is over
           an hour old.
+        </p>
+        <p class="text-xs text-muted-foreground">
+          {#if countNormalSendsDraft}
+            With the toggle on, ordinary emails sent from the composer (through the Outbox) count toward the same hourly
+            limit as Mail Merge mail, so a busy hour of ordinary sending can hold back the next merge batch. Reactions
+            never count. Save the limit to apply the change.
+          {:else}
+            With the toggle off, the limit counts Mail Merge mail only — ordinary emails sent from the composer do not
+            count toward it, and Mail Merge's own direct sends do count (they are Mail Merge mail). Reactions never
+            count. Save the limit to apply the change.
+          {/if}
         </p>
       </section>
 

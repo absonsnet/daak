@@ -133,6 +133,21 @@ type sendQueueService struct {
 	// local reaction record (the pill); a normal send has no
 	// reaction to remove. Nil-safe: the detached composer passes none.
 	onUndo func(item sendqueue.Item)
+
+	// onNormalSendAccepted runs at SMTP-accept time for a normal
+	// (KindMessage) send dispatched by this worker — inside the
+	// afterSMTP hook in sendOne, the moment the server accepts the
+	// mail. The App sets it to record the send toward the Mail
+	// Merge hourly budget when that opt-in is on (re-audit R27).
+	// Best-effort by design: it has no error return, sendOne
+	// recovers a panic from it, and a failure inside it can never
+	// fail the send. It is NEVER called for reactions
+	// (sendReactionItem does not use it): reactions are tiny
+	// user-initiated messages, not bulk mail, and counting them
+	// could block a Mail Merge run because the user reacted to
+	// emails. Nil-safe: tests and the detached composer (which
+	// never runs a worker) pass none.
+	onNormalSendAccepted func(sentAt time.Time)
 }
 
 func (s *sendQueueService) clock() time.Time {
@@ -824,6 +839,25 @@ func (s *sendQueueService) sendOne(item sendqueue.Item, now time.Time) bool {
 				log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Message accepted by SMTP but failed to delete or mark sent")
 			}
 		}
+		// Counted toward the Mail Merge hourly budget when the
+		// opt-in is on (re-audit R27): the bridge method itself
+		// no-ops when the opt-in is off or the extension is
+		// disabled, and the App's hook drops its error — the mail
+		// is already out, so a count write can never fail a send.
+		// A panic inside the hook is recovered here so it cannot
+		// lose the post-send bookkeeping; the send still succeeds
+		// either way. Reactions never reach this hook
+		// (sendReactionItem has no such call).
+		if s.onNormalSendAccepted != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Warn().Interface("panic", r).Str("queue_id", item.ID).Msg("Normal-send budget hook panicked; send still succeeded")
+					}
+				}()
+				s.onNormalSendAccepted(now)
+			}()
+		}
 	}
 	if _, err, sentSaveErr := s.ops.sendMessageWithHook(s.ctx, full.AccountID, msg, d, markAccepted); err != nil {
 		s.recordFailure(*full, now, err)
@@ -1172,6 +1206,19 @@ func (a *App) newSendQueueService() *sendQueueService {
 				return "", fmt.Errorf("save draft returned no draft")
 			}
 			return res.Draft.ID, nil
+		},
+		// Count a dispatched normal send toward the Mail Merge
+		// hourly budget when the R27 opt-in is on. The bridge
+		// method no-ops when the opt-in is off or the extension is
+		// disabled, and its error is dropped on purpose: the mail
+		// is already accepted by SMTP, so a count write can never
+		// fail a send. The detached composer never runs a worker,
+		// so its service (newComposerSendQueueService) sets no
+		// hook — the main process's worker is the single recorder.
+		onNormalSendAccepted: func(sentAt time.Time) {
+			if a.MailMergeBridge != nil {
+				_ = a.MailMergeBridge.MailMerge_RecordNormalSend(sentAt)
+			}
 		},
 	}
 }

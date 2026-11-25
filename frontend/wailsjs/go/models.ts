@@ -1937,6 +1937,7 @@ export namespace backend {
 	export class QueueConfig {
 	    perHour: number;
 	    paused: boolean;
+	    countNormalSends: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new QueueConfig(source);
@@ -1946,6 +1947,7 @@ export namespace backend {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.perHour = source["perHour"];
 	        this.paused = source["paused"];
+	        this.countNormalSends = source["countNormalSends"];
 	    }
 	}
 	export class QueueRunStats {
@@ -4681,3 +4683,19 @@ export namespace v1 {
 
 }
 
+export namespace time {
+
+	export class Time {
+
+
+	    static createFrom(source: any = {}) {
+	        return new Time(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+
+	    }
+	}
+
+}

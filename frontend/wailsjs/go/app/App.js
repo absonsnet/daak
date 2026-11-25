@@ -1166,6 +1166,10 @@ export function MailMerge_Preview(arg1, arg2, arg3) {
   return window['go']['app']['App']['MailMerge_Preview'](arg1, arg2, arg3);
 }
 
+export function MailMerge_RecordNormalSend(arg1) {
+  return window['go']['app']['App']['MailMerge_RecordNormalSend'](arg1);
+}
+
 export function MailMerge_ResumeQueue() {
   return window['go']['app']['App']['MailMerge_ResumeQueue']();
 }
