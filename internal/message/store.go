@@ -1286,6 +1286,27 @@ func (s *Store) ExistsInFolder(messageID string, folderType string, accountID st
 	return count > 0, nil
 }
 
+// ExistsByUIDInFolderType is the UID twin of ExistsInFolder: it reports
+// whether a message with this UID exists in a folder of the given type
+// for the account. Used by the Gmail Trash/Spam delete guard
+// (fourth-audit finding 59) for messages with no Message-ID header —
+// the Message-ID check cannot match those at all, so without this the
+// guard was skipped and a Trash/Spam-hidden message was deleted
+// locally. UID + account is unique per folder in Gmail's IMAP view,
+// and the folder-type join keeps the match to the Trash/Spam label.
+func (s *Store) ExistsByUIDInFolderType(uid uint32, folderType string, accountID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM messages m
+		JOIN folders f ON m.folder_id = f.id
+		WHERE m.uid = ? AND f.folder_type = ? AND m.account_id = ?
+	`, uid, folderType, accountID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to check message UID in folder type: %w", err)
+	}
+	return count > 0, nil
+}
+
 // HasCopiesInOtherFolders checks if a message with the same RFC 822 Message-ID
 // exists in any other folder (excluding the specified folder) for the account.
 // Used by Gmail-aware permanent delete to avoid destroying the underlying message

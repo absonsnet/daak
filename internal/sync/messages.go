@@ -430,9 +430,20 @@ func (e *Engine) SyncMessages(ctx context.Context, accountID, folderID string, s
 		// the message isn't truly deleted. Skip local deletion to preserve it.
 		if isGmail {
 			msg, msgErr := e.messageStore.GetByUID(folderID, uid)
-			if msgErr == nil && msg != nil && msg.MessageID != "" {
-				inTrash, _ := e.messageStore.ExistsInFolder(msg.MessageID, string(folder.TypeTrash), accountID)
-				inSpam, _ := e.messageStore.ExistsInFolder(msg.MessageID, string(folder.TypeSpam), accountID)
+			if msgErr == nil && msg != nil {
+				var inTrash, inSpam bool
+				if msg.MessageID != "" {
+					inTrash, _ = e.messageStore.ExistsInFolder(msg.MessageID, string(folder.TypeTrash), accountID)
+					inSpam, _ = e.messageStore.ExistsInFolder(msg.MessageID, string(folder.TypeSpam), accountID)
+				} else {
+					// No Message-ID header: the Message-ID check
+					// cannot match anything, so fall back to
+					// UID + account (fourth-audit finding 59).
+					// Skipping the guard here used to delete a
+					// Trash/Spam-hidden message locally.
+					inTrash, _ = e.messageStore.ExistsByUIDInFolderType(uid, string(folder.TypeTrash), accountID)
+					inSpam, _ = e.messageStore.ExistsByUIDInFolderType(uid, string(folder.TypeSpam), accountID)
+				}
 				if inTrash || inSpam {
 					e.log.Debug().Uint32("uid", uid).Str("messageID", msg.MessageID).
 						Msg("Gmail: skipping local delete — message hidden by Trash/Spam label")
