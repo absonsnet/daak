@@ -387,7 +387,11 @@ func addExdateProp(props ical.Props, instanceTimeUnix int64) {
 
 // PushInstance for CalDAV — composes the new VCALENDAR resource(s) and
 // PUTs them. For scope=this: one PUT to master.Href. For
-// scope=this-and-future + update: two PUTs (clamped master + new series).
+// scope=this-and-future + update: two PUTs (new series + clamped master).
+// Create-first ordering: the new series is PUT before the clamped
+// master, so a failed master PUT cannot leave future meetings already
+// deleted on the server; if it fails, the new series resource is
+// deleted again (best-effort rollback).
 //
 // Master PUT uses If-Match: master.ETag for optimistic concurrency.
 // New-series PUT uses If-None-Match: * (create-only). 412 → ErrConflict;
@@ -410,20 +414,14 @@ func (p caldavProvider) PushInstance(ctx context.Context, src Source, cal Calend
 		return PushInstanceResult{}, err
 	}
 
-	// PUT the new master blob to master.Href.
-	masterHref, err := absoluteHref(src.URL, payload.Master.Href)
-	if err != nil {
-		return PushInstanceResult{}, fmt.Errorf("resolve master href: %w", err)
-	}
-	masterETag, err := caldavPut(ctx, httpClient, masterHref, composed.MasterBlob, payload.Master.ETag, false)
-	if err != nil {
-		return PushInstanceResult{}, err
-	}
+	var result PushInstanceResult
+	// pushErr tracks whether this call is failing: the deferred
+	// rollback above deletes the just-created series resource when
+	// set, and does nothing on success.
+	var pushErr error
 
-	result := PushInstanceResult{MasterNewETag: masterETag}
-
+	// PUT the new series FIRST (this-and-future + update only).
 	if composed.NewSeries != nil {
-		// PUT the new series to a fresh resource URL.
 		newHref := joinHref(cal.URL, composed.NewSeries.UID+".ics")
 		newHrefAbs, err := absoluteHref(src.URL, newHref)
 		if err != nil {
@@ -438,9 +436,47 @@ func (p caldavProvider) PushInstance(ctx context.Context, src Source, cal Calend
 			ETag: newETag,
 			Href: newHref, // store the relative form locally — same as sync does
 		}
+		// If the master PUT below fails, roll the new series back so
+		// the split does not half-land on the server. pushErr is set
+		// on every failure path after this point.
+		defer func() {
+			if pushErr != nil {
+				_ = caldavDelete(ctx, httpClient, newHrefAbs)
+			}
+		}()
 	}
 
+	// PUT the new master blob to master.Href.
+	masterHref, err := absoluteHref(src.URL, payload.Master.Href)
+	if err != nil {
+		pushErr = err
+		return PushInstanceResult{}, fmt.Errorf("resolve master href: %w", err)
+	}
+	masterETag, err := caldavPut(ctx, httpClient, masterHref, composed.MasterBlob, payload.Master.ETag, false)
+	if err != nil {
+		pushErr = err
+		return PushInstanceResult{}, err
+	}
+	result.MasterNewETag = masterETag
+
 	return result, nil
+}
+
+// caldavDelete issues an unconditional DELETE for a resource created by
+// this call (rollback for a half-landed split). Errors are swallowed by
+// the caller: the orphaned resource is visible on the server and the
+// next sync surfaces it.
+func caldavDelete(ctx context.Context, client webdav.HTTPClient, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.Body.Close()
 }
 
 // caldavPut issues a PUT with optional If-Match (for updates) or

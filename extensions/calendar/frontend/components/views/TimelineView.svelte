@@ -312,7 +312,7 @@
   // --- Click handlers ---------------------------------------------------------
 
   function onEventClick(inst: backend.EventInstance) {
-    calendarView.selectEvent(inst.id)
+    calendarView.selectEvent(inst.id, inst.instanceStartUnix, inst.instanceEndUnix)
   }
 
   // --- Click empty timeslot → open composer at 15-min snapped slot ------------

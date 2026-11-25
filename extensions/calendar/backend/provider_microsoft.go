@@ -901,6 +901,47 @@ func (p microsoftProvider) pushThis(ctx context.Context, client *http.Client, ca
 }
 
 func (p microsoftProvider) pushThisAndFuture(ctx context.Context, client *http.Client, cal Calendar, payload PushInstancePayload) (PushInstanceResult, error) {
+	var result PushInstanceResult
+
+	if payload.Kind == InstanceOpUpdate {
+		// POST the new series FIRST (create-first ordering — see
+		// googleProvider.pushThisAndFuture): a failed clamp must
+		// never leave future meetings already deleted on the server.
+		newUID := uuid.NewString() + "@daak-microsoft"
+		newICS, serr := serializeVEVENT(newUID, payload.In)
+		if serr != nil {
+			return PushInstanceResult{}, fmt.Errorf("serialize new series: %w", serr)
+		}
+		newBody, terr := translateICSToGraphEvent(newICS)
+		if terr != nil {
+			return PushInstanceResult{}, fmt.Errorf("translate new series: %w", terr)
+		}
+		newPayload, _ := json.Marshal(newBody)
+
+		newURL := microsoftGraphBase + "/me/calendars/" + url.PathEscape(cal.URL) + "/events"
+		nreq, _ := http.NewRequestWithContext(ctx, http.MethodPost, newURL, bytes.NewReader(newPayload))
+		nreq.Header.Set("Content-Type", "application/json")
+		nresp, nerr := doGraphRequest(ctx, client, nreq)
+		if nerr != nil {
+			return PushInstanceResult{}, fmt.Errorf("graph post new series: %w", nerr)
+		}
+		defer nresp.Body.Close()
+		if nresp.StatusCode != http.StatusOK && nresp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(io.LimitReader(nresp.Body, 4096))
+			return PushInstanceResult{}, fmt.Errorf("graph post new series %d %s: %s",
+				nresp.StatusCode, nresp.Status, strings.TrimSpace(string(body)))
+		}
+		var nout graphEvent
+		if derr := json.NewDecoder(nresp.Body).Decode(&nout); derr != nil {
+			return PushInstanceResult{}, fmt.Errorf("decode new series response: %w", derr)
+		}
+		result.NewSeries = &NewSeriesIdentifiers{
+			UID:             nout.ICalUID,
+			ETag:            nout.ETag,
+			ProviderEventID: nout.ID,
+		}
+	}
+
 	// PATCH master with recurrence.range.endDate clamped.
 	endDate := time.Unix(payload.InstanceTimeUnix-86400, 0).UTC().Format("2006-01-02")
 	masterPatch := graphEvent{
@@ -925,6 +966,7 @@ func (p microsoftProvider) pushThisAndFuture(ctx context.Context, client *http.C
 	}
 	mresp, merr := doGraphRequest(ctx, client, mreq)
 	if merr != nil {
+		p.rollbackNewSeries(ctx, client, result.NewSeries)
 		return PushInstanceResult{}, fmt.Errorf("graph patch master: %w", merr)
 	}
 	defer mresp.Body.Close()
@@ -932,57 +974,38 @@ func (p microsoftProvider) pushThisAndFuture(ctx context.Context, client *http.C
 	case http.StatusOK:
 		// continue
 	case http.StatusPreconditionFailed:
+		p.rollbackNewSeries(ctx, client, result.NewSeries)
 		return PushInstanceResult{}, ErrConflict
 	default:
 		body, _ := io.ReadAll(io.LimitReader(mresp.Body, 4096))
+		p.rollbackNewSeries(ctx, client, result.NewSeries)
 		return PushInstanceResult{}, fmt.Errorf("graph patch master %d %s: %s",
 			mresp.StatusCode, mresp.Status, strings.TrimSpace(string(body)))
 	}
 	var mout graphEvent
 	if derr := json.NewDecoder(mresp.Body).Decode(&mout); derr != nil {
+		p.rollbackNewSeries(ctx, client, result.NewSeries)
 		return PushInstanceResult{}, fmt.Errorf("decode master patch response: %w", derr)
 	}
-	result := PushInstanceResult{MasterNewETag: mout.ETag}
-
-	if payload.Kind == InstanceOpDelete {
-		return result, nil
-	}
-
-	// POST new event with the new series.
-	newUID := uuid.NewString() + "@daak-microsoft"
-	newICS, serr := serializeVEVENT(newUID, payload.In)
-	if serr != nil {
-		return PushInstanceResult{}, fmt.Errorf("serialize new series: %w", serr)
-	}
-	newBody, terr := translateICSToGraphEvent(newICS)
-	if terr != nil {
-		return PushInstanceResult{}, fmt.Errorf("translate new series: %w", terr)
-	}
-	newPayload, _ := json.Marshal(newBody)
-
-	newURL := microsoftGraphBase + "/me/calendars/" + url.PathEscape(cal.URL) + "/events"
-	nreq, _ := http.NewRequestWithContext(ctx, http.MethodPost, newURL, bytes.NewReader(newPayload))
-	nreq.Header.Set("Content-Type", "application/json")
-	nresp, nerr := doGraphRequest(ctx, client, nreq)
-	if nerr != nil {
-		return PushInstanceResult{}, fmt.Errorf("graph post new series: %w", nerr)
-	}
-	defer nresp.Body.Close()
-	if nresp.StatusCode != http.StatusOK && nresp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(io.LimitReader(nresp.Body, 4096))
-		return PushInstanceResult{}, fmt.Errorf("graph post new series %d %s: %s",
-			nresp.StatusCode, nresp.Status, strings.TrimSpace(string(body)))
-	}
-	var nout graphEvent
-	if derr := json.NewDecoder(nresp.Body).Decode(&nout); derr != nil {
-		return PushInstanceResult{}, fmt.Errorf("decode new series response: %w", derr)
-	}
-	result.NewSeries = &NewSeriesIdentifiers{
-		UID:             nout.ICalUID,
-		ETag:            nout.ETag,
-		ProviderEventID: nout.ID,
-	}
+	result.MasterNewETag = mout.ETag
 	return result, nil
+}
+
+// rollbackNewSeries deletes a new series created by pushThisAndFuture
+// when the master clamp that was meant to follow it failed. Best
+// effort — see googleProvider.rollbackNewSeries.
+func (p microsoftProvider) rollbackNewSeries(ctx context.Context, client *http.Client, series *NewSeriesIdentifiers) {
+	if series == nil || series.ProviderEventID == "" {
+		return
+	}
+	u := microsoftGraphBase + "/me/events/" + url.PathEscape(series.ProviderEventID)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	resp, err := doGraphRequest(ctx, client, req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 }
 
 func (p microsoftProvider) findInstanceID(ctx context.Context, client *http.Client, masterEventID string, instanceTimeUnix int64) (string, error) {

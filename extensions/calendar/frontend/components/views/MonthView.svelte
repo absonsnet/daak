@@ -189,7 +189,7 @@
   }
 
   function onEventClick(inst: backend.EventInstance) {
-    calendarView.selectEvent(inst.id)
+    calendarView.selectEvent(inst.id, inst.instanceStartUnix, inst.instanceEndUnix)
   }
 
   const noSources = $derived(calendarSources.sources.length === 0)

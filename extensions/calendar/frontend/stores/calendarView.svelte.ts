@@ -17,6 +17,13 @@ let viewKind = $state<ViewKind>('month')
 let anchorDate = $state<Date>(startOfMonth(new Date()))
 let selectedEventId = $state<string | null>(null)
 let eventFocusMode = $state<'off' | 'event'>('off')
+// The selected occurrence's start/end (unix seconds). EventInstance rows
+// share the master's id, so the id alone cannot say WHICH occurrence the
+// user picked — and scoped edit/delete must target that occurrence, not
+// the master's first one. Views pass the instance times at select time;
+// 0 means "no occurrence" (search results, non-recurring events).
+let selectedInstanceStartUnix = $state(0)
+let selectedInstanceEndUnix = $state(0)
 
 // Centralized create-mode composer state. Trigger sites (the "+ Event"
 // button in ViewSwitcher, empty-slot click in TimelineView, and the
@@ -114,8 +121,10 @@ function goToday() {
   anchorDate = startOfDay(new Date())
 }
 
-function selectEvent(id: string | null) {
+function selectEvent(id: string | null, instanceStartUnix = 0, instanceEndUnix = 0) {
   selectedEventId = id
+  selectedInstanceStartUnix = instanceStartUnix
+  selectedInstanceEndUnix = instanceEndUnix
   eventFocusMode = 'off'
 }
 
@@ -183,6 +192,8 @@ export const calendarView = {
   get viewKind() { return viewKind },
   get anchorDate() { return anchorDate },
   get selectedEventId() { return selectedEventId },
+  get selectedInstanceStartUnix() { return selectedInstanceStartUnix },
+  get selectedInstanceEndUnix() { return selectedInstanceEndUnix },
   get eventFocusMode() { return eventFocusMode },
   get visibleRange() { return visibleRange },
   // Getter+setter so consumers can `bind:open={calendarView.composerOpen}`.

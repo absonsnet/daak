@@ -95,8 +95,18 @@ type ReminderSpec struct {
 type EventCreateInput = EventInput
 
 // EventUpdateInput is EventInput + target event ID.
+//
+// OriginalInstanceTimeUnix is the DTSTART of the occurrence being edited
+// (unix seconds, UTC) — the occurrence's identity. It MUST differ from
+// DTStartUnix when the edit moves the occurrence: DTStartUnix is the NEW
+// start, and using it as the instance identity (RECURRENCE-ID, split
+// point, provider instance lookup) would hit the wrong occurrence or
+// silently do nothing. Zero means "not supplied" — the API falls back
+// to DTStartUnix for callers that predate the field (e.g. whole-series
+// drags, which use scope=all and never need it).
 type EventUpdateInput struct {
-	EventID string `json:"eventId"`
+	EventID                  string `json:"eventId"`
+	OriginalInstanceTimeUnix int64  `json:"originalInstanceTimeUnix,omitempty"`
 	EventInput
 }
 
@@ -289,11 +299,22 @@ func (a *API) UpdateEvent(in EventUpdateInput, scope EditScope) error {
 
 	switch scope {
 	case EditScopeThis:
-		return a.updateInstance(*src, *cal, *master, in.EventInput, InstanceOpUpdate, EditScopeThis)
+		return a.updateInstance(*src, *cal, *master, in.EventInput, resolveInstanceUnix(in), InstanceOpUpdate, EditScopeThis)
 	case EditScopeThisAndFuture:
-		return a.updateInstance(*src, *cal, *master, in.EventInput, InstanceOpUpdate, EditScopeThisAndFuture)
+		return a.updateInstance(*src, *cal, *master, in.EventInput, resolveInstanceUnix(in), InstanceOpUpdate, EditScopeThisAndFuture)
 	}
 	return fmt.Errorf("calendar: unknown edit scope %q", scope)
+}
+
+// resolveInstanceUnix returns the occurrence the edit targets: the
+// caller-supplied original instance time when present, else the input's
+// (possibly edited) start — the pre-existing fallback for callers that
+// do not track occurrences (whole-series edits never reach here).
+func resolveInstanceUnix(in EventUpdateInput) int64 {
+	if in.OriginalInstanceTimeUnix != 0 {
+		return in.OriginalInstanceTimeUnix
+	}
+	return in.DTStartUnix
 }
 
 // updateInstance handles scope=this and scope=this-and-future updates for
@@ -305,13 +326,28 @@ func (a *API) UpdateEvent(in EventUpdateInput, scope EditScope) error {
 // localProvider's PushInstance is a no-op, so this same code path drives
 // local scope=this / scope=this-and-future too — replacing the previous
 // updateThis / updateThisAndFuture local-only helpers.
-func (a *API) updateInstance(src Source, cal Calendar, master Event, in EventInput, kind InstanceOpKind, op EditScope) error {
+func (a *API) updateInstance(src Source, cal Calendar, master Event, in EventInput, instanceUnix int64, kind InstanceOpKind, op EditScope) error {
 	provider := ProviderForSource(src, ProviderDeps{Store: a.store, Secrets: a.secrets, Auth: a.auth})
 	pushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// instanceUnix is the ORIGINAL occurrence start — never the edited
+	// DTStartUnix. It is the instance identity on every provider
+	// (RECURRENCE-ID, split point, instance lookup).
+	if instanceUnix == 0 {
+		return errors.New("calendar: instance time is required for this edit")
+	}
+	// A split for this occurrence is already queued for retry (a
+	// transport failure earlier, or a manual retry while offline):
+	// do not queue — or push — a second one. The queued row replays
+	// the whole split when connectivity returns.
+	if a.queue != nil {
+		if queued, err := a.queue.HasPendingInstance(master.ID, op, instanceUnix); err == nil && queued {
+			return errors.New("calendar: this change is already queued and will sync when you are back online")
+		}
+	}
 	result, err := provider.PushInstance(pushCtx, src, cal, PushInstancePayload{
 		Master:           master,
-		InstanceTimeUnix: in.DTStartUnix,
+		InstanceTimeUnix: instanceUnix,
 		Op:               op,
 		Kind:             kind,
 		In:               in,
@@ -320,32 +356,75 @@ func (a *API) updateInstance(src Source, cal Calendar, master Event, in EventInp
 		if errors.Is(err, ErrConflict) {
 			return wrapCalendarConflict(err, master.Summary, "edit")
 		}
+		// Transport failure: queue the whole split for retry instead
+		// of losing it. Nothing is persisted locally — the local
+		// state still shows the pre-edit series, and Drain replays
+		// the push (the following sync then reconciles the local
+		// rows). The error still surfaces so the user knows the
+		// change has not landed yet.
+		if errors.Is(err, ErrTransport) && a.queue != nil {
+			if _, qerr := a.queue.Enqueue(PendingOp{
+				SourceID:         src.ID,
+				CalendarID:       cal.ID,
+				EventID:          master.ID,
+				Op:               pendingOpKindFor(kind),
+				Scope:            op,
+				InstanceTimeUnix: instanceUnix,
+				Kind:             kind,
+				CalendarURL:      cal.URL,
+				UID:              master.UID,
+				ETag:             master.ETag,
+				Href:             master.Href,
+				ProviderEventID:  master.ProviderEventID,
+				Summary:          in.Summary,
+				Description:      in.Description,
+				Location:         in.Location,
+				DTStartUnix:      in.DTStartUnix,
+				DTEndUnix:        in.DTEndUnix,
+				IsAllDay:         in.IsAllDay,
+				TZName:           in.TZName,
+				RRuleText:        rruleText(in.Recurrence),
+				In:               &in,
+			}); qerr == nil {
+				return fmt.Errorf("calendar: could not reach the server — this change is queued and will sync when you are back online: %w", err)
+			}
+		}
 		return fmt.Errorf("push instance to remote: %w", err)
 	}
 
 	switch {
 	case op == EditScopeThis && kind == InstanceOpUpdate:
-		return a.persistThisUpdate(master, in, result)
+		return a.persistThisUpdate(master, in, instanceUnix, result)
 	case op == EditScopeThis && kind == InstanceOpDelete:
-		return a.persistThisDelete(master, in.DTStartUnix, result)
+		return a.persistThisDelete(master, instanceUnix, result)
 	case op == EditScopeThisAndFuture && kind == InstanceOpUpdate:
-		return a.persistThisAndFutureUpdateLocally(master, in, result)
+		return a.persistThisAndFutureUpdateLocally(master, in, instanceUnix, result)
 	case op == EditScopeThisAndFuture && kind == InstanceOpDelete:
-		return a.persistThisAndFutureDeleteLocally(master, in.DTStartUnix, result)
+		return a.persistThisAndFutureDeleteLocally(master, instanceUnix, result)
 	}
 	return fmt.Errorf("calendar: unsupported scope/kind combo %q/%q", op, kind)
 }
 
+// pendingOpKindFor maps an instance op to the queueable op kind.
+func pendingOpKindFor(kind InstanceOpKind) PendingOpKind {
+	if kind == InstanceOpDelete {
+		return PendingOpDelete
+	}
+	return PendingOpUpdate
+}
+
 // persistThisUpdate writes the override row + updates the master's ETag
 // when the provider returned one (CalDAV — the master's resource was
-// rewritten to embed the override).
-func (a *API) persistThisUpdate(master Event, in EventInput, result PushInstanceResult) error {
-	overrideBlob, err := serializeVEVENTWithRecurrenceID(master.UID, in)
+// rewritten to embed the override). instanceUnix is the ORIGINAL
+// occurrence start: it is the override's RECURRENCE-ID, while in carries
+// the NEW fields (DTSTART may have moved).
+func (a *API) persistThisUpdate(master Event, in EventInput, instanceUnix int64, result PushInstanceResult) error {
+	overrideBlob, err := serializeVEVENTWithRecurrenceID(master.UID, in, instanceUnix)
 	if err != nil {
 		return fmt.Errorf("serialize override: %w", err)
 	}
 	return a.store.WithTx(func(tx *sql.Tx) error {
-		if err := a.store.UpsertOverrideTx(tx, master.ID, in.DTStartUnix, overrideBlob); err != nil {
+		if err := a.store.UpsertOverrideTx(tx, master.ID, instanceUnix, overrideBlob); err != nil {
 			return err
 		}
 		if result.MasterNewETag != "" {
@@ -390,8 +469,9 @@ func (a *API) persistThisDelete(master Event, instanceUnix int64, result PushIns
 // a new events row for the future series. NewSeries identifiers come from
 // the provider (or are generated locally for local sources via the same
 // pattern as the legacy updateThisAndFuture).
-func (a *API) persistThisAndFutureUpdateLocally(master Event, in EventInput, result PushInstanceResult) error {
-	splitUnix := in.DTStartUnix
+func (a *API) persistThisAndFutureUpdateLocally(master Event, in EventInput, splitUnix int64, result PushInstanceResult) error {
+	// splitUnix is the ORIGINAL occurrence start — the clamp point.
+	// in.DTStartUnix is the NEW series' start and may have moved.
 
 	// 1. Clamp master's RRULE locally.
 	clampedRRULE := clampRRuleUntil(master.RRuleText, splitUnix-1)
@@ -498,7 +578,14 @@ func (a *API) persistThisAndFutureDeleteLocally(master Event, splitUnix int64, r
 // CalDAV recurring + scope=this / this-and-future returns ErrScopeNotSupported
 // (same reasoning as UpdateEvent). CalDAV scope=All issues an HTTP DELETE with
 // If-Match for optimistic concurrency, then CASCADEs the local rows.
-func (a *API) DeleteEvent(eventID string, scope EditScope) error {
+//
+// instanceUnix is the DTSTART of the occurrence being deleted. For a
+// recurring event with scope=this or scope=this-and-future it is
+// REQUIRED: the old code silently substituted the master's first
+// occurrence (master.DTStartUnix), so "just this occurrence" deleted
+// the FIRST occurrence instead. A zero value here refuses the delete
+// rather than guessing.
+func (a *API) DeleteEvent(eventID string, scope EditScope, instanceUnix int64) error {
 	if eventID == "" {
 		return errors.New("calendar: event ID required")
 	}
@@ -556,11 +643,13 @@ func (a *API) DeleteEvent(eventID string, scope EditScope) error {
 	}
 
 	// For recurring "this" / "this-and-future", the caller's intent is
-	// based on a specific instance. The bridge passes the original
-	// instance start via master.DTStartUnix as a placeholder; a future
-	// bridge update can thread a specific instance time through when the
-	// frontend selects an instance other than the master's first.
-	splitUnix := master.DTStartUnix
+	// based on a specific instance. The bridge passes the occurrence's
+	// original start; a zero value refuses rather than deleting the
+	// master's first occurrence by mistake.
+	if instanceUnix == 0 {
+		return errors.New("calendar: instance time is required to delete one occurrence of a recurring event")
+	}
+	splitUnix := instanceUnix
 
 	// Push delete to remote first via PushInstance, then persist locally.
 	// Symmetric with UpdateEvent's scope=this / scope=this-and-future
@@ -576,9 +665,9 @@ func (a *API) DeleteEvent(eventID string, scope EditScope) error {
 
 	switch scope {
 	case EditScopeThis:
-		return a.updateInstance(*src, *cal, *master, deleteIn, InstanceOpDelete, EditScopeThis)
+		return a.updateInstance(*src, *cal, *master, deleteIn, splitUnix, InstanceOpDelete, EditScopeThis)
 	case EditScopeThisAndFuture:
-		return a.updateInstance(*src, *cal, *master, deleteIn, InstanceOpDelete, EditScopeThisAndFuture)
+		return a.updateInstance(*src, *cal, *master, deleteIn, splitUnix, InstanceOpDelete, EditScopeThisAndFuture)
 	}
 	return fmt.Errorf("calendar: unknown edit scope %q", scope)
 }
@@ -614,7 +703,36 @@ func (a *API) updateAllAndPush(src Source, cal Calendar, master Event, in EventI
 	provider := ProviderForSource(src, ProviderDeps{Store: a.store, Secrets: a.secrets, Auth: a.auth})
 	pushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	result, err := provider.PushEvent(pushCtx, src, cal, ev)
+
+	// Whole-series edits used to drop EVERY single-occurrence
+	// customisation (event_recurrence_overrides) — a time change
+	// silently wiped them all. Keep the overrides that still map
+	// onto the new occurrence set; only the ones that no longer
+	// correspond to any occurrence of the new series are dropped.
+	// On CalDAV the retained overrides must also ride in the PUT
+	// payload: the server resource is one VCALENDAR, so a
+	// master-only PUT would drop them server-side and the next sync
+	// would wipe the locally kept rows. Google/Microsoft keep
+	// exceptions as separate resources, so local retention is enough
+	// there (and for local sources).
+	existingOverrides, overridesErr := a.store.ListOverrides(master.ID)
+	retainedOverrides, retainedOK := retainedOverrides(ev, existingOverrides)
+	if overridesErr != nil || !retainedOK {
+		// Cannot tell what maps — fall back to the old behaviour
+		// (drop all) rather than keeping rows that point at
+		// occurrences that no longer exist.
+		retainedOverrides = nil
+	}
+	pushEv := ev
+	if src.Type == SourceTypeCalDAV && len(retainedOverrides) > 0 {
+		if merged, merr := mergeOverrideBlobs(ev.ICSBlob, retainedOverrides); merr == nil {
+			pushEv.ICSBlob = merged
+		}
+		// On merge failure the local rows are kept anyway (inert for
+		// non-matching occurrences) — the next sync reconciles the
+		// server copy. Do not fail the edit over it.
+	}
+	result, err := provider.PushEvent(pushCtx, src, cal, pushEv)
 	if err == nil {
 		ev.ETag = result.ETag
 		if result.ProviderEventID != "" {
@@ -663,7 +781,7 @@ func (a *API) updateAllAndPush(src Source, cal Calendar, master Event, in EventI
 			IsAllDay:        ev.IsAllDay,
 			TZName:          ev.TZName,
 			RRuleText:       ev.RRuleText,
-			ICSBlob:         ev.ICSBlob,
+			ICSBlob:         pushEv.ICSBlob,
 		}); qerr != nil {
 			return fmt.Errorf("queue offline write: %w", qerr)
 		}
@@ -673,11 +791,25 @@ func (a *API) updateAllAndPush(src Source, cal Calendar, master Event, in EventI
 		if err := a.store.UpsertEventTx(tx, ev); err != nil {
 			return err
 		}
-		// Drop ALL overrides — they were attached to the old RRULE shape
-		// and may not map cleanly to the new occurrence set.
-		if _, err := tx.Exec(
-			`DELETE FROM event_recurrence_overrides WHERE event_id = ?`, ev.ID); err != nil {
-			return err
+		// Drop only the overrides that no longer map onto the new
+		// occurrence set. Retained rows keep their customisations.
+		if len(retainedOverrides) == 0 {
+			if _, err := tx.Exec(
+				`DELETE FROM event_recurrence_overrides WHERE event_id = ?`, ev.ID); err != nil {
+				return err
+			}
+		} else {
+			args := make([]any, 0, len(retainedOverrides)+1)
+			args = append(args, ev.ID)
+			placeholders := make([]string, 0, len(retainedOverrides))
+			for _, o := range retainedOverrides {
+				placeholders = append(placeholders, "?")
+				args = append(args, o.RecurrenceIDUnix)
+			}
+			if _, err := tx.Exec(
+				`DELETE FROM event_recurrence_overrides WHERE event_id = ? AND recurrence_id_unix NOT IN (`+strings.Join(placeholders, ",")+`)`, args...); err != nil {
+				return err
+			}
 		}
 		return a.extractAndUpsertAlarmsTx(tx, ev)
 	})
@@ -979,9 +1111,10 @@ func (a *API) extractAndUpsertAlarmsTx(tx *sql.Tx, ev Event) error {
 
 // serializeVEVENTWithRecurrenceID is like serializeVEVENT but uses the
 // caller-supplied uid (same as the master's per RFC 5545 §3.8.4.4) and
-// adds RECURRENCE-ID = DTStartUnix so the override binds to a specific
-// occurrence.
-func serializeVEVENTWithRecurrenceID(uid string, in EventInput) (string, error) {
+// adds RECURRENCE-ID = recurrenceIDUnix — the ORIGINAL occurrence start,
+// which is what binds the override to its occurrence. in.DTStartUnix is
+// the override's NEW start and must never be used as the RECURRENCE-ID.
+func serializeVEVENTWithRecurrenceID(uid string, in EventInput, recurrenceIDUnix int64) (string, error) {
 	// Overrides are single-instance, never recurring.
 	in.Recurrence = nil
 
@@ -998,13 +1131,74 @@ func serializeVEVENTWithRecurrenceID(uid string, in EventInput) (string, error) 
 	}
 	ev := cal.Events()[0]
 	recIDProp := ical.NewProp(ical.PropRecurrenceID)
-	recIDProp.Value = formatICSDateTime(time.Unix(in.DTStartUnix, 0))
+	recIDProp.Value = formatICSDateTime(time.Unix(recurrenceIDUnix, 0))
 	ev.Props.Set(recIDProp)
 	var buf bytes.Buffer
 	if err := ical.NewEncoder(&buf).Encode(cal); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// retainedOverrides returns the subset of overrides whose
+// RECURRENCE-ID still names an occurrence of ev's (new) recurrence.
+// An override for an occurrence the new series no longer has is
+// dropped by the caller; the rest keep their customisation across a
+// whole-series edit. Returns ok=false when the occurrence set could
+// not be computed (caller falls back to dropping all, the old
+// behaviour). The expansion window is capped at 5 years past the
+// new start to bound the work; overrides beyond that are dropped.
+func retainedOverrides(ev Event, overrides []EventOverride) ([]EventOverride, bool) {
+	if len(overrides) == 0 {
+		return nil, true
+	}
+	var maxUnix int64
+	for _, o := range overrides {
+		if o.RecurrenceIDUnix > maxUnix {
+			maxUnix = o.RecurrenceIDUnix
+		}
+	}
+	from := time.Unix(ev.DTStartUnix, 0)
+	to := time.Unix(maxUnix, 0)
+	if cap := from.AddDate(5, 0, 0); to.After(cap) {
+		to = cap
+	}
+	instances, err := ExpandInRange(ev, nil, from, to)
+	if err != nil {
+		return nil, false
+	}
+	occurs := make(map[int64]bool, len(instances))
+	for _, inst := range instances {
+		occurs[inst.InstanceStartUnix] = true
+	}
+	var kept []EventOverride
+	for _, o := range overrides {
+		if occurs[o.RecurrenceIDUnix] {
+			kept = append(kept, o)
+		}
+	}
+	return kept, true
+}
+
+// mergeOverrideBlobs appends retained override VEVENTs to a master-only
+// VCALENDAR blob, for the CalDAV whole-series PUT: the server resource
+// is one VCALENDAR, so overrides must ride in the PUT or the server
+// drops them. The local events row keeps its master-only blob.
+func mergeOverrideBlobs(masterBlob string, overrides []EventOverride) (string, error) {
+	cal, err := ical.NewDecoder(strings.NewReader(masterBlob)).Decode()
+	if err != nil {
+		return "", fmt.Errorf("decode master blob: %w", err)
+	}
+	for _, o := range overrides {
+		ocal, err := ical.NewDecoder(strings.NewReader(o.ICSBlob)).Decode()
+		if err != nil {
+			return "", fmt.Errorf("decode override blob: %w", err)
+		}
+		for _, oev := range ocal.Events() {
+			cal.Children = append(cal.Children, oev.Component)
+		}
+	}
+	return encodeICS(cal)
 }
 
 // reserializeMasterICS rewrites the RRULE on an existing master's ICS blob.

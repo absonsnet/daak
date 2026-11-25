@@ -1714,6 +1714,7 @@ export namespace backend {
 	}
 	export class EventUpdateInput {
 	    eventId: string;
+	    originalInstanceTimeUnix?: number;
 	    calendarId: string;
 	    summary: string;
 	    description?: string;
@@ -1738,6 +1739,7 @@ export namespace backend {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.eventId = source["eventId"];
+	        this.originalInstanceTimeUnix = source["originalInstanceTimeUnix"];
 	        this.calendarId = source["calendarId"];
 	        this.summary = source["summary"];
 	        this.description = source["description"];

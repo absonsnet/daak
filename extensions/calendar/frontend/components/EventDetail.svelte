@@ -323,7 +323,10 @@
     if (!event) return
     deleting = true
     try {
-      await Calendar_DeleteEvent(event.id, composerScope)
+      // The selected occurrence's start — required for scope=this /
+      // this-and-future on recurring events; 0 refuses rather than
+      // deleting the first occurrence.
+      await Calendar_DeleteEvent(event.id, composerScope, calendarView.selectedInstanceStartUnix || 0)
       toasts.success($_('calendar.composer.toastDeleted'))
       // Refresh and close overlay.
       void events.fetchRange(
@@ -564,6 +567,8 @@
   mode="edit"
   existing={event}
   scope={composerScope}
+  instanceStartUnix={calendarView.selectedInstanceStartUnix || undefined}
+  instanceEndUnix={calendarView.selectedInstanceEndUnix || undefined}
   onSaved={onComposerSaved}
 />
 
