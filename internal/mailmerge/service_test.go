@@ -911,3 +911,62 @@ func TestOpenRawSenderWithoutFactory(t *testing.T) {
 		t.Fatal("expected error without a sender factory")
 	}
 }
+
+// Audit4 finding 24: a Mail Merge mail that is delivered but whose Sent
+// save fails must leave the same persistent warning a normal send
+// leaves, naming subject and recipient — on both the direct-send and
+// queued paths.
+type fakeSentSaveFailureRecorder struct {
+	recorded []sentSaveFailure
+}
+
+type sentSaveFailure struct {
+	accountID, subject, recipient, from string
+	err                                 error
+}
+
+func (f *fakeSentSaveFailureRecorder) RecordSentSaveFailure(_ context.Context, accountID, subject, recipient, fromAddress string, saveErr error) {
+	f.recorded = append(f.recorded, sentSaveFailure{accountID, subject, recipient, fromAddress, saveErr})
+}
+
+func TestServiceSentSaveFailureRecorded(t *testing.T) {
+	sentSaver := &fakeSentSaver{fail: errors.New("imap down")}
+	recorder := &fakeSentSaveFailureRecorder{}
+	svc := NewService(ServiceDeps{
+		SenderFactory:           &fakeSenderFactory{sender: &fakeSender{}},
+		SentSaver:               sentSaver,
+		SentSaveFailureRecorder: recorder,
+	})
+	out, err := svc.Execute(context.Background(), RunRequest{
+		Template: testTemplate(), Rows: testRows()[:1],
+		DeliverMode: "send", AccountID: "acc1",
+	}, nil)
+	if err != nil || out.SentCount != 1 {
+		t.Fatalf("send with failing Sent save: out %+v err %v", out, err)
+	}
+	if len(recorder.recorded) != 1 {
+		t.Fatalf("recorded warnings = %d, want 1", len(recorder.recorded))
+	}
+	got := recorder.recorded[0]
+	if got.subject != "Hello John" || got.recipient != "john@example.com" || got.accountID != "acc1" {
+		t.Fatalf("warning = %+v, want subject 'Hello John', recipient john@example.com, account acc1", got)
+	}
+
+	// Queued path: the same warning via RawSender.
+	recorder.recorded = nil
+	rs, err := svc.OpenRawSender(context.Background(), "acc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rs.Close()
+	if err := rs.Send(context.Background(), QueuedMessage{
+		Email: "jane@example.com", Subject: "Hello Jane",
+		From: "sender@example.com", To: []string{"jane@example.com"},
+		Raw: []byte("Subject: Hello Jane\r\n\r\nHi Jane"),
+	}, nil); err != nil {
+		t.Fatalf("RawSender.Send: %v", err)
+	}
+	if len(recorder.recorded) != 1 || recorder.recorded[0].subject != "Hello Jane" || recorder.recorded[0].recipient != "jane@example.com" {
+		t.Fatalf("queued-path warnings = %+v, want one for 'Hello Jane' / jane@example.com", recorder.recorded)
+	}
+}

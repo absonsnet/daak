@@ -334,7 +334,7 @@ func (c *ComposerApp) initMailMergeExtension() {
 		SettingsStore: c.settingsStore,
 		Paths:         c.paths,
 		Core:          core,
-		Service:       newMailMergeService(&c.composeOps, &composerMailMergeDraftSaver{c: c}, c.contactStore),
+		Service:       newMailMergeService(&c.composeOps, &composerMailMergeDraftSaver{c: c}, c.contactStore, &mailMergeSentSaveFailureRecorder{get: func() *sendQueueService { return c.sendQueue }}),
 		Ctx:           c.ctx,
 	})
 	if _, err := c.mailMergeExt.Register(core); err != nil {

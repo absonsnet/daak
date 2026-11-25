@@ -1196,6 +1196,22 @@ func sameAddressPtr(a, b *smtp.Address) bool {
 	return strings.EqualFold(strings.TrimSpace(a.Address), strings.TrimSpace(b.Address)) && a.Name == b.Name
 }
 
+// RecordMailMergeSentSaveFailure records a persistent "sent but not
+// saved to Sent" warning for a Mail Merge send (audit4 finding 24),
+// the same warning a normal send records via recordSentSaveFailure.
+// The mail was delivered; only its Sent copy is missing, so the
+// warning names the subject and recipient for the user to check.
+func (s *sendQueueService) RecordMailMergeSentSaveFailure(accountID, subject, recipient, fromAddress string, saveErr error) {
+	s.recordSentSaveFailure(sendqueue.Item{
+		AccountID:   accountID,
+		Kind:        sendqueue.KindMessage,
+		Subject:     subject,
+		Recipient:   recipient,
+		FromAddress: fromAddress,
+		To:          []string{recipient},
+	}, s.clock(), saveErr)
+}
+
 // recordSentSaveFailure records a persistent, user-visible
 // warning for a mail that SMTP accepted but whose Sent-folder save
 // then failed (re-audit finding R24). The queue row for a queued

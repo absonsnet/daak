@@ -86,6 +86,18 @@ type ServiceDeps struct {
 	// signing. Nil = signing unavailable (Validate/StartRun/Execute
 	// all fail a signing run before anything is sent).
 	MessageSigner MessageSigner
+	// SentSaveFailureRecorder records a persistent "sent but not
+	// saved to Sent" warning for a Mail Merge send whose Sent save
+	// failed (audit4 finding 24) — the same warning a normal send
+	// records. Nil = log only, as before.
+	SentSaveFailureRecorder SentSaveFailureRecorder
+}
+
+// SentSaveFailureRecorder records a persistent warning for a mail that
+// was delivered but whose Sent-folder save failed, naming its subject
+// and recipient so the user can check with the recipient.
+type SentSaveFailureRecorder interface {
+	RecordSentSaveFailure(ctx context.Context, accountID, subject, recipient, fromAddress string, saveErr error)
 }
 
 // Service is the host-side run orchestrator. It owns no UI and no
@@ -482,13 +494,23 @@ func (s *Service) RenderForQueue(ctx context.Context, req RunRequest, onQueued f
 // RawSender is one reused SMTP connection for sending already-rendered
 // queue bytes: Connect + Login happen once (via SenderFactory, exactly
 // like a normal send run), Send per queued item, Close at the end. The
+// recordSentSaveFailure records the persistent "sent but not saved to
+// Sent" warning for a delivered Mail Merge row (audit4 finding 24).
+// Nil recorder = log only, as before.
+func (s *Service) recordSentSaveFailure(ctx context.Context, accountID, subject, recipient, fromAddress string, saveErr error) {
+	if s.deps.SentSaveFailureRecorder != nil {
+		s.deps.SentSaveFailureRecorder.RecordSentSaveFailure(ctx, accountID, subject, recipient, fromAddress, saveErr)
+	}
+}
+
 // queue runner opens one RawSender per account per dispatch tick, so a
 // batch still uses one connection per account — the same reuse as a
 // normal send run, and the same SentSaver as a normal send.
 type RawSender struct {
-	sender    MailSender
-	saver     SentSaver
-	accountID string
+	sender           MailSender
+	saver            SentSaver
+	failureRecorder  SentSaveFailureRecorder
+	accountID        string
 }
 
 // OpenRawSender opens the run's single SMTP connection for an account.
@@ -500,7 +522,7 @@ func (s *Service) OpenRawSender(ctx context.Context, accountID string) (*RawSend
 	if err != nil {
 		return nil, fmt.Errorf("mailmerge: connect SMTP: %w", err)
 	}
-	return &RawSender{sender: sender, saver: s.deps.SentSaver, accountID: accountID}, nil
+	return &RawSender{sender: sender, saver: s.deps.SentSaver, failureRecorder: s.deps.SentSaveFailureRecorder, accountID: accountID}, nil
 }
 
 // Send transmits one already-rendered queued message, then saves it to
@@ -525,6 +547,9 @@ func (rs *RawSender) Send(ctx context.Context, m QueuedMessage, afterSMTP func()
 		if err := rs.saver.SaveToSent(ctx, rs.accountID, m.Raw); err != nil {
 			slog := logging.WithComponent("mailmerge")
 			slog.Warn().Err(err).Str("email", m.Email).Msg("Failed to save queued sent message to Sent folder")
+			if rs.failureRecorder != nil {
+				rs.failureRecorder.RecordSentSaveFailure(ctx, rs.accountID, m.Subject, m.Email, m.From, err)
+			}
 		}
 	}
 	return nil
@@ -764,11 +789,14 @@ func (s *Service) processRow(ctx context.Context, req RunRequest, row map[string
 		markSeen()
 		*sentAttempted++
 		// Save to Sent the way App.SendMessage does. A failure here
-		// must not fail the send (the message is already out).
+		// must not fail the send (the message is already out), but it
+		// must leave the same persistent warning a normal send leaves
+		// (audit4 finding 24), naming subject and recipient.
 		if s.deps.SentSaver != nil {
 			if err := s.deps.SentSaver.SaveToSent(ctx, req.AccountID, raw); err != nil {
 				slog := logging.WithComponent("mailmerge")
 				slog.Warn().Err(err).Str("email", email).Msg("Failed to save sent message to Sent folder")
+				s.recordSentSaveFailure(ctx, req.AccountID, bm.msg.Subject, email, bm.fromAddr.Address, err)
 			}
 		}
 		return RowResult{Index: origIndex, Email: email, Status: RowSent, Timestamp: now, MessageID: messageID}
