@@ -1601,4 +1601,39 @@ var migrations = []Migration{
 			ALTER TABLE messages ADD COLUMN body_truncated INTEGER NOT NULL DEFAULT 0;
 		`,
 	},
+	{
+		Version: 54,
+		SQL: `
+			-- Re-audit R9: the draft guard in QueueSend is
+			-- check-then-insert, not atomic across processes — two
+			-- processes queueing the same draft in the same instant
+			-- could both pass the check and enqueue two rows that
+			-- both dispatch. A partial unique index on send_queue
+			-- (draft_id) for live rows makes the guard atomic: a
+			-- concurrent second insert fails the constraint, and
+			-- QueueSend maps that back to the "already queued"
+			-- error. The predicate MUST exclude empty draft_id:
+			-- reaction rows all carry draft_id '' and a plain
+			-- unique index would let only one reaction ever be
+			-- queued. Failed rows are outside the predicate on
+			-- purpose: a failed row and a live row for the same
+			-- draft can coexist, and the app layer (not the index)
+			-- blocks re-sending while a failed row exists.
+			-- Pre-existing duplicate live rows (queued before this
+			-- fix) would break the index build, so keep only the
+			-- oldest live row per draft and drop the rest first.
+			DELETE FROM send_queue
+			WHERE status IN ('pending', 'sending') AND draft_id <> ''
+			  AND EXISTS (
+				SELECT 1 FROM send_queue b
+				WHERE b.draft_id = send_queue.draft_id
+				  AND b.status IN ('pending', 'sending')
+				  AND (b.created_at < send_queue.created_at
+				    OR (b.created_at = send_queue.created_at AND b.id < send_queue.id))
+			  );
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_send_queue_draft_active
+				ON send_queue (draft_id)
+				WHERE draft_id <> '' AND status IN ('pending', 'sending');
+		`,
+	},
 }

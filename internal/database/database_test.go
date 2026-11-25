@@ -680,3 +680,81 @@ func TestMigrationV51_DedupesAttachments(t *testing.T) {
 		t.Fatalf("m2 attachments = %d, want 2 (different files sharing a name are kept)", n)
 	}
 }
+
+// TestMigrationV54_DedupesDuplicateActiveDraftRows verifies migration
+// 54's pre-step: a DB that already holds two live rows for the same
+// draft (queued before the fix) must migrate cleanly, keeping only
+// the oldest live row, and the partial unique index must then exist
+// and enforce itself.
+func TestMigrationV54_DedupesDuplicateActiveDraftRows(t *testing.T) {
+	db := openTestDB(t)
+
+	// Rewind to the v53 schema: drop the v54 index and its
+	// migration record, so Migrate() re-applies v54 below.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_send_queue_draft_active`); err != nil {
+		t.Fatalf("drop v54 index for re-migrate: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM migrations WHERE version = 54`); err != nil {
+		t.Fatalf("delete v54 migration record: %v", err)
+	}
+
+	// Seed two live rows for the same draft, plus a failed row for
+	// it (untouched by the dedupe) and a live row for another draft.
+	seed := func(id, draftID, status, createdAt string) {
+		t.Helper()
+		if _, err := db.Exec(`
+			INSERT INTO send_queue
+				(id, account_id, draft_id, message_json, status,
+				 send_at, due_at, created_at)
+			VALUES (?, 'acc-1', ?, '', ?, '2026-11-25T00:00:00Z',
+				'2026-11-25T00:00:00Z', ?)
+		`, id, draftID, status, createdAt); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("dup-old", "draft-1", "pending", "2026-11-25T00:00:00Z")
+	seed("dup-new", "draft-1", "pending", "2026-11-25T00:01:00Z")
+	seed("dup-failed", "draft-1", "failed", "2026-11-25T00:02:00Z")
+	seed("other-live", "draft-2", "pending", "2026-11-25T00:00:00Z")
+
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("re-migrate to v54: %v", err)
+	}
+
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM send_queue WHERE draft_id = 'draft-1' AND status = 'pending'`).Scan(&n); err != nil {
+		t.Fatalf("count live draft-1 rows: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("live draft-1 rows = %d, want 1 (oldest kept)", n)
+	}
+	var kept string
+	if err := db.QueryRow(`SELECT id FROM send_queue WHERE draft_id = 'draft-1' AND status = 'pending'`).Scan(&kept); err != nil {
+		t.Fatalf("kept live row: %v", err)
+	}
+	if kept != "dup-old" {
+		t.Fatalf("kept live row = %q, want dup-old (oldest)", kept)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM send_queue WHERE id = 'dup-failed'`).Scan(&n); err != nil {
+		t.Fatalf("count failed row: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("failed row survived = %d, want 1 (dedupe touches live rows only)", n)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_send_queue_draft_active'`).Scan(&n); err != nil {
+		t.Fatalf("count v54 index: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("v54 index present = %d, want 1", n)
+	}
+	// And the index enforces itself after the migration.
+	if _, err := db.Exec(`
+		INSERT INTO send_queue
+			(id, account_id, draft_id, message_json, status,
+			 send_at, due_at, created_at)
+		VALUES ('dup-third', 'acc-1', 'draft-1', '', 'pending',
+			'2026-11-25T00:00:00Z', '2026-11-25T00:00:00Z', '2026-11-25T00:03:00Z')
+	`); err == nil {
+		t.Fatalf("inserting a second live row for draft-1 succeeded, want a UNIQUE constraint failure")
+	}
+}

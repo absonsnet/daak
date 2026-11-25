@@ -2,6 +2,7 @@ package sendqueue
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,7 +27,7 @@ func testItem(id string) Item {
 	return Item{
 		ID:          id,
 		AccountID:   "acc-1",
-		DraftID:     "draft-1",
+		DraftID:     "draft-" + id,
 		MessageJSON: `{"subject":"hi"}`,
 		Subject:     "hi",
 		Recipient:   "a@example.com",
@@ -53,8 +54,8 @@ func TestEnqueueGetList(t *testing.T) {
 	if got == nil {
 		t.Fatal("Get returned nil for an enqueued item")
 	}
-	if got.Subject != "hi" || got.Recipient != "a@example.com" || got.DraftID != "draft-1" {
-		t.Fatalf("Get = %+v, want subject hi / recipient a@example.com / draft-1", got)
+	if got.Subject != "hi" || got.Recipient != "a@example.com" || got.DraftID != "draft-q1" {
+		t.Fatalf("Get = %+v, want subject hi / recipient a@example.com / draft-q1", got)
 	}
 	if got.MessageJSON != "" {
 		t.Fatalf("Get must not load message JSON, got %q", got.MessageJSON)
@@ -331,9 +332,141 @@ func (e errString) Error() string { return string(e) }
 // pending or sending, and stops being active once the row is gone
 // (undone/sent) or failed — so QueueSend can reject a second queue
 // attempt for the same draft during the undo window.
+// TestHasFailedForDraft: only a 'failed' row counts — pending,
+// sending and deleted rows do not. QueueSend uses it to reject a
+// re-send from Drafts while a failed row waits for Retry.
+func TestHasFailedForDraft(t *testing.T) {
+	s := NewStore(openTestDB(t))
+	if failed, err := s.HasFailedForDraft("draft-q1"); err != nil || failed {
+		t.Fatalf("HasFailedForDraft(empty) = %v, %v, want false, nil", failed, err)
+	}
+	if failed, err := s.HasFailedForDraft(""); err != nil || failed {
+		t.Fatalf("HasFailedForDraft(\"\") = %v, %v, want false, nil", failed, err)
+	}
+	if err := s.Enqueue(testItem("q1")); err != nil {
+		t.Fatal(err)
+	}
+	if failed, err := s.HasFailedForDraft("draft-q1"); err != nil || failed {
+		t.Fatalf("HasFailedForDraft(pending) = %v, %v, want false, nil", failed, err)
+	}
+	now := time.Now().UTC()
+	if err := s.RecordAttempt("q1", 1, StatusFailed, now, "boom"); err != nil {
+		t.Fatal(err)
+	}
+	if failed, err := s.HasFailedForDraft("draft-q1"); err != nil || !failed {
+		t.Fatalf("HasFailedForDraft(failed) = %v, %v, want true, nil", failed, err)
+	}
+	if failed, err := s.HasFailedForDraft("other-draft"); err != nil || failed {
+		t.Fatalf("HasFailedForDraft(other) = %v, %v, want false, nil", failed, err)
+	}
+	// Retry clears it: the row is pending again, not failed.
+	if ok, err := s.Retry("q1", now); err != nil || !ok {
+		t.Fatalf("Retry = %v, %v, want true, nil", ok, err)
+	}
+	if failed, err := s.HasFailedForDraft("draft-q1"); err != nil || failed {
+		t.Fatalf("HasFailedForDraft(retried) = %v, %v, want false, nil", failed, err)
+	}
+}
+
+// TestActiveReaction: a reaction row is live while pending or
+// sending, and stops being live once it is gone or failed.
+func TestActiveReaction(t *testing.T) {
+	s := NewStore(openTestDB(t))
+	if active, err := s.ActiveReaction("msg-1"); err != nil || active != nil {
+		t.Fatalf("ActiveReaction(empty) = %v, %v, want nil, nil", active, err)
+	}
+	if active, err := s.ActiveReaction(""); err != nil || active != nil {
+		t.Fatalf("ActiveReaction(\"\") = %v, %v, want nil, nil", active, err)
+	}
+	reaction := testItem("r1")
+	reaction.Kind = KindReaction
+	reaction.MessageJSON = ""
+	reaction.RawMessage = []byte("raw")
+	reaction.ReactionMessageID = "msg-1"
+	reaction.DraftID = ""
+	if err := s.Enqueue(reaction); err != nil {
+		t.Fatal(err)
+	}
+	active, err := s.ActiveReaction("msg-1")
+	if err != nil || active == nil || active.ID != "r1" || active.Status != StatusPending {
+		t.Fatalf("ActiveReaction(pending) = %+v, %v, want r1 / pending", active, err)
+	}
+	if active, err := s.ActiveReaction("msg-2"); err != nil || active != nil {
+		t.Fatalf("ActiveReaction(other) = %v, %v, want nil, nil", active, err)
+	}
+	// Claimed (sending) still counts as live.
+	now := time.Now().UTC()
+	if ok, err := s.Claim("r1", now); err != nil || !ok {
+		t.Fatalf("Claim = %v, %v, want true, nil", ok, err)
+	}
+	active, err = s.ActiveReaction("msg-1")
+	if err != nil || active == nil || active.Status != StatusSending {
+		t.Fatalf("ActiveReaction(sending) = %+v, %v, want r1 / sending", active, err)
+	}
+	// Failed rows are not live.
+	if err := s.RecordAttempt("r1", 1, StatusFailed, now, "boom"); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := s.ActiveReaction("msg-1"); err != nil || active != nil {
+		t.Fatalf("ActiveReaction(failed) = %v, %v, want nil, nil", active, err)
+	}
+}
+
+// TestDraftActiveUniqueIndex is the migration-54 regression test:
+// the partial unique index on live draft rows makes the QueueSend
+// guard atomic — a second live row for the same draft cannot be
+// inserted even by a caller that skips the check. Failed rows and
+// reaction rows (empty draft_id) are outside the predicate and
+// stay insertable.
+func TestDraftActiveUniqueIndex(t *testing.T) {
+	s := NewStore(openTestDB(t))
+	if err := s.Enqueue(testItem("q1")); err != nil {
+		t.Fatal(err)
+	}
+	dup := testItem("q2")
+	dup.DraftID = "draft-q1"
+	if err := s.Enqueue(dup); err == nil || !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		t.Fatalf("Enqueue(second live row for draft-q1) = %v, want a UNIQUE constraint failure", err)
+	}
+	// A failed row for the same draft is fine: the index only
+	// covers live rows.
+	now := time.Now().UTC()
+	if err := s.RecordAttempt("q1", 1, StatusFailed, now, "boom"); err != nil {
+		t.Fatal(err)
+	}
+	failed := testItem("q2")
+	failed.DraftID = "draft-q1"
+	failed.Status = StatusFailed
+	if err := s.Enqueue(failed); err != nil {
+		t.Fatalf("Enqueue(failed row for draft-q1) = %v, want success", err)
+	}
+	// Reaction rows all carry an empty draft_id: many may coexist.
+	for _, id := range []string{"r1", "r2"} {
+		reaction := testItem(id)
+		reaction.Kind = KindReaction
+		reaction.MessageJSON = ""
+		reaction.RawMessage = []byte("raw")
+		reaction.ReactionMessageID = "msg-" + id
+		reaction.DraftID = ""
+		if err := s.Enqueue(reaction); err != nil {
+			t.Fatalf("Enqueue(reaction %s) = %v, want success", id, err)
+		}
+	}
+	// Once the live row is gone, a fresh live row is insertable.
+	if ok, err := s.Delete("q1"); err != nil || !ok {
+		t.Fatalf("Delete(q1) = %v, %v, want true, nil", ok, err)
+	}
+	if ok, err := s.Delete("q2"); err != nil || !ok {
+		t.Fatalf("Delete(q2) = %v, %v, want true, nil", ok, err)
+	}
+	if err := s.Enqueue(testItem("q3")); err != nil {
+		t.Fatalf("Enqueue(after live rows gone) = %v, want success", err)
+	}
+}
+
 func TestHasActiveForDraft(t *testing.T) {
 	s := NewStore(openTestDB(t))
-	if active, err := s.HasActiveForDraft("draft-1"); err != nil || active {
+	if active, err := s.HasActiveForDraft("draft-q1"); err != nil || active {
 		t.Fatalf("HasActiveForDraft(empty) = %v, %v, want false, nil", active, err)
 	}
 	if active, err := s.HasActiveForDraft(""); err != nil || active {
@@ -342,7 +475,7 @@ func TestHasActiveForDraft(t *testing.T) {
 	if err := s.Enqueue(testItem("q1")); err != nil {
 		t.Fatal(err)
 	}
-	if active, err := s.HasActiveForDraft("draft-1"); err != nil || !active {
+	if active, err := s.HasActiveForDraft("draft-q1"); err != nil || !active {
 		t.Fatalf("HasActiveForDraft(pending) = %v, %v, want true, nil", active, err)
 	}
 	if active, err := s.HasActiveForDraft("other-draft"); err != nil || active {
@@ -353,27 +486,27 @@ func TestHasActiveForDraft(t *testing.T) {
 	if ok, err := s.Claim("q1", now); err != nil || !ok {
 		t.Fatalf("Claim = %v, %v, want true, nil", ok, err)
 	}
-	if active, err := s.HasActiveForDraft("draft-1"); err != nil || !active {
+	if active, err := s.HasActiveForDraft("draft-q1"); err != nil || !active {
 		t.Fatalf("HasActiveForDraft(sending) = %v, %v, want true, nil", active, err)
 	}
 	// Failed rows do not block a fresh queue attempt.
 	if err := s.RecordAttempt("q1", 1, StatusFailed, now, "boom"); err != nil {
 		t.Fatal(err)
 	}
-	if active, err := s.HasActiveForDraft("draft-1"); err != nil || active {
+	if active, err := s.HasActiveForDraft("draft-q1"); err != nil || active {
 		t.Fatalf("HasActiveForDraft(failed) = %v, %v, want false, nil", active, err)
 	}
 	// Neither does a deleted (undone/sent) row.
 	if err := s.Enqueue(testItem("q2")); err != nil {
 		t.Fatal(err)
 	}
-	if active, err := s.HasActiveForDraft("draft-1"); err != nil || !active {
+	if active, err := s.HasActiveForDraft("draft-q2"); err != nil || !active {
 		t.Fatalf("HasActiveForDraft(re-queued) = %v, %v, want true, nil", active, err)
 	}
 	if ok, err := s.DeletePending("q2"); err != nil || !ok {
 		t.Fatalf("DeletePending = %v, %v, want true, nil", ok, err)
 	}
-	if active, err := s.HasActiveForDraft("draft-1"); err != nil || active {
+	if active, err := s.HasActiveForDraft("draft-q2"); err != nil || active {
 		t.Fatalf("HasActiveForDraft(deleted) = %v, %v, want false, nil", active, err)
 	}
 }
