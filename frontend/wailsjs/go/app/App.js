@@ -110,6 +110,10 @@ export function Calendar_DeleteSource(arg1) {
   return window['go']['app']['App']['Calendar_DeleteSource'](arg1);
 }
 
+export function Calendar_DiscardExhaustedWrite(arg1) {
+  return window['go']['app']['App']['Calendar_DiscardExhaustedWrite'](arg1);
+}
+
 export function Calendar_DismissAlarm(arg1) {
   return window['go']['app']['App']['Calendar_DismissAlarm'](arg1);
 }
@@ -132,6 +136,10 @@ export function Calendar_ListCalendars(arg1) {
 
 export function Calendar_ListEventsInRange(arg1, arg2, arg3) {
   return window['go']['app']['App']['Calendar_ListEventsInRange'](arg1, arg2, arg3);
+}
+
+export function Calendar_ListExhaustedWrites() {
+  return window['go']['app']['App']['Calendar_ListExhaustedWrites']();
 }
 
 export function Calendar_ListGoogleCalendarsForAccount(arg1) {
@@ -164,6 +172,10 @@ export function Calendar_RenameSource(arg1, arg2) {
 
 export function Calendar_ReprobeCalDAVOrganizerIdentities(arg1) {
   return window['go']['app']['App']['Calendar_ReprobeCalDAVOrganizerIdentities'](arg1);
+}
+
+export function Calendar_RetryExhaustedWrite(arg1) {
+  return window['go']['app']['App']['Calendar_RetryExhaustedWrite'](arg1);
 }
 
 export function Calendar_SearchContacts(arg1, arg2) {

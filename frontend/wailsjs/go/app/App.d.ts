@@ -78,6 +78,8 @@ export function Calendar_DeleteEvent(arg1:string,arg2:string,arg3:number):Promis
 
 export function Calendar_DeleteSource(arg1:string):Promise<void>;
 
+export function Calendar_DiscardExhaustedWrite(arg1:string):Promise<void>;
+
 export function Calendar_DismissAlarm(arg1:string):Promise<void>;
 
 export function Calendar_ForceSyncSource(arg1:string):Promise<void>;
@@ -89,6 +91,8 @@ export function Calendar_GrantCalendarAccess(arg1:string,arg2:string,arg3:string
 export function Calendar_ListCalendars(arg1:string):Promise<Array<backend.Calendar>>;
 
 export function Calendar_ListEventsInRange(arg1:Array<string>,arg2:number,arg3:number):Promise<Array<backend.EventInstance>>;
+
+export function Calendar_ListExhaustedWrites():Promise<Array<backend.ExhaustedWrite>>;
 
 export function Calendar_ListGoogleCalendarsForAccount(arg1:string):Promise<Array<backend.GoogleCalendarChoice>>;
 
@@ -105,6 +109,8 @@ export function Calendar_QueryFreeBusy(arg1:Array<string>,arg2:Array<string>,arg
 export function Calendar_RenameSource(arg1:string,arg2:string):Promise<void>;
 
 export function Calendar_ReprobeCalDAVOrganizerIdentities(arg1:string):Promise<number>;
+
+export function Calendar_RetryExhaustedWrite(arg1:string):Promise<void>;
 
 export function Calendar_SearchContacts(arg1:string,arg2:number):Promise<Array<v1.Contact>>;
 

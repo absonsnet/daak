@@ -318,6 +318,35 @@ func (a *API) ReprobeCalDAVOrganizerIdentities(sourceID string) (int, error) {
 	return len(identities), nil
 }
 
+// ListExhaustedWrites returns the offline-queue rows that used up
+// their retry budget (audit4 finding 21). The calendar UI surfaces
+// them with retry/discard instead of letting the edits silently never
+// reach the server. Empty (not an error) when there is no queue.
+func (a *API) ListExhaustedWrites() ([]ExhaustedWrite, error) {
+	if a.queue == nil {
+		return nil, nil
+	}
+	return a.queue.ListExhausted()
+}
+
+// RetryExhaustedWrite resets an exhausted queued write's attempt budget
+// so the next Drain retries it.
+func (a *API) RetryExhaustedWrite(id string) error {
+	if a.queue == nil {
+		return errors.New("calendar: offline queue is not available")
+	}
+	return a.queue.RetryExhausted(id)
+}
+
+// DiscardExhaustedWrite drops an exhausted queued write without pushing
+// it. The edit never reaches the server.
+func (a *API) DiscardExhaustedWrite(id string) error {
+	if a.queue == nil {
+		return errors.New("calendar: offline queue is not available")
+	}
+	return a.queue.DiscardExhausted(id)
+}
+
 // ListSources returns all configured calendar sources.
 func (a *API) ListSources() ([]Source, error) {
 	return a.store.ListSources()

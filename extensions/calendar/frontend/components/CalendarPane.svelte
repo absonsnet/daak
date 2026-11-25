@@ -16,6 +16,7 @@
   import PaneLayout from '$lib/components/kit/PaneLayout.svelte'
   import DetailOverlay from '$lib/components/kit/DetailOverlay.svelte'
   import CalendarSidebar from './CalendarSidebar.svelte'
+  import ExhaustedWritesBanner from './ExhaustedWritesBanner.svelte'
   import ViewSwitcher from './ViewSwitcher.svelte'
   import MonthView from './views/MonthView.svelte'
   import WeekView from './views/WeekView.svelte'
@@ -24,6 +25,7 @@
   import EventDetail from './EventDetail.svelte'
   import EventComposerDialog from './EventComposerDialog.svelte'
   import { calendarSources } from '$extensions/calendar/frontend/stores/calendarSources.svelte'
+  import { exhaustedWrites } from '$extensions/calendar/frontend/stores/exhaustedWrites.svelte'
   import { calendarView } from '$extensions/calendar/frontend/stores/calendarView.svelte'
   import { events } from '$extensions/calendar/frontend/stores/events.svelte'
   import { registerExtensionShortcut } from '$lib/stores/extensionShortcuts.svelte'
@@ -49,6 +51,9 @@
   // and we open the matching event here).
   onMount(() => {
     void calendarSources.load()
+    // Audit4 finding 21: surface offline writes that exhausted their
+    // retry budget, with retry/discard.
+    void exhaustedWrites.load()
     events.initSubscription(() => ({
       calendarIDs: calendarSources.visibleCalendarIDs,
       fromUnix: calendarView.visibleRange.fromUnix,
@@ -192,6 +197,7 @@
 <PaneLayout>
   <CalendarSidebar onOpenSettings={openSettings} />
   <div class="flex-1 flex flex-col min-w-0 bg-background">
+    <ExhaustedWritesBanner />
     <ViewSwitcher />
     {#if calendarView.viewKind === 'month'}<MonthView />{/if}
     {#if calendarView.viewKind === 'week'}<WeekView />{/if}

@@ -20,8 +20,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -456,5 +458,143 @@ func TestPendingQueue_Drain_DeleteRemovesLocalRow(t *testing.T) {
 	_, err := store.GetEvent("evt-row-1")
 	if !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("GetEvent after drain-delete = %v, want sql.ErrNoRows (row removed)", err)
+	}
+}
+
+// Audit4 finding 21: auth failures must not consume the retry budget,
+// and exhausted rows must be listable with retry/discard.
+func TestIsAuthFailure(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{ErrAuth, true},
+		{fmt.Errorf("google post event 401 401 Unauthorized: invalid credentials"), true},
+		{fmt.Errorf("graph request 403 403 Forbidden: insufficient privileges"), true},
+		{fmt.Errorf("google post event 500 500 Internal Server Error"), false},
+		{ErrTransport, false},
+		{ErrConflict, false},
+		{fmt.Errorf("request failed: 401 in the response body text"), false},
+	}
+	for _, c := range cases {
+		if got := IsAuthFailure(c.err); got != c.want {
+			t.Errorf("IsAuthFailure(%v) = %v, want %v", c.err, got, c.want)
+		}
+	}
+}
+
+func TestPendingQueue_Drain_AuthFailureDoesNotConsumeBudget(t *testing.T) {
+	store := newTestStore(t)
+	bus := &recordingEventBus{}
+
+	// httptest server that answers 401 to every write.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error": "invalid credentials"}`))
+	}))
+	defer srv.Close()
+
+	auth := fakeAuth{target: srv.URL}
+	queue := NewPendingQueue(store, fakeSecrets{password: "x"}, auth, bus)
+	srcID, calID := seedGoogleSource(t, store, "primary")
+	if _, err := queue.Enqueue(PendingOp{
+		SourceID: srcID, CalendarID: calID,
+		Op: PendingOpCreate, CalendarURL: "primary",
+		UID: "evt@daak-google", ICSBlob: minimalGoogleICS(t, "evt@daak-google"),
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// Drain must return (not loop forever on the un-bumped row).
+	done := make(chan error, 1)
+	go func() { done <- queue.Drain(context.Background(), srcID) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Drain did not return — auth failure re-picked the row forever")
+	}
+
+	var attempt int
+	var lastError string
+	if err := store.DB().QueryRow(
+		`SELECT attempt, COALESCE(last_error, '') FROM pending_writes WHERE source_id = ?`,
+		srcID,
+	).Scan(&attempt, &lastError); err != nil {
+		t.Fatalf("expected row to stay after auth failure, query err: %v", err)
+	}
+	if attempt != 0 {
+		t.Errorf("attempt = %d, want 0 (auth must not consume budget)", attempt)
+	}
+	if !strings.Contains(lastError, "401") {
+		t.Errorf("last_error = %q, want the 401 recorded", lastError)
+	}
+	// The row is not exhausted, so it is not listed as such.
+	exhausted, err := queue.ListExhausted()
+	if err != nil {
+		t.Fatalf("ListExhausted: %v", err)
+	}
+	if len(exhausted) != 0 {
+		t.Fatalf("exhausted = %+v, want none after auth failures", exhausted)
+	}
+}
+
+func TestPendingQueue_ExhaustedRows_ListRetryDiscard(t *testing.T) {
+	store := newTestStore(t)
+	queue := NewPendingQueue(store, fakeSecrets{password: "x"}, fakeAuth{}, &recordingEventBus{})
+	srcID, calID := seedGoogleSource(t, store, "primary")
+	id, err := queue.Enqueue(PendingOp{
+		SourceID: srcID, CalendarID: calID,
+		Op: PendingOpUpdate, CalendarURL: "primary",
+		UID: "evt@daak-google", Summary: "Standup",
+		ICSBlob: minimalGoogleICS(t, "evt@daak-google"),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// A row inside its budget cannot be retried or discarded.
+	if err := queue.RetryExhausted(id); err == nil {
+		t.Fatalf("RetryExhausted(non-exhausted) succeeded, want an error")
+	}
+	if err := queue.DiscardExhausted(id); err == nil {
+		t.Fatalf("DiscardExhausted(non-exhausted) succeeded, want an error")
+	}
+	// Exhaust it.
+	for i := 0; i < pendingMaxAttempts; i++ {
+		if _, err := queue.bumpAttempt(id, "boom"); err != nil {
+			t.Fatalf("bumpAttempt: %v", err)
+		}
+	}
+	exhausted, err := queue.ListExhausted()
+	if err != nil {
+		t.Fatalf("ListExhausted: %v", err)
+	}
+	if len(exhausted) != 1 || exhausted[0].ID != id || exhausted[0].Summary != "Standup" {
+		t.Fatalf("exhausted = %+v, want the one row with summary Standup", exhausted)
+	}
+	if n, err := queue.ExhaustedCount(); err != nil || n != 1 {
+		t.Fatalf("ExhaustedCount = %d, %v, want 1", n, err)
+	}
+	// Retry resets the budget; the row leaves the exhausted list.
+	if err := queue.RetryExhausted(id); err != nil {
+		t.Fatalf("RetryExhausted: %v", err)
+	}
+	if n, err := queue.ExhaustedCount(); err != nil || n != 0 {
+		t.Fatalf("ExhaustedCount after retry = %d, %v, want 0", n, err)
+	}
+	// Exhaust it again, then discard.
+	for i := 0; i < pendingMaxAttempts; i++ {
+		if _, err := queue.bumpAttempt(id, "boom"); err != nil {
+			t.Fatalf("bumpAttempt: %v", err)
+		}
+	}
+	if err := queue.DiscardExhausted(id); err != nil {
+		t.Fatalf("DiscardExhausted: %v", err)
+	}
+	if row, _ := queue.nextPending(srcID); row != nil {
+		t.Fatalf("row still present after discard: %+v", row)
 	}
 }
