@@ -314,6 +314,15 @@ type App struct {
 	// Temporary OAuth token storage (for pending account creation)
 	pendingOAuthTokens *oauth2.TokenResponse
 	pendingOAuthEmail  string
+	// pendingOAuthProvider binds the pending tokens to the provider
+	// (and flow) that produced them — "google", "microsoft", or
+	// "custom". A pending slot must never be consumed by a different
+	// provider's setup call: without the binding, tokens granted by
+	// one account's sign-in could be saved under another account's
+	// name. Set by the Start*OAuthFlow callbacks, verified by the
+	// Complete*/SavePending* calls, cleared with the rest of the
+	// slot by clearPendingOAuth.
+	pendingOAuthProvider string
 
 	// Pending custom ("bring your own app") OAuth provider config, set by
 	// StartCustomOAuthFlow and consumed by CompleteCustomOAuthAccountSetup so the

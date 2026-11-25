@@ -325,17 +325,38 @@ func (a *extensionAuth) StartIncrementalConsent(req coreapi.StartIncrementalCons
 	// identity — Microsoft's email/UPN/primary-SMTP are mutable and can differ
 	// across mail vs. the returned grant (#337/#328). Fall back to the email
 	// compare for Google / source-keyed / legacy accounts, where email is stable.
+	// Either check must VERIFY the grant: when neither a stable pair nor an
+	// email pair is available, the grant is unverifiable and the tokens are
+	// refused — persisting them anyway could save one account's tokens under
+	// another account's name.
 	grantedStableID := oauth2.ExtractStableSubjectFromIDToken(tokens.IDToken)
 	expectedStableID := ""
 	if req.AccountID != "" {
 		expectedStableID, _ = a.app.accountStore.GetOAuthStableID(req.AccountID)
 	}
-	haveStablePair := expectedStableID != "" && grantedStableID != ""
-	if haveStablePair && expectedStableID != grantedStableID {
-		return fmt.Errorf("incremental consent: granted account does not match the expected account")
+	verified := false
+	if expectedStableID != "" && grantedStableID != "" {
+		if expectedStableID != grantedStableID {
+			return fmt.Errorf("incremental consent: granted account does not match the expected account")
+		}
+		verified = true
+	} else if req.ExpectedEmail != "" && email != "" {
+		if !strings.EqualFold(email, req.ExpectedEmail) {
+			return fmt.Errorf("incremental consent: granted account %q does not match expected account %q", email, req.ExpectedEmail)
+		}
+		verified = true
 	}
-	if !haveStablePair && req.ExpectedEmail != "" && email != "" && !strings.EqualFold(email, req.ExpectedEmail) {
-		return fmt.Errorf("incremental consent: granted account %q does not match expected account %q", email, req.ExpectedEmail)
+	if !verified {
+		return fmt.Errorf("incremental consent: could not verify the granted account matches the expected account (no stable identity or email available) - refusing to persist tokens")
+	}
+
+	// Self-heal: verification succeeded via email but no stable ID was
+	// stored for this account — persist the granted one so the next
+	// consent validates against the immutable identity. Best-effort.
+	if req.AccountID != "" && expectedStableID == "" && grantedStableID != "" {
+		if err := a.app.accountStore.SetOAuthStableID(req.AccountID, grantedStableID); err != nil {
+			log.Warn().Err(err).Str("account_id", req.AccountID).Msg("Incremental consent: failed to persist granted stable identity")
+		}
 	}
 
 	storeTokens := &credentials.OAuthTokens{
