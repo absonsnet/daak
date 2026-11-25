@@ -717,6 +717,9 @@ func (v *ViewerApp) setStarredStatus(messageIDs []string, isStarred bool) error 
 	if len(messageIDs) == 0 {
 		return nil
 	}
+	// Star/unstar covers every same-folder copy sharing a Message-ID,
+	// exactly like read/unread already does (fourth-audit finding 43).
+	messageIDs = v.expandToFolderCopies(messageIDs)
 	messages, err := v.messageStore.GetByIDs(messageIDs)
 	if err != nil {
 		return fmt.Errorf("failed to get messages: %w", err)
@@ -1998,24 +2001,27 @@ func (v *ViewerApp) SaveAllAttachments(messageID string) (string, error) {
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
 	savedCount := 0
+	failed := []string{}
 	usedNames := map[string]bool{}
 	for _, att := range attachments {
 		content, err := downloader.ExtractAttachmentContentFor(raw, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		savePath := filepath.Join(saveDir, email.DeduplicateFilename(saveDir, att.Filename, usedNames))
 		_, err = downloader.SaveAttachment(att, content, savePath)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		savedCount++
 	}
 
 	log.Info().Int("count", savedCount).Str("folder", saveDir).Msg("Saved all attachments")
-	return saveDir, nil
+	return saveDir, saveAllResultError(savedCount, len(attachments), failed)
 }
 
 // decryptMessageBody decrypts an encrypted message's raw body.
@@ -2213,24 +2219,27 @@ func (v *ViewerApp) SaveAllEncryptedAttachments(messageID string) (string, error
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
 	savedCount := 0
+	failed := []string{}
 	usedNames := map[string]bool{}
 	for _, att := range regularAtts {
 		content, err := downloader.ExtractAttachmentContentFor(innerBytes, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract encrypted attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		savePath := filepath.Join(saveDir, email.DeduplicateFilename(saveDir, att.Filename, usedNames))
 		_, err = downloader.SaveAttachment(att, content, savePath)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save encrypted attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		savedCount++
 	}
 
 	log.Info().Int("count", savedCount).Str("folder", saveDir).Msg("Saved all encrypted attachments")
-	return saveDir, nil
+	return saveDir, saveAllResultError(savedCount, len(regularAtts), failed)
 }
 
 // saveAllAttachmentsViaPortal saves all attachments using the XDG
@@ -2270,6 +2279,7 @@ func (v *ViewerApp) saveAllAttachmentsViaPortal(messageID string, attachments []
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
 	savedCount := 0
+	failed := []string{}
 	for i, att := range attachments {
 		if i >= len(savePaths) {
 			break
@@ -2277,18 +2287,20 @@ func (v *ViewerApp) saveAllAttachmentsViaPortal(messageID string, attachments []
 		content, err := downloader.ExtractAttachmentContentFor(raw, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		_, err = downloader.SaveAttachment(att, content, savePaths[i])
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		savedCount++
 	}
 
 	log.Info().Int("count", savedCount).Msg("Saved all attachments via portal")
-	return filepath.Dir(savePaths[0]), nil
+	return filepath.Dir(savePaths[0]), saveAllResultError(savedCount, len(attachments), failed)
 }
 
 // saveAllEncryptedAttachmentsViaPortal saves all encrypted attachments
@@ -2315,6 +2327,7 @@ func (v *ViewerApp) saveAllEncryptedAttachmentsViaPortal(attachments []*message.
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
 	savedCount := 0
+	failed := []string{}
 	for i, att := range attachments {
 		if i >= len(savePaths) {
 			break
@@ -2322,18 +2335,20 @@ func (v *ViewerApp) saveAllEncryptedAttachmentsViaPortal(attachments []*message.
 		content, err := downloader.ExtractAttachmentContentFor(innerBytes, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract encrypted attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		_, err = downloader.SaveAttachment(att, content, savePaths[i])
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save encrypted attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		savedCount++
 	}
 
 	log.Info().Int("count", savedCount).Msg("Saved all encrypted attachments via portal")
-	return filepath.Dir(savePaths[0]), nil
+	return filepath.Dir(savePaths[0]), saveAllResultError(savedCount, len(attachments), failed)
 }
 
 // rememberSavePath records a path the user chose in a save dialog (#474).
