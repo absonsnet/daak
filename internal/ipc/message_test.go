@@ -111,3 +111,22 @@ func TestParsePayloadNil(t *testing.T) {
 		t.Fatalf("expected nil error for nil payload, got: %v", err)
 	}
 }
+
+// TestViewerFolderCountsChangedPayload (fourth-audit finding 47):
+// the viewer popup's folder-count notice round-trips through the IPC
+// message envelope, so the main window can re-read the counts it
+// names.
+func TestViewerFolderCountsChangedPayload(t *testing.T) {
+	payload := ViewerFolderCountsChangedPayload{Counts: map[string]int{"inbox-1": 3, "spam-1": 0}}
+	msg, err := NewMessage(TypeViewerFolderCountsChanged, payload)
+	if err != nil {
+		t.Fatalf("NewMessage failed: %v", err)
+	}
+	var parsed ViewerFolderCountsChangedPayload
+	if err := msg.ParsePayload(&parsed); err != nil {
+		t.Fatalf("ParsePayload failed: %v", err)
+	}
+	if len(parsed.Counts) != 2 || parsed.Counts["inbox-1"] != 3 || parsed.Counts["spam-1"] != 0 {
+		t.Fatalf("parsed counts = %v, want map[inbox-1:3 spam-1:0]", parsed.Counts)
+	}
+}

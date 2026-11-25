@@ -64,12 +64,12 @@ func newUnsubscribeTestApp(t *testing.T) *unsubscribeTestApp {
 	uta := &unsubscribeTestApp{db: db}
 	accountStore := account.NewStore(db)
 	a := &App{
-		ctx:           context.Background(),
-		db:            db,
-		accountStore:  accountStore,
-		folderStore:   folder.NewStore(db),
-		messageStore:  message.NewStore(db),
-		ownExpungeAt:  make(map[string]time.Time),
+		ctx:             context.Background(),
+		db:              db,
+		accountStore:    accountStore,
+		folderStore:     folder.NewStore(db),
+		messageStore:    message.NewStore(db),
+		ownExpungeAt:    make(map[string]time.Time),
 		syncLastRequest: make(map[string]time.Time),
 		syncContexts:    make(map[string]context.CancelFunc),
 		composeOps: composeOps{

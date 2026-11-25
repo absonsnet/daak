@@ -687,6 +687,17 @@ func (v *ViewerApp) setReadStatus(messageIDs []string, isRead bool) error {
 	if err := v.messageStore.RecordPendingFlagChanges(messages, message.FlagTypeRead, isRead); err != nil {
 		log.Warn().Err(err).Msg("Local read flag updated but its pending row could not be recorded — a failed push may flip it back")
 	}
+	// The main window's sidebar badge reads folder counts from the
+	// shared database plus folders:countsChanged events — and this
+	// popup is a separate process, so its own events never reach the
+	// main window (fourth-audit finding 47). Adjust the shared
+	// folder rows with the same delta math App.setReadStatus uses,
+	// then tell the main window over IPC so it re-reads and emits.
+	go func() {
+		defer recoverPanic("viewer.actions", "update folder counts")
+		counts := v.adjustFolderCountsForReadFlip(byFolder, isRead)
+		v.notifyFolderCountsChanged(counts)
+	}()
 	wailsRuntime.EventsEmit(v.ctx, "messages:readChanged", map[string]interface{}{
 		"messageIds": messageIDs,
 		"isRead":     isRead,
@@ -700,6 +711,43 @@ func (v *ViewerApp) setReadStatus(messageIDs []string, isRead bool) error {
 		}, byFolder, message.FlagTypeRead, isRead)
 	}()
 	return nil
+}
+
+// adjustFolderCountsForReadFlip applies the unread-count delta of a
+// read flip to the shared folder rows — the same delta math as
+// App.setReadStatus (readFlipDelta over the pre-mutation messages,
+// so messages already in the target state contribute nothing) —
+// and returns the new unread count per folder for the main window.
+func (v *ViewerApp) adjustFolderCountsForReadFlip(byFolder map[string][]*message.Message, isRead bool) map[string]int {
+	log := logging.WithComponent("viewer")
+	counts := make(map[string]int, len(byFolder))
+	for folderID, msgs := range byFolder {
+		f, err := v.folderStore.AdjustCounts(folderID, 0, readFlipDelta(msgs, isRead))
+		if err != nil {
+			log.Error().Err(err).Str("folderID", folderID).Msg("Failed to adjust folder counts")
+			continue
+		}
+		counts[folderID] = f.UnreadCount
+	}
+	return counts
+}
+
+// notifyFolderCountsChanged tells the main window the unread counts
+// changed, so its sidebar badge re-reads them. Best-effort: the
+// shared database rows are already adjusted, so a failed send only
+// delays the badge until the next sync — it never loses the counts.
+func (v *ViewerApp) notifyFolderCountsChanged(counts map[string]int) {
+	if v.ipcClient == nil || len(counts) == 0 {
+		return
+	}
+	msg, err := ipc.NewMessage(ipc.TypeViewerFolderCountsChanged, ipc.ViewerFolderCountsChangedPayload{Counts: counts})
+	if err != nil {
+		return
+	}
+	if err := v.ipcClient.Send(msg); err != nil {
+		log := logging.WithComponent("viewer")
+		log.Warn().Err(err).Msg("Failed to notify main window of folder count change")
+	}
 }
 
 // Star marks messages as starred.
