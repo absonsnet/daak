@@ -65,6 +65,15 @@ func (e *AttachmentExtractor) ExtractAttachments(messageID string, raw []byte) (
 		return nil, fmt.Errorf("failed to parse message: %w", err)
 	}
 
+	// An encrypted message's payload is the message itself, not an
+	// attachment (re-audit finding R19): without this a PGP/MIME or
+	// S/MIME message opened from server search yields phantom
+	// downloadable rows (usually attachment.bin) for its encrypted
+	// parts. Decryption happens on view from the stored raw body.
+	if isEncryptedContentType(entity.Header.Get("Content-Type")) {
+		return nil, nil
+	}
+
 	// Check if it's a multipart message
 	if mr := entity.MultipartReader(); mr != nil {
 		return e.extractFromMultipart(messageID, mr), nil
@@ -84,6 +93,12 @@ func (e *AttachmentExtractor) extractFromSinglePart(messageID string, entity *go
 	contentType, params, _ := mime.ParseMediaType(entity.Header.Get("Content-Type"))
 	disposition, dispParams, _ := mime.ParseMediaType(entity.Header.Get("Content-Disposition"))
 	contentID := strings.Trim(entity.Header.Get("Content-ID"), "<>")
+
+	// An encrypted single-part body is the message itself, not a
+	// downloadable attachment (R19).
+	if isEncryptedContentType(entity.Header.Get("Content-Type")) {
+		return nil
+	}
 
 	// Signature parts are never downloadable attachments.
 	if isSignaturePart(contentType) {
@@ -127,6 +142,28 @@ func (e *AttachmentExtractor) extractFromSinglePart(messageID string, entity *go
 	return []*AttachmentData{{Attachment: att, Content: content}}
 }
 
+// isEncryptedContentType reports whether a Content-Type header value is
+// an encrypted payload: S/MIME enveloped-data (application/pkcs7-mime
+// with smime-type=enveloped-data), PGP/MIME multipart/encrypted (with
+// or without the protocol parameter), or the PGP/MIME version part
+// (application/pgp-encrypted). Mirrors smime.IsSMIMEEncrypted and
+// pgp.IsPGPEncrypted, reimplemented here so this package does not take
+// a dependency on those packages for one classification. The encrypted
+// payload is the message itself, never an attachment (R19).
+func isEncryptedContentType(contentType string) bool {
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(mediaType) {
+	case "multipart/encrypted", "application/pgp-encrypted":
+		return true
+	case "application/pkcs7-mime", "application/x-pkcs7-mime":
+		return strings.EqualFold(params["smime-type"], "enveloped-data")
+	}
+	return false
+}
+
 // isSignaturePart returns true for S/MIME and PGP signature content types
 // that should not be exposed as downloadable attachments. Must mirror
 // isSignaturePart in internal/sync/parse.go — the two cannot share one
@@ -159,6 +196,14 @@ func (e *AttachmentExtractor) extractFromMultipart(messageID string, mr gomessag
 		contentType, params, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
 		disposition, dispParams, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
 		contentID := strings.Trim(part.Header.Get("Content-ID"), "<>")
+
+		// An encrypted subtree or part is payload, not an attachment
+		// (R19): skip it whole — including the PGP/MIME version part
+		// (application/pgp-encrypted) and the encrypted data part —
+		// instead of surfacing them as downloadable files.
+		if isEncryptedContentType(part.Header.Get("Content-Type")) {
+			continue
+		}
 
 		// Handle nested multipart
 		if strings.HasPrefix(contentType, "multipart/") {

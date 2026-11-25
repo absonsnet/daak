@@ -485,6 +485,18 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 		Int("rawLen", len(raw)).
 		Msg("Parsing message body")
 
+	// Encrypted mail (S/MIME enveloped-data or PGP/MIME
+	// multipart/encrypted) is not an attachment and has no readable
+	// body text: the encrypted payload is the message itself, stored as
+	// the raw body by the modern parser and decrypted on view. Mirror
+	// that here (re-audit finding R19): without this the encrypted
+	// parts below are classified as attachments, so a message opened
+	// from server search gains a phantom downloadable file (usually
+	// attachment.bin) that is actually the encrypted message.
+	if isEncryptedContentType(topLevelCT) {
+		return "", "", false, false
+	}
+
 	// Check if it's a multipart message
 	mr := entity.MultipartReader()
 	e.log.Debug().Bool("isMultipart", mr != nil).Msg("Multipart detection result")
@@ -514,6 +526,14 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 				Str("disposition", disposition).
 				Str("charset", params["charset"]).
 				Msg("Processing multipart part")
+
+			// An encrypted part or subtree is payload, not an attachment
+			// or body text (R19): skip it whole instead of classifying
+			// its parts. This covers multipart/encrypted nested inside
+			// multipart/mixed, and a lone enveloped S/MIME part.
+			if isEncryptedContentType(part.Header.Get("Content-Type")) {
+				continue
+			}
 
 			// Check for attachments (signature parts are not attachments)
 			if disposition == "attachment" && !isSignaturePart(contentType) {
@@ -711,6 +731,12 @@ func (e *Engine) parseNestedMultipart(entity *gomessage.Entity) (bodyText, bodyH
 		contentType, params, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
 		disposition, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
 
+		// An encrypted part or subtree is payload, not an attachment
+		// (R19) — same skip as the top-level walk in parseMessageBody.
+		if isEncryptedContentType(part.Header.Get("Content-Type")) {
+			continue
+		}
+
 		// Signature parts are not attachments.
 		if disposition == "attachment" && !isSignaturePart(contentType) {
 			hasAttachments = true
@@ -872,6 +898,26 @@ func (e *Engine) extractAttachmentMetadata(part *gomessage.Entity, messageID, co
 	}
 
 	return att
+}
+
+// isEncryptedContentType reports whether a Content-Type header value is
+// an encrypted payload: S/MIME enveloped-data, PGP/MIME
+// multipart/encrypted (with or without the protocol parameter), or the
+// PGP/MIME version part (application/pgp-encrypted). The encrypted
+// payload is the message itself, never an attachment — see R19.
+func isEncryptedContentType(contentType string) bool {
+	if smime.IsSMIMEEncrypted(contentType) || pgp.IsPGPEncrypted(contentType) {
+		return true
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(mediaType) {
+	case "multipart/encrypted", "application/pgp-encrypted":
+		return true
+	}
+	return false
 }
 
 // isSignaturePart returns true for S/MIME and PGP signature content types

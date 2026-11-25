@@ -417,8 +417,18 @@ func (e *Engine) FetchServerMessage(ctx context.Context, accountID, folderID str
 	// so a later body pass retries it instead of stranding a permanently
 	// blank row.
 	var parsed *ParsedBody
+	isEncrypted := false
 	if len(rawBytes) > 0 {
 		parsed = e.parseMessageBodyFull(rawBytes, "", 30*time.Second)
+		if parsed != nil && (parsed.SMIMEEncrypted || parsed.PGPEncrypted) {
+			isEncrypted = true
+			// R19: the encrypted payload is the message itself, not an
+			// attachment. The legacy parser no longer flags it, but
+			// clear the flag here too so the row Create below can never
+			// persist a paperclip for it, whatever the legacy parse
+			// reported, and the extractor below is skipped outright.
+			m.HasAttachments = false
+		}
 		if parsed != nil &&
 			((parsed.SMIMEEncrypted && len(parsed.SMIMERawBody) == 0) ||
 				(parsed.PGPEncrypted && len(parsed.PGPRawBody) == 0)) {
@@ -461,7 +471,9 @@ func (e *Engine) FetchServerMessage(ctx context.Context, accountID, folderID str
 	// Extract and store attachments. Replace, don't append (same class
 	// as the on-demand fetch in fetch.go): a plain Create doubles the
 	// rows if this message's attachments were already stored.
-	if m.HasAttachments && len(rawBytes) > 0 && e.attachmentStore != nil {
+	// R19: never extract for an encrypted message — its parts are the
+	// encrypted payload, not downloadable files.
+	if m.HasAttachments && !isEncrypted && len(rawBytes) > 0 && e.attachmentStore != nil {
 		attachments, err := e.attachExtractor.ExtractAttachments(m.ID, rawBytes)
 		if err != nil {
 			e.log.Debug().Err(err).Str("messageId", m.ID).Msg("Failed to extract attachments")
