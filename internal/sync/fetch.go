@@ -435,6 +435,27 @@ func shouldChargeFailure(receivedBytes, reportedSize int64) bool {
 	return receivedBytes >= threshold
 }
 
+// splitFetchableIDs partitions a batch of message IDs into the ones the
+// server can actually be asked for (a real UID came back from
+// GetMessageUIDsAndFolder) and the ones with no server UID yet — just-moved
+// messages carrying a negative placeholder UID, which the plural lookup
+// skips exactly as the singular lookup refuses them. Only the fetchable IDs
+// may be passed to markUnresolvedAsFailed: charging a placeholder ID
+// body_failed would strand it for ever, because every
+// GetMessagesWithoutBody variant requires body_failed = 0 while only the
+// destination sync can resolve the real UID. Kept pure so the partition
+// itself is unit-testable without standing up a sync engine.
+func splitFetchableIDs(batchIDs []string, uidInfos map[string]message.UIDInfo) (fetchable, skipped []string) {
+	for _, id := range batchIDs {
+		if _, ok := uidInfos[id]; ok {
+			fetchable = append(fetchable, id)
+		} else {
+			skipped = append(skipped, id)
+		}
+	}
+	return fetchable, skipped
+}
+
 // markUnresolvedAsFailed persists messages.body_failed=1 for any requested ID
 // whose body parsed to nothing usable AND wasn't encrypted, OR whose UID the server
 // didn't return at all. Encrypted messages (which legitimately carry empty
@@ -625,6 +646,15 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 	connectionFailures := 0 // total connection recovery attempts
 	fetched := 0
 	failed := 0
+	noServerUID := make(map[string]bool)
+
+	// noServerUID remembers, for this run only, the message IDs whose UID
+	// lookup came back empty — just-moved messages carrying a placeholder
+	// UID, which have no server UID to fetch under. They are skipped when
+	// building later batches: without this the loop would re-query the
+	// same candidates for ever (they stay body_failed = 0, correctly, so
+	// the candidate query keeps returning them) instead of moving on to
+	// fetchable messages. They resolve via the destination sync, not here.
 
 	// Note: parse-failure tracking is persisted in messages.body_failed (v39).
 	// Once a fetch returns nothing usable for a message, MarkBodyFailed flags
@@ -773,6 +803,12 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 		var batchBytes int64
 
 		for _, msg := range candidates {
+			// Skip messages already found to have no server UID yet in
+			// this run (see noServerUID): re-selecting them would spin
+			// the loop on the same batch for ever.
+			if noServerUID[msg.ID] {
+				continue
+			}
 			msgSize := int64(msg.Size)
 			if msgSize <= 0 {
 				msgSize = 10 * 1024 // Assume 10KB for messages with unknown size
@@ -816,6 +852,20 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 		uidToMessageID := make(map[uint32]string)
 		for msgID, info := range uidInfos {
 			uidToMessageID[info.UID] = msgID
+		}
+
+		// Only the IDs with a real UID were actually requested from the
+		// server: a just-moved message's placeholder UID was skipped by
+		// the lookup, so it must never reach markUnresolvedAsFailed as a
+		// "requested but unreturned" ID (that would charge it
+		// body_failed and strand it). Remember the skipped IDs for this
+		// run so later batches don't re-select them.
+		requestedIDs, skippedIDs := splitFetchableIDs(batchIDs, uidInfos)
+		for _, id := range skippedIDs {
+			noServerUID[id] = true
+		}
+		if len(skippedIDs) > 0 {
+			e.log.Debug().Strs("messageIDs", skippedIDs).Msg("Skipping messages with no server UID yet in this body-fetch run")
 		}
 
 		if len(uidToMessageID) == 0 {
@@ -885,7 +935,9 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 			// No size signals here — server returned nothing, so every ID
 			// falls through to the "no signal" branch of shouldChargeFailure
 			// and gets charged. Pass nil to keep the call sites uniform.
-			e.markUnresolvedAsFailed(batchIDs, nil, nil, nil)
+			// requestedIDs (not batchIDs): placeholder-UID messages were
+			// never asked of the server, so they must not be charged.
+			e.markUnresolvedAsFailed(requestedIDs, nil, nil, nil)
 			failed += len(uidToMessageID)
 			continue
 		}
@@ -939,7 +991,7 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 				Msg("Built body updates and attachments for batch")
 
 			resultChan <- processingResult{
-				requestedIDs: batchIDs,
+				requestedIDs: requestedIDs,
 				bodyUpdates:  bodyUpdates,
 				attachments:  allAttachments,
 				sizes:        sizes,
