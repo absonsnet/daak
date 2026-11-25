@@ -85,9 +85,11 @@ func (a *App) StartOAuthFlow(provider string) error {
 			return
 		}
 
-		// Store tokens temporarily for account creation
+		// Store tokens temporarily for account creation, bound to
+		// the provider that produced them (finding 15).
 		a.pendingOAuthTokens = tokens
 		a.pendingOAuthEmail = email
+		a.pendingOAuthProvider = provider
 
 		log.Info().
 			Str("provider", provider).
@@ -127,6 +129,16 @@ func (a *App) persistOAuthStableID(accountID string, tokens *oauth2.TokenRespons
 	}
 }
 
+// clearPendingOAuth drops the whole pending OAuth slot (tokens,
+// email, provider binding). Called on every consume path — success
+// or rejection — so stale tokens from one sign-in can never be
+// retried against another account.
+func (a *App) clearPendingOAuth() {
+	a.pendingOAuthTokens = nil
+	a.pendingOAuthEmail = ""
+	a.pendingOAuthProvider = ""
+}
+
 func (a *App) CompleteOAuthAccountSetup(provider, email, accountName, displayName, color string) (*account.Account, error) {
 	log := logging.WithComponent("app.oauth")
 
@@ -141,12 +153,27 @@ func (a *App) CompleteOAuthAccountSetup(provider, email, accountName, displayNam
 		return nil, fmt.Errorf("no pending OAuth tokens - please complete the sign-in process first")
 	}
 
-	// Verify the email matches
-	if a.pendingOAuthEmail != "" && a.pendingOAuthEmail != email {
-		log.Warn().
-			Str("expected", a.pendingOAuthEmail).
-			Str("provided", email).
-			Msg("OAuth email mismatch, using provided email")
+	// The pending tokens are bound to the provider that produced
+	// them: tokens granted by another provider's sign-in must never
+	// be saved under this account's name.
+	if a.pendingOAuthProvider != provider {
+		issuedFor := a.pendingOAuthProvider
+		a.clearPendingOAuth()
+		return nil, fmt.Errorf("pending OAuth tokens were issued for provider %q, not %q - please sign in again", issuedFor, provider)
+	}
+
+	// Verify the email matches the account the user signed in as.
+	// A mismatch used to log a warning and save anyway, so one
+	// account's tokens could land under another account's name.
+	// It is now a hard rejection, and the pending slot is cleared
+	// so the tokens cannot be retried against a different account.
+	if a.pendingOAuthEmail == "" {
+		a.clearPendingOAuth()
+		return nil, fmt.Errorf("could not verify the signed-in account's email - please sign in again")
+	}
+	if a.pendingOAuthEmail != email {
+		a.clearPendingOAuth()
+		return nil, fmt.Errorf("OAuth email mismatch: signed in as %q, but the account is for %q - please sign in with the right account", a.pendingOAuthEmail, email)
 	}
 
 	// Get provider config for IMAP/SMTP settings
@@ -239,8 +266,7 @@ func (a *App) CompleteOAuthAccountSetup(provider, email, accountName, displayNam
 	a.persistOAuthStableID(acc.ID, a.pendingOAuthTokens)
 
 	// Clear pending tokens
-	a.pendingOAuthTokens = nil
-	a.pendingOAuthEmail = ""
+	a.clearPendingOAuth()
 
 	log.Info().
 		Str("accountID", acc.ID).
@@ -322,6 +348,7 @@ func (a *App) StartCustomOAuthFlow(authURL, tokenURL, userinfoURL string, scopes
 
 		a.pendingOAuthTokens = tokens
 		a.pendingOAuthEmail = email
+		a.pendingOAuthProvider = customOAuthProviderName
 
 		log.Info().
 			Str("provider", customOAuthProviderName).
@@ -377,6 +404,12 @@ func (a *App) CompleteCustomOAuthAccountSetup(config account.AccountConfig) (*ac
 	if a.pendingCustomProvider == nil {
 		return nil, fmt.Errorf("no pending custom OAuth provider - please restart the sign-in process")
 	}
+	// The pending tokens must come from the custom flow, not from a
+	// shipped provider's sign-in that happened to run in between.
+	if a.pendingOAuthProvider != customOAuthProviderName {
+		a.clearPendingOAuth()
+		return nil, fmt.Errorf("pending OAuth tokens were not issued by the custom OAuth flow - please restart the sign-in process")
+	}
 	provider := a.pendingCustomProvider
 
 	config.AuthType = account.AuthOAuth2
@@ -425,8 +458,7 @@ func (a *App) CompleteCustomOAuthAccountSetup(config account.AccountConfig) (*ac
 	// Capture the stable account identity (oid+tid) for incremental-consent validation.
 	a.persistOAuthStableID(acc.ID, a.pendingOAuthTokens)
 
-	a.pendingOAuthTokens = nil
-	a.pendingOAuthEmail = ""
+	a.clearPendingOAuth()
 	a.pendingCustomProvider = nil
 
 	a.updateDBConnectionPool()
@@ -457,6 +489,37 @@ func (a *App) SavePendingOAuthTokens(accountID string) error {
 	provider, err := a.credStore.GetOAuthProvider(accountID)
 	if err != nil || provider == "" {
 		return fmt.Errorf("could not determine OAuth provider for account")
+	}
+
+	// The pending tokens must belong to this account's provider:
+	// without the binding, a sign-in for another provider (or
+	// another account on the same provider) could overwrite this
+	// account's tokens. The slot is cleared on rejection so the
+	// tokens cannot be retried against a different account.
+	if a.pendingOAuthProvider != provider {
+		issuedFor := a.pendingOAuthProvider
+		a.clearPendingOAuth()
+		return fmt.Errorf("pending OAuth tokens were issued for provider %q, not %q - please sign in again", issuedFor, provider)
+	}
+
+	// The pending tokens must also belong to this account's email.
+	// Custom providers carry no verifiable email (their userinfo
+	// lookup is unsupported), so the provider binding above is the
+	// only check for them; for shipped providers an unverifiable
+	// (empty) or mismatched email refuses the save.
+	if provider != customOAuthProviderName {
+		acc, accErr := a.accountStore.Get(accountID)
+		if accErr != nil || acc == nil {
+			return fmt.Errorf("could not load account for token save")
+		}
+		if a.pendingOAuthEmail == "" {
+			a.clearPendingOAuth()
+			return fmt.Errorf("could not verify the signed-in account's email - please sign in again")
+		}
+		if a.pendingOAuthEmail != acc.Email {
+			a.clearPendingOAuth()
+			return fmt.Errorf("OAuth email mismatch: signed in as %q, but the account is %q - please sign in with the right account", a.pendingOAuthEmail, acc.Email)
+		}
 	}
 
 	// Resolve scopes for the token record. Shipped providers expose them via their
@@ -512,8 +575,7 @@ func (a *App) SavePendingOAuthTokens(accountID string) error {
 		Msg("Pending OAuth tokens saved to account")
 
 	// Clear pending tokens
-	a.pendingOAuthTokens = nil
-	a.pendingOAuthEmail = ""
+	a.clearPendingOAuth()
 
 	return nil
 }
@@ -526,8 +588,7 @@ func (a *App) CancelOAuthFlow() {
 	a.oauth2Manager.CancelAuthFlow()
 
 	// Clear any pending tokens
-	a.pendingOAuthTokens = nil
-	a.pendingOAuthEmail = ""
+	a.clearPendingOAuth()
 
 	wailsRuntime.EventsEmit(a.ctx, "oauth:cancelled", nil)
 }

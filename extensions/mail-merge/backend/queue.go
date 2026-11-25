@@ -406,10 +406,26 @@ func (b *MailMergeBridge) sendOneQueuedItem(sender *hostmm.RawSender, item Queue
 	if _, err := b.store.DeleteSendingQueueItem(item.ID); err != nil {
 		_ = b.store.MarkItemSent(item.ID, now)
 	}
-	_ = b.store.SaveRowResult(item.RunID, hostmm.RowResult{
+	// The log write is checked, not ignored: a failed write used to
+	// leave the row "queued" with no queue item, and the run stuck
+	// "queued" forever. Retry once, then log loudly — the next load
+	// reconciles the dangling row from the (gone) queue item
+	// (ReconcileQueuedRows), so a lost write is recoverable but never
+	// silent.
+	if err := b.store.SaveRowResult(item.RunID, hostmm.RowResult{
 		Index: item.RowIndex, Email: item.Recipient,
 		Status: hostmm.RowSent, Timestamp: now,
-	})
+	}); err != nil {
+		if err2 := b.store.SaveRowResult(item.RunID, hostmm.RowResult{
+			Index: item.RowIndex, Email: item.Recipient,
+			Status: hostmm.RowSent, Timestamp: now,
+		}); err2 != nil {
+			log := logging.WithComponent("mailmerge.queue")
+			log.Error().Err(err2).
+				Str("runID", item.RunID).Int("rowIndex", item.RowIndex).
+				Msg("Failed to record sent row in run log — run will be reconciled on load")
+		}
+	}
 	return true, false
 }
 
@@ -427,10 +443,23 @@ func (b *MailMergeBridge) recordQueueFailure(item QueuedItem, now time.Time, sen
 	}
 	_ = b.store.UpdateItemAttempt(item.ID, attempts, status, nextAttempt, sendErr.Error())
 	if status == QueueStatusFailed {
-		_ = b.store.SaveRowResult(item.RunID, hostmm.RowResult{
+		// Same rule as the sent path: a lost log write must not
+		// leave the row "queued" while its queue item is failed —
+		// retry once, then log loudly (the next load reconciles it).
+		if err := b.store.SaveRowResult(item.RunID, hostmm.RowResult{
 			Index: item.RowIndex, Email: item.Recipient,
 			Status: hostmm.RowFailed, Error: sendErr.Error(), Timestamp: now,
-		})
+		}); err != nil {
+			if err2 := b.store.SaveRowResult(item.RunID, hostmm.RowResult{
+				Index: item.RowIndex, Email: item.Recipient,
+				Status: hostmm.RowFailed, Error: sendErr.Error(), Timestamp: now,
+			}); err2 != nil {
+				log := logging.WithComponent("mailmerge.queue")
+				log.Error().Err(err2).
+					Str("runID", item.RunID).Int("rowIndex", item.RowIndex).
+					Msg("Failed to record failed row in run log — run will be reconciled on load")
+			}
+		}
 		return true
 	}
 	return false

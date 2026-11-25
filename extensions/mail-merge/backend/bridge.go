@@ -451,7 +451,25 @@ func (b *MailMergeBridge) MailMerge_ListRuns() ([]hostmm.RunSummary, error) {
 	if err := b.ensureInit(); err != nil {
 		return nil, err
 	}
-	return b.store.ListRuns()
+	summaries, err := b.store.ListRuns()
+	if err != nil {
+		return nil, err
+	}
+	// A "queued" run whose rows were reconciled on load (finding 14)
+	// would otherwise keep stale counts/status in the list until
+	// something opened it: refresh queued runs so the list shows the
+	// corrected state.
+	refreshed := false
+	for _, s := range summaries {
+		if s.Status == hostmm.RunQueued {
+			b.refreshRunCounts(s.ID)
+			refreshed = true
+		}
+	}
+	if refreshed {
+		return b.store.ListRuns()
+	}
+	return summaries, nil
 }
 
 // MailMerge_CancelRun cancels a running run. It stops after the current
@@ -479,6 +497,39 @@ func (b *MailMergeBridge) MailMerge_CancelRun(runID string) error {
 		return fmt.Errorf("mail-merge: run %q not found", runID)
 	}
 	return nil
+}
+
+// messageIDFromRaw extracts the Message-ID header value from
+// rendered RFC822 bytes ("" when absent). Used to recover a resumed
+// row's identity from its failed queue item's bytes.
+func messageIDFromRaw(raw []byte) string {
+	for _, line := range strings.Split(string(raw), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			break // end of headers
+		}
+		if len(trimmed) > len("Message-ID:") && strings.EqualFold(trimmed[:len("Message-ID:")], "Message-ID:") {
+			return strings.TrimSpace(trimmed[len("Message-ID:"):])
+		}
+	}
+	return ""
+}
+
+// sentAddresses returns the lowercased first-To addresses of a run's
+// sent / draft-saved rows — the duplicate-suppression seed for a resume
+// or a held batch (finding 8). Failed / held / skipped rows are not
+// included: their addresses were never delivered.
+func sentAddresses(run *hostmm.Run) []string {
+	if run == nil {
+		return nil
+	}
+	var out []string
+	for _, r := range run.Rows {
+		if (r.Status == hostmm.RowSent || r.Status == hostmm.RowDraftSaved) && r.Email != "" {
+			out = append(out, r.Email)
+		}
+	}
+	return out
 }
 
 // MailMerge_ResumeRun re-runs the FAILED rows of a run only (NOT held
@@ -509,13 +560,24 @@ func (b *MailMergeBridge) MailMerge_ResumeRun(runID string) (string, error) {
 	}
 	var rows []map[string]string
 	var messageIDs []string
+	var resumedIndices []int
 	for _, r := range run.Rows {
 		if r.Status == hostmm.RowFailed && r.Index >= 0 && r.Index < len(req.Rows) {
 			rows = append(rows, req.Rows[r.Index])
 			// The Message-ID assigned when this row was first
 			// rendered rides along, parallel to rows, so the retry
-			// rebuilds the same mail with the same identity.
-			messageIDs = append(messageIDs, r.MessageID)
+			// rebuilds the same mail with the same identity. The
+			// run log does not always carry it (the failed-row
+			// update drops it) — recover it from the failed queue
+			// item's rendered bytes, which still hold the header.
+			id := r.MessageID
+			if id == "" {
+				if item, err := b.store.GetQueueItemForRow(runID, r.Index); err == nil && item != nil {
+					id = messageIDFromRaw(item.RawMessage)
+				}
+			}
+			messageIDs = append(messageIDs, id)
+			resumedIndices = append(resumedIndices, r.Index)
 		}
 	}
 	// A run that failed as a whole (RunFailed) with no failed rows
@@ -524,6 +586,9 @@ func (b *MailMergeBridge) MailMerge_ResumeRun(runID string) (string, error) {
 	// processed, so all of them are the failed set.
 	if len(rows) == 0 && run.Status == hostmm.RunFailed {
 		rows = append(rows, req.Rows...)
+		for i := range req.Rows {
+			resumedIndices = append(resumedIndices, i)
+		}
 	}
 	if len(rows) == 0 {
 		return "", fmt.Errorf("mail-merge: run %q has no failed rows to resume", runID)
@@ -532,6 +597,23 @@ func (b *MailMergeBridge) MailMerge_ResumeRun(runID string) (string, error) {
 	req.MessageIDs = messageIDs
 	req.StartRow = 0
 	req.StopRow = 0
+	// Seed duplicate suppression with every address the original run
+	// already sent / draft-saved — and, for "later" runs, every
+	// address still queued for it. A resumed run re-executes only its
+	// failed rows, but the duplicate check otherwise covers just the
+	// resumed run: a failed row to an address the original run already
+	// delivered to (via another row) would send the same person the
+	// same mail twice.
+	req.AlreadySent = sentAddresses(run)
+	if req.DeliverMode == "later" {
+		if items, err := b.store.ListQueueItems(); err == nil {
+			for _, it := range items {
+				if it.RunID == runID && (it.Status == QueueStatusQueued || it.Status == QueueStatusSending) && it.Recipient != "" {
+					req.AlreadySent = append(req.AlreadySent, it.Recipient)
+				}
+			}
+		}
+	}
 	req.AttachmentDir = b.effectiveAttachmentDir(req)
 	if v := hostmm.Validate(req.Template, req.Rows, req.AttachmentDir); len(v.UnresolvedVariables) > 0 {
 		return "", fmt.Errorf("mail-merge: unresolved variable(s): %s", strings.Join(v.UnresolvedVariables, ", "))
@@ -550,6 +632,23 @@ func (b *MailMergeBridge) MailMerge_ResumeRun(runID string) (string, error) {
 		return "", err
 	}
 	if req.DeliverMode == "later" {
+		// Remove the old failed queue items for the resumed rows
+		// BEFORE re-rendering them: the resume enqueues fresh items
+		// carrying the same Message-IDs, and the failed copies must
+		// not still sit in the queue (a later RetryFailedRunItems
+		// would send them a second time). A failure here aborts the
+		// resume — unless there are no failed items to remove at
+		// all (e.g. the rows failed at enqueue because the queue
+		// table was gone): then there is nothing to clean up and
+		// the resume proceeds, failing the same way at enqueue.
+		if _, err := b.store.DeleteFailedQueueItemsForRows(runID, resumedIndices); err != nil {
+			hasFailed, perr := b.store.HasFailedQueueItems(runID, resumedIndices)
+			if perr != nil || hasFailed {
+				return "", fmt.Errorf("mail-merge: could not remove old failed queue items for resume: %w", err)
+			}
+			log := logging.WithComponent("mailmerge")
+			log.Warn().Err(err).Str("runID", runID).Msg("Resume: failed-queue cleanup failed but no failed items exist, proceeding")
+		}
 		b.launchQueueExecution(newRun, req, nil)
 	} else {
 		b.launchExecution(newRun, req, nil)
@@ -958,6 +1057,10 @@ func (b *MailMergeBridge) sendBatch(runID string, capped bool) error {
 		CapLimit:      limit,
 		AccountID:     req.AccountID,
 		AttachmentDir: b.effectiveAttachmentDir(req),
+		// A held row to an address the run already sent (via an
+		// earlier row) must not go out a second time when the batch
+		// sends — same seed as ResumeRun.
+		AlreadySent: sentAddresses(run),
 	}
 	// The sub-run executes against `rows`; indexMap translates its
 	// positions back to the original run's row indices. The live tally

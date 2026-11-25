@@ -38,6 +38,7 @@ func (f *localUndoContext) FindLocalMessageIDs(accountID, folderID string, rfc82
 func (f *localUndoContext) MoveMessagesToFolder(ids []string, destFolderID string) error {
 	return f.messageStore.MoveMessages(ids, destFolderID)
 }
+func (f *localUndoContext) DeleteMessagesFromServer([]string) error { return nil }
 func (f *localUndoContext) ResolveMessageUID(string) (uint32, string, error) {
 	return 0, "", fmt.Errorf("unused in test")
 }

@@ -251,6 +251,105 @@ func (s *Store) SaveRowResult(runID string, r hostmm.RowResult) error {
 	return nil
 }
 
+// ReconcileQueuedRows corrects run-log rows stuck at "queued" whose
+// queue item is no longer live. The dispatcher deletes the queue row
+// the moment SMTP accepts the mail and only then records the sent
+// outcome in the run log — if that log write fails (or the process
+// crashes in between), the row stays "queued" with no queue item and
+// the run sits "queued" forever. On load, a queued row is corrected
+// from the queue item's fate: no item at all (deleted after SMTP
+// acceptance) or a 'sent' item → sent; a 'failed' item → failed with
+// its last error; a 'cancelled' item → skipped. Items still queued
+// or sending are genuinely outstanding and left alone. Returns the
+// number of rows corrected.
+func (s *Store) ReconcileQueuedRows(runID string) (int, error) {
+	rows, err := s.DB().Query(`
+		SELECT row_index, email FROM mailmerge_run_rows
+		WHERE run_id = ? AND status = 'queued'`, runID)
+	if err != nil {
+		return 0, fmt.Errorf("mail-merge: reconcile queued rows: %w", err)
+	}
+	type queuedRow struct {
+		index int
+		email string
+	}
+	var queued []queuedRow
+	for rows.Next() {
+		var r queuedRow
+		if err := rows.Scan(&r.index, &r.email); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("mail-merge: scan queued row: %w", err)
+		}
+		queued = append(queued, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("mail-merge: read queued rows: %w", err)
+	}
+	corrected := 0
+	for _, qr := range queued {
+		itemRows, err := s.DB().Query(`
+			SELECT status, COALESCE(last_error, '') FROM mailmerge_queue_items
+			WHERE run_id = ? AND row_index = ?`, runID, qr.index)
+		if err != nil {
+			return corrected, fmt.Errorf("mail-merge: reconcile queue lookup: %w", err)
+		}
+		var statuses []string
+		var lastErr string
+		for itemRows.Next() {
+			var st, le string
+			if err := itemRows.Scan(&st, &le); err != nil {
+				itemRows.Close()
+				return corrected, fmt.Errorf("mail-merge: scan queue item: %w", err)
+			}
+			statuses = append(statuses, st)
+			if le != "" {
+				lastErr = le
+			}
+		}
+		itemRows.Close()
+		if err := itemRows.Err(); err != nil {
+			return corrected, fmt.Errorf("mail-merge: read queue items: %w", err)
+		}
+		live := false
+		sent, failed, cancelled := false, false, false
+		for _, st := range statuses {
+			switch st {
+			case QueueStatusQueued, QueueStatusSending:
+				live = true
+			case "sent":
+				sent = true
+			case "failed":
+				failed = true
+			case "cancelled":
+				cancelled = true
+			}
+		}
+		if live {
+			continue
+		}
+		var fix hostmm.RowResult
+		switch {
+		case sent || len(statuses) == 0:
+			// No item at all: the dispatcher deleted it after SMTP
+			// accepted the mail. The mail went out; only the log
+			// write was lost.
+			fix = hostmm.RowResult{Index: qr.index, Email: qr.email, Status: hostmm.RowSent, Error: "reconciled: queue item gone after send, log write lost", Timestamp: time.Now()}
+		case failed:
+			fix = hostmm.RowResult{Index: qr.index, Email: qr.email, Status: hostmm.RowFailed, Error: lastErr, Timestamp: time.Now()}
+		case cancelled:
+			fix = hostmm.RowResult{Index: qr.index, Email: qr.email, Status: hostmm.RowSkipped, Error: "cancelled in outbox queue", Timestamp: time.Now()}
+		default:
+			continue
+		}
+		if err := s.SaveRowResult(runID, fix); err != nil {
+			return corrected, fmt.Errorf("mail-merge: reconcile save row: %w", err)
+		}
+		corrected++
+	}
+	return corrected, nil
+}
+
 // GetRun loads a run with its per-row log. Returns (nil, nil) when the
 // run does not exist.
 func (s *Store) GetRun(runID string) (*hostmm.Run, error) {
@@ -272,6 +371,11 @@ func (s *Store) GetRun(runID string) (*hostmm.Run, error) {
 	if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
 		run.CreatedAt = t
 	}
+	// Reconcile dangling "queued" rows on load (finding 14) before
+	// reading the log, so a run whose log write was lost never reads
+	// as stuck "queued" again. Best-effort: a reconcile failure must
+	// not fail the load.
+	_, _ = s.ReconcileQueuedRows(runID)
 	rows, err := s.DB().Query(`
 		SELECT row_index, email, status, error, message_id, timestamp
 		FROM mailmerge_run_rows WHERE run_id = ? ORDER BY row_index ASC
@@ -456,6 +560,50 @@ func scanQueueItem(rows *sql.Rows) (QueuedItem, error) {
 		item.To = []string{}
 	}
 	return item, nil
+}
+
+// GetQueueItemForRow returns the queue item for one (run, row), if
+// any — including its raw message bytes. Used by ResumeRun to recover
+// a resumed row's Message-ID from the rendered bytes when the run
+// log lost it (the failed-row update does not carry it).
+func (s *Store) GetQueueItemForRow(runID string, rowIndex int) (*QueuedItem, error) {
+	var item QueuedItem
+	var toRaw, nextAttemptAt, createdAt string
+	var sentAt sql.NullString
+	err := s.DB().QueryRow(`
+		SELECT id, run_id, row_index, account_id, recipient, subject,
+		       from_address, to_json, raw_message, status, attempts, max_attempts,
+		       next_attempt_at, last_error, created_at, sent_at
+		FROM mailmerge_queue_items WHERE run_id = ? AND row_index = ?
+		ORDER BY created_at ASC LIMIT 1
+	`, runID, rowIndex).Scan(&item.ID, &item.RunID, &item.RowIndex, &item.AccountID,
+		&item.Recipient, &item.Subject, &item.FromAddress, &toRaw, &item.RawMessage, &item.Status,
+		&item.Attempts, &item.MaxAttempts, &nextAttemptAt, &item.LastError,
+		&createdAt, &sentAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("mail-merge: get queue item for row: %w", err)
+	}
+	if err := json.Unmarshal([]byte(toRaw), &item.To); err != nil {
+		return nil, fmt.Errorf("mail-merge: decode queue recipients: %w", err)
+	}
+	if t, err := time.Parse(time.RFC3339Nano, nextAttemptAt); err == nil {
+		item.NextAttemptAt = t
+	}
+	if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
+		item.CreatedAt = t
+	}
+	if sentAt.Valid {
+		if t, err := time.Parse(time.RFC3339Nano, sentAt.String); err == nil {
+			item.SentAt = &t
+		}
+	}
+	if item.To == nil {
+		item.To = []string{}
+	}
+	return &item, nil
 }
 
 // ListQueueItems returns all queue items, oldest first (raw bytes not
@@ -907,6 +1055,71 @@ func (s *Store) RetryFailedRunItems(runID string, now time.Time) (int, error) {
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("mail-merge: retry failed run items rows: %w", err)
+	}
+	return int(n), nil
+}
+
+// HasFailedQueueItems reports whether any failed queue items exist
+// for the given row indices of a run. It returns false (no error)
+// when the queue table does not exist at all — there can be no
+// failed items then, e.g. a run whose rows failed at enqueue because
+// the table was gone.
+func (s *Store) HasFailedQueueItems(runID string, rowIndices []int) (bool, error) {
+	if len(rowIndices) == 0 {
+		return false, nil
+	}
+	var exists int
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'mailmerge_queue_items'`).Scan(&exists); err != nil {
+		return false, fmt.Errorf("mail-merge: check queue table: %w", err)
+	}
+	if exists == 0 {
+		return false, nil
+	}
+	placeholders := make([]string, 0, len(rowIndices))
+	args := []any{runID}
+	for _, idx := range rowIndices {
+		placeholders = append(placeholders, "?")
+		args = append(args, idx)
+	}
+	var n int
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM mailmerge_queue_items
+		WHERE run_id = ? AND status = 'failed' AND row_index IN (`+strings.Join(placeholders, ",")+`)`,
+		args...).Scan(&n); err != nil {
+		return false, fmt.Errorf("mail-merge: count failed queue items: %w", err)
+	}
+	return n > 0, nil
+}
+
+// DeleteFailedQueueItemsForRows deletes the failed queue items for the
+// given row indices of a run. Used when a "Send later" run is resumed:
+// the resume re-renders those rows and enqueues fresh items, so the old
+// failed items must go — otherwise the failed copy still sits in the
+// queue (and could later be retried via RetryFailedRunItems) while the
+// resumed copy also goes out. Only the resumed rows' items are removed;
+// other failed items of the run are untouched.
+func (s *Store) DeleteFailedQueueItemsForRows(runID string, rowIndices []int) (int, error) {
+	if len(rowIndices) == 0 {
+		return 0, nil
+	}
+	placeholders := make([]string, 0, len(rowIndices))
+	args := []any{runID}
+	for _, idx := range rowIndices {
+		placeholders = append(placeholders, "?")
+		args = append(args, idx)
+	}
+	res, err := s.DB().Exec(`
+		DELETE FROM mailmerge_queue_items
+		WHERE run_id = ? AND status = 'failed' AND row_index IN (`+strings.Join(placeholders, ",")+`)`,
+		args...)
+	if err != nil {
+		return 0, fmt.Errorf("mail-merge: delete failed queue items for resume: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("mail-merge: delete failed queue items rows: %w", err)
 	}
 	return int(n), nil
 }

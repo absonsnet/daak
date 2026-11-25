@@ -893,13 +893,68 @@ func (v *ViewerApp) syncDestinationFolder(accountID, destFolderID string) error 
 	return v.syncEngine.SyncMessages(v.ctx, accountID, destFolderID, syncPeriodDays, false)
 }
 
+// isGmailAccount reports whether the account uses Gmail's IMAP server.
+// Gmail uses labels instead of folders — an IMAP EXPUNGE in one mailbox
+// destroys the one underlying message across ALL labels.
+func (v *ViewerApp) isGmailAccount(accountID string) bool {
+	acc, err := v.accountStore.Get(accountID)
+	if err != nil || acc == nil {
+		return false
+	}
+	return acc.IMAPHost == "imap.gmail.com"
+}
+
+// deleteMessagesFromIMAP mirrors App.deleteMessagesFromIMAP: placeholder
+// UIDs (0 or negative — local-only rows with no server counterpart) are
+// never sent to the server, and on Gmail a message that still has copies
+// in other local folders is left alone — expunging it here would destroy
+// it in every folder.
+func (v *ViewerApp) deleteMessagesFromIMAP(messages []*message.Message, folderID string) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	log := logging.WithComponent("viewer.deleteMessagesFromIMAP")
+	folderObj, err := v.folderStore.Get(folderID)
+	if err != nil || folderObj == nil {
+		return fmt.Errorf("folder not found")
+	}
+	accountID := messages[0].AccountID
+	isGmail := v.isGmailAccount(accountID)
+	var uids []goImap.UID
+	for _, m := range messages {
+		if m.UID == 0 || int32(m.UID) < 0 {
+			continue
+		}
+		if isGmail && m.MessageID != "" {
+			hasCopies, copyErr := v.messageStore.HasCopiesInOtherFolders(m.MessageID, folderID, accountID)
+			if copyErr != nil {
+				log.Warn().Err(copyErr).Str("messageID", m.MessageID).Msg("Failed to check for copies in other folders")
+			}
+			if hasCopies {
+				log.Debug().Str("messageID", m.MessageID).Msg("Gmail: skipping IMAP delete — message exists in other folders")
+				continue
+			}
+		}
+		uids = append(uids, goImap.UID(m.UID))
+	}
+	if len(uids) == 0 {
+		return nil
+	}
+	return v.withIMAPRetry(accountID, func(conn *imap.Client) error {
+		if _, err := conn.SelectMailbox(v.ctx, folderObj.Path); err != nil {
+			return fmt.Errorf("failed to select mailbox: %w", err)
+		}
+		return conn.DeleteMessagesByUID(uids)
+	})
+}
+
 // moveMessagesOnIMAP copies messages to the destination mailbox and deletes
 // the originals. Gmail note: the main window partitions copies for
 // Trash/Spam so a message with copies elsewhere only loses the label;
-// the popup does a plain COPY + DELETE, which for Gmail adds the
-// destination label and removes the source one — equivalent for a sole
-// copy, but a message that also lives in another folder loses that
-// other copy's label too.
+// the popup mirrors that partition — a copy elsewhere gets DELETE only
+// (no COPY), so the Trash/Spam label is never added to the one
+// underlying Gmail message and it stays visible in its other folders.
+// Placeholder UIDs have no server counterpart and are skipped.
 func (v *ViewerApp) moveMessagesOnIMAP(messages []*message.Message, sourceFolderID string, destFolder *folder.Folder) error {
 	if len(messages) == 0 {
 		return nil
@@ -908,18 +963,41 @@ func (v *ViewerApp) moveMessagesOnIMAP(messages []*message.Message, sourceFolder
 	if err != nil || sourceFolder == nil {
 		return fmt.Errorf("source folder not found")
 	}
-	uids := make([]goImap.UID, len(messages))
-	for i, m := range messages {
-		uids[i] = goImap.UID(m.UID)
+	log := logging.WithComponent("viewer.moveMessagesOnIMAP")
+	accountID := messages[0].AccountID
+	isGmail := v.isGmailAccount(accountID)
+	destIsTrashOrSpam := destFolder.Type == folder.TypeTrash || destFolder.Type == folder.TypeSpam
+	var moveUIDs, labelRemovalUIDs []goImap.UID
+	for _, m := range messages {
+		if m.UID == 0 || int32(m.UID) < 0 {
+			continue
+		}
+		if isGmail && destIsTrashOrSpam && m.MessageID != "" {
+			hasCopies, copyErr := v.messageStore.HasCopiesInOtherFolders(m.MessageID, sourceFolderID, accountID)
+			if copyErr != nil {
+				log.Warn().Err(copyErr).Str("messageID", m.MessageID).Msg("Failed to check for copies, treating as sole copy")
+			}
+			if hasCopies {
+				labelRemovalUIDs = append(labelRemovalUIDs, goImap.UID(m.UID))
+				continue
+			}
+		}
+		moveUIDs = append(moveUIDs, goImap.UID(m.UID))
 	}
-	return v.withIMAPRetry(messages[0].AccountID, func(conn *imap.Client) error {
+	allUIDs := append(moveUIDs, labelRemovalUIDs...)
+	if len(allUIDs) == 0 {
+		return nil
+	}
+	return v.withIMAPRetry(accountID, func(conn *imap.Client) error {
 		if _, err := conn.SelectMailbox(v.ctx, sourceFolder.Path); err != nil {
 			return fmt.Errorf("failed to select mailbox: %w", err)
 		}
-		if _, err := conn.CopyMessages(uids, destFolder.Path); err != nil {
-			return fmt.Errorf("failed to copy messages: %w", err)
+		if len(moveUIDs) > 0 {
+			if _, err := conn.CopyMessages(moveUIDs, destFolder.Path); err != nil {
+				return fmt.Errorf("failed to copy messages: %w", err)
+			}
 		}
-		return conn.DeleteMessagesByUID(uids)
+		return conn.DeleteMessagesByUID(allUIDs)
 	})
 }
 
@@ -1031,21 +1109,10 @@ func (v *ViewerApp) DeletePermanently(messageIDs []string) error {
 	go func() {
 		defer recoverPanic("viewer.actions", "delete messages on IMAP")
 		for folderID, msgs := range byFolder {
-			uids := make([]goImap.UID, len(msgs))
-			for i, m := range msgs {
-				uids[i] = goImap.UID(m.UID)
+			if err := v.deleteMessagesFromIMAP(msgs, folderID); err != nil {
+				log := logging.WithComponent("viewer")
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to delete messages from IMAP")
 			}
-			folderObj, err := v.folderStore.Get(folderID)
-			if err != nil || folderObj == nil {
-				continue
-			}
-			accountID := msgs[0].AccountID
-			_ = v.withIMAPRetry(accountID, func(conn *imap.Client) error {
-				if _, err := conn.SelectMailbox(v.ctx, folderObj.Path); err != nil {
-					return err
-				}
-				return conn.DeleteMessagesByUID(uids)
-			})
 		}
 	}()
 	return nil

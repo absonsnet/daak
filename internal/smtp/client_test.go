@@ -213,3 +213,111 @@ func TestForcedMechanismFailsWithoutFallback(t *testing.T) {
 		})
 	}
 }
+
+// transactionalSMTPServer speaks SMTP with a strict transaction state
+// machine: after a rejected RCPT the connection stays mid-transaction
+// and a further MAIL FROM is refused (503) until RSET. It rejects RCPT
+// for bad@example.com and accepts everything else. rsetSeen counts the
+// RSET commands it received.
+func transactionalSMTPServer(t *testing.T, rsetSeen chan<- struct{}) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		r := bufio.NewReader(conn)
+		fmt.Fprintf(conn, "220 fake ESMTP ready\r\n")
+		inTransaction := false
+		for {
+			line, readErr := r.ReadString('\n')
+			if readErr != nil {
+				return
+			}
+			trimmed := strings.TrimSpace(line)
+			cmd := strings.ToUpper(trimmed)
+			switch {
+			case strings.HasPrefix(cmd, "EHLO"):
+				fmt.Fprintf(conn, "250-fake\r\n250 8BITMIME\r\n")
+			case strings.HasPrefix(cmd, "MAIL FROM"):
+				if inTransaction {
+					fmt.Fprintf(conn, "503 Bad sequence of commands\r\n")
+					continue
+				}
+				inTransaction = true
+				fmt.Fprintf(conn, "250 ok\r\n")
+			case strings.HasPrefix(cmd, "RCPT TO"):
+				if strings.Contains(strings.ToLower(trimmed), "bad@example.com") {
+					fmt.Fprintf(conn, "550 No such user\r\n")
+					continue
+				}
+				fmt.Fprintf(conn, "250 ok\r\n")
+			case strings.HasPrefix(cmd, "DATA"):
+				fmt.Fprintf(conn, "354 End data with <CR><LF>.<CR><LF>\r\n")
+				for {
+					dataLine, derr := r.ReadString('\n')
+					if derr != nil {
+						return
+					}
+					if strings.TrimSpace(dataLine) == "." {
+						break
+					}
+				}
+				inTransaction = false
+				fmt.Fprintf(conn, "250 ok: queued\r\n")
+			case strings.HasPrefix(cmd, "RSET"):
+				inTransaction = false
+				select {
+				case rsetSeen <- struct{}{}:
+				default:
+				}
+				fmt.Fprintf(conn, "250 ok\r\n")
+			case strings.HasPrefix(cmd, "QUIT"):
+				fmt.Fprintf(conn, "221 bye\r\n")
+				return
+			default:
+				fmt.Fprintf(conn, "250 ok\r\n")
+			}
+		}
+	}()
+	return ln
+}
+
+// TestSendMail_ResetsSessionAfterError (fourth-audit finding 10): one bad
+// recipient must not poison the shared connection for the next row —
+// SendMail issues RSET after the failure, so the following send succeeds
+// instead of failing with a stale-transaction 503.
+func TestSendMail_ResetsSessionAfterError(t *testing.T) {
+	rsetSeen := make(chan struct{}, 4)
+	ln := transactionalSMTPServer(t, rsetSeen)
+	defer ln.Close()
+	addr := ln.Addr().(*net.TCPAddr)
+
+	c := NewClient(ClientConfig{
+		Host:     "127.0.0.1",
+		Port:     addr.Port,
+		Security: SecurityNone,
+	})
+	if err := c.Connect(); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	msg := []byte("Subject: test\r\n\r\nhello\r\n")
+	if err := c.SendMail("from@example.com", []string{"bad@example.com"}, msg); err == nil {
+		t.Fatal("SendMail to a rejected recipient should fail")
+	}
+	select {
+	case <-rsetSeen:
+	default:
+		t.Fatal("SendMail did not issue RSET after the failed recipient")
+	}
+	if err := c.SendMail("from@example.com", []string{"good@example.com"}, msg); err != nil {
+		t.Fatalf("SendMail after a failed recipient should succeed on the reset connection: %v", err)
+	}
+}

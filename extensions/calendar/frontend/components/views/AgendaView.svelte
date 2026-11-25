@@ -84,7 +84,17 @@
   }
 
   function onActivate(id: string) {
-    calendarView.selectEvent(id)
+    // Keyboard activation only carries the id (which recurring
+    // occurrences share): resolve the first matching row so the
+    // occurrence time is at least in-window rather than the
+    // master's first occurrence. Mouse clicks pass the row's exact
+    // instance times directly (see the ListRow onclick below).
+    const row = rows.find((r) => r.id === id)
+    if (row) {
+      calendarView.selectEvent(id, row.instance.instanceStartUnix, row.instance.instanceEndUnix)
+    } else {
+      calendarView.selectEvent(id)
+    }
   }
 
   // Header label combines the existing `calendar.viewSwitcher.agenda` key with
@@ -131,7 +141,7 @@
       <ListRow
         selected={ctx.selected}
         density="compact"
-        onclick={() => onActivate(item.id)}
+        onclick={() => calendarView.selectEvent(item.id, item.instance.instanceStartUnix, item.instance.instanceEndUnix)}
       >
         <span
           class="shrink-0 inline-block w-2.5 h-2.5 rounded-full"

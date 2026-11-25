@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/absonsnet/daak/internal/imap"
+	"github.com/absonsnet/daak/internal/message"
 	"github.com/absonsnet/daak/internal/undo"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -173,6 +174,30 @@ func (a *App) FindLocalMessageIDs(accountID, folderID string, rfc822MessageIDs [
 // ResolveMessageUID implements undo.UndoContext
 func (a *App) ResolveMessageUID(messageID string) (uint32, string, error) {
 	return a.messageStore.GetMessageUIDAndFolder(messageID)
+}
+
+// DeleteMessagesFromServer implements undo.UndoContext
+// Deletes the given messages from their server (grouped by folder so
+// each folder's provider quirks — Gmail's copy guard, temp UIDs —
+// apply via the standard permanent-delete path).
+func (a *App) DeleteMessagesFromServer(messageIDs []string) error {
+	messages, err := a.messageStore.GetByIDs(messageIDs)
+	if err != nil {
+		return fmt.Errorf("failed to get messages: %w", err)
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+	byFolder := make(map[string][]*message.Message)
+	for _, m := range messages {
+		byFolder[m.FolderID] = append(byFolder[m.FolderID], m)
+	}
+	for folderID, msgs := range byFolder {
+		if err := a.deleteMessagesFromIMAP(msgs, folderID); err != nil {
+			return fmt.Errorf("failed to delete messages from server in folder %s: %w", folderID, err)
+		}
+	}
+	return nil
 }
 
 // MoveMessagesToFolder implements undo.UndoContext

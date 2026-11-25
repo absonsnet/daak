@@ -225,6 +225,12 @@ func TestMigrationV32_LocalRecordIDsRewrittenToUUIDs(t *testing.T) {
 	if _, err := db.Exec(`ALTER TABLE message_translations DROP COLUMN body_hash`); err != nil {
 		t.Fatalf("drop message_translations.body_hash for re-migrate: %v", err)
 	}
+	// And v56's reaction index first: it references kind /
+	// reaction_message_id, and SQLite refuses DROP COLUMN while an
+	// index references the column.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_send_queue_reaction_active`); err != nil {
+		t.Fatalf("drop v56 reaction index for re-migrate: %v", err)
+	}
 	// And v52's kind / raw_message / reaction_message_id on send_queue.
 	for _, col := range []string{"kind", "raw_message", "reaction_message_id"} {
 		if _, err := db.Exec(`ALTER TABLE send_queue DROP COLUMN ` + col); err != nil {
@@ -414,6 +420,12 @@ func TestMigrationV33_CleansExistingOrphans(t *testing.T) {
 	// And v49's body_hash on message_translations.
 	if _, err := db.Exec(`ALTER TABLE message_translations DROP COLUMN body_hash`); err != nil {
 		t.Fatalf("drop message_translations.body_hash for re-migrate: %v", err)
+	}
+	// And v56's reaction index first: it references kind /
+	// reaction_message_id, and SQLite refuses DROP COLUMN while an
+	// index references the column.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_send_queue_reaction_active`); err != nil {
+		t.Fatalf("drop v56 reaction index for re-migrate: %v", err)
 	}
 	// And v52's kind / raw_message / reaction_message_id on send_queue.
 	for _, col := range []string{"kind", "raw_message", "reaction_message_id"} {
@@ -786,8 +798,10 @@ func TestMigrationV55_AddsAddressbookWritable(t *testing.T) {
 	if _, err := db.Exec(`ALTER TABLE contact_source_addressbooks DROP COLUMN writable`); err != nil {
 		t.Fatalf("drop writable for re-migrate: %v", err)
 	}
-	if _, err := db.Exec(`DELETE FROM migrations WHERE version = 55`); err != nil {
-		t.Fatalf("delete v55 migration record: %v", err)
+	// Delete the v55 AND v56 markers: Migrate keys off MAX(version),
+	// so leaving the v56 marker would skip v55 on the re-run.
+	if _, err := db.Exec(`DELETE FROM migrations WHERE version >= 55`); err != nil {
+		t.Fatalf("delete v55+ migration records: %v", err)
 	}
 
 	// Seed a pre-v55 addressbook row (no writable value to insert).
@@ -814,5 +828,96 @@ func TestMigrationV55_AddsAddressbookWritable(t *testing.T) {
 	}
 	if writable != 1 {
 		t.Fatalf("pre-existing addressbook writable = %d, want 1 (default writable)", writable)
+	}
+}
+
+// TestMigrationV56_DedupesDuplicateActiveReactionRows mirrors the
+// v54 draft test for fourth-audit finding 13: the v56 migration
+// keeps only the oldest live reaction row per reacted-to message,
+// leaves failed rows alone, creates the partial unique index, and
+// the index then refuses a second live row for the same message.
+func TestMigrationV56_DedupesDuplicateActiveReactionRows(t *testing.T) {
+	db := openTestDB(t)
+
+	// Rewind to the v55 schema: drop the v56 index and its
+	// migration record, so Migrate() re-applies v56 below.
+	// Migrate keys off MAX(version), so leaving the v56 marker
+	// would skip it.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_send_queue_reaction_active`); err != nil {
+		t.Fatalf("drop v56 index for re-migrate: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM migrations WHERE version >= 56`); err != nil {
+		t.Fatalf("delete v56 migration record: %v", err)
+	}
+
+	// Seed two live reaction rows for the same message, plus a
+	// failed row for it (untouched by the dedupe) and a live row
+	// for another message.
+	seed := func(id, reactionID, status, createdAt string) {
+		t.Helper()
+		if _, err := db.Exec(`
+			INSERT INTO send_queue
+				(id, account_id, draft_id, kind, message_json, reaction_message_id,
+				 status, send_at, due_at, created_at)
+			VALUES (?, 'acc-1', '', 'reaction', '', ?, ?,
+				'2026-11-25T00:00:00Z', '2026-11-25T00:00:00Z', ?)
+		`, id, reactionID, status, createdAt); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("dup-old", "msg-1", "pending", "2026-11-25T00:00:00Z")
+	seed("dup-new", "msg-1", "pending", "2026-11-25T00:01:00Z")
+	seed("dup-failed", "msg-1", "failed", "2026-11-25T00:02:00Z")
+	seed("other-live", "msg-2", "pending", "2026-11-25T00:00:00Z")
+
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("re-migrate to v56: %v", err)
+	}
+
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM send_queue WHERE reaction_message_id = 'msg-1' AND status = 'pending'`).Scan(&n); err != nil {
+		t.Fatalf("count live msg-1 rows: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("live msg-1 rows = %d, want 1 (oldest kept)", n)
+	}
+	var kept string
+	if err := db.QueryRow(`SELECT id FROM send_queue WHERE reaction_message_id = 'msg-1' AND status = 'pending'`).Scan(&kept); err != nil {
+		t.Fatalf("kept live row: %v", err)
+	}
+	if kept != "dup-old" {
+		t.Fatalf("kept live row = %q, want dup-old (oldest)", kept)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM send_queue WHERE id = 'dup-failed'`).Scan(&n); err != nil {
+		t.Fatalf("count failed row: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("failed row survived = %d, want 1 (dedupe touches live rows only)", n)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_send_queue_reaction_active'`).Scan(&n); err != nil {
+		t.Fatalf("count v56 index: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("v56 index present = %d, want 1", n)
+	}
+	// And the index enforces itself after the migration.
+	if _, err := db.Exec(`
+		INSERT INTO send_queue
+			(id, account_id, draft_id, kind, message_json, reaction_message_id,
+			 status, send_at, due_at, created_at)
+		VALUES ('dup-third', 'acc-1', '', 'reaction', '', 'msg-1', 'pending',
+			'2026-11-25T00:00:00Z', '2026-11-25T00:00:00Z', '2026-11-25T00:03:00Z')
+	`); err == nil {
+		t.Fatalf("inserting a second live reaction row for msg-1 succeeded, want a UNIQUE constraint failure")
+	}
+	// Ordinary sends (empty reaction_message_id) are unaffected.
+	if _, err := db.Exec(`
+		INSERT INTO send_queue
+			(id, account_id, draft_id, kind, message_json, reaction_message_id,
+			 status, send_at, due_at, created_at)
+		VALUES ('plain-send', 'acc-1', 'draft-9', 'message', '', '', 'pending',
+			'2026-11-25T00:00:00Z', '2026-11-25T00:00:00Z', '2026-11-25T00:00:00Z')
+	`); err != nil {
+		t.Fatalf("ordinary send insert failed after v56: %v", err)
 	}
 }

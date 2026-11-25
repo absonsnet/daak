@@ -58,11 +58,20 @@ const pendingMaxAttempts = 3
 // re-reading the events row at drain time — important because
 // soft-committed deletes have no events row to read.
 type PendingOp struct {
-	SourceID    string
-	CalendarID  string
-	EventID     string // local events.id; empty when no row (rare)
-	Op          PendingOpKind
-	Scope       EditScope // applies to update/delete; empty for create
+	SourceID   string
+	CalendarID string
+	EventID    string // local events.id; empty when no row (rare)
+	Op         PendingOpKind
+	Scope      EditScope // applies to update/delete; empty for create
+
+	// InstanceTimeUnix + Kind carry a scoped (this / this-and-future)
+	// split for Drain: the original occurrence start and whether the
+	// split updates or deletes it. Zero/empty for whole-series ops.
+	InstanceTimeUnix int64
+	Kind             InstanceOpKind
+	// In carries the new fields for a scoped update, so Drain can
+	// replay the split without re-reading the (un-split) events row.
+	In *EventInput
 
 	// CalendarURL holds the URL/ID the provider uses to address the
 	// calendar (CalDAV path, Google calendarId, Microsoft Graph id).
@@ -107,20 +116,23 @@ type pendingRow struct {
 // It captures everything Drain needs to replay the push (or delete) so
 // the events row doesn't have to exist at drain time.
 type pendingPayload struct {
-	CalendarURL     string `json:"calendarUrl"`
-	UID             string `json:"uid"`
-	ETag            string `json:"etag,omitempty"`
-	Href            string `json:"href,omitempty"`
-	ProviderEventID string `json:"providerEventId,omitempty"`
-	Summary         string `json:"summary,omitempty"`
-	Description     string `json:"description,omitempty"`
-	Location        string `json:"location,omitempty"`
-	DTStartUnix     int64  `json:"dtstartUnix,omitempty"`
-	DTEndUnix       int64  `json:"dtendUnix,omitempty"`
-	IsAllDay        bool   `json:"isAllDay,omitempty"`
-	TZName          string `json:"tzName,omitempty"`
-	RRuleText       string `json:"rruleText,omitempty"`
-	ICSBlob         string `json:"icsBlob,omitempty"`
+	CalendarURL      string      `json:"calendarUrl"`
+	UID              string      `json:"uid"`
+	ETag             string      `json:"etag,omitempty"`
+	Href             string      `json:"href,omitempty"`
+	ProviderEventID  string      `json:"providerEventId,omitempty"`
+	Summary          string      `json:"summary,omitempty"`
+	Description      string      `json:"description,omitempty"`
+	Location         string      `json:"location,omitempty"`
+	DTStartUnix      int64       `json:"dtstartUnix,omitempty"`
+	DTEndUnix        int64       `json:"dtendUnix,omitempty"`
+	IsAllDay         bool        `json:"isAllDay,omitempty"`
+	TZName           string      `json:"tzName,omitempty"`
+	RRuleText        string      `json:"rruleText,omitempty"`
+	ICSBlob          string      `json:"icsBlob,omitempty"`
+	InstanceTimeUnix int64       `json:"instanceTimeUnix,omitempty"`
+	Kind             string      `json:"kind,omitempty"`
+	Input            *EventInput `json:"input,omitempty"`
 }
 
 // PendingQueue owns the pending_writes table + the drain loop. Shared
@@ -151,20 +163,23 @@ func (q *PendingQueue) Enqueue(op PendingOp) (string, error) {
 		return "", errors.New("pending queue: SourceID and CalendarID required")
 	}
 	payload, err := json.Marshal(pendingPayload{
-		CalendarURL:     op.CalendarURL,
-		UID:             op.UID,
-		ETag:            op.ETag,
-		Href:            op.Href,
-		ProviderEventID: op.ProviderEventID,
-		Summary:         op.Summary,
-		Description:     op.Description,
-		Location:        op.Location,
-		DTStartUnix:     op.DTStartUnix,
-		DTEndUnix:       op.DTEndUnix,
-		IsAllDay:        op.IsAllDay,
-		TZName:          op.TZName,
-		RRuleText:       op.RRuleText,
-		ICSBlob:         op.ICSBlob,
+		CalendarURL:      op.CalendarURL,
+		UID:              op.UID,
+		ETag:             op.ETag,
+		Href:             op.Href,
+		ProviderEventID:  op.ProviderEventID,
+		Summary:          op.Summary,
+		Description:      op.Description,
+		Location:         op.Location,
+		DTStartUnix:      op.DTStartUnix,
+		DTEndUnix:        op.DTEndUnix,
+		IsAllDay:         op.IsAllDay,
+		TZName:           op.TZName,
+		RRuleText:        op.RRuleText,
+		ICSBlob:          op.ICSBlob,
+		InstanceTimeUnix: op.InstanceTimeUnix,
+		Kind:             string(op.Kind),
+		Input:            op.In,
 	})
 	if err != nil {
 		return "", fmt.Errorf("marshal pending payload: %w", err)
@@ -193,6 +208,36 @@ func (q *PendingQueue) Enqueue(op PendingOp) (string, error) {
 		})
 	}
 	return id, nil
+}
+
+// HasPendingInstance reports whether a scoped split (this /
+// this-and-future) for this event + occurrence is already queued.
+// updateInstance checks it before pushing so a manual retry while
+// offline cannot queue — and later replay — a second copy of the
+// same split.
+func (q *PendingQueue) HasPendingInstance(eventID string, scope EditScope, instanceUnix int64) (bool, error) {
+	rows, err := q.store.DB().Query(`
+		SELECT payload_json FROM pending_writes
+		WHERE event_id = ? AND scope = ? AND attempt < ?`,
+		eventID, string(scope), pendingMaxAttempts)
+	if err != nil {
+		return false, fmt.Errorf("pending queue: lookup pending split: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var payloadJSON string
+		if err := rows.Scan(&payloadJSON); err != nil {
+			return false, fmt.Errorf("pending queue: scan pending split: %w", err)
+		}
+		var p pendingPayload
+		if err := json.Unmarshal([]byte(payloadJSON), &p); err != nil {
+			continue
+		}
+		if p.InstanceTimeUnix == instanceUnix && p.InstanceTimeUnix != 0 {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // Drain replays all pending rows for the given sourceID in
@@ -328,6 +373,39 @@ func (q *PendingQueue) processRow(ctx context.Context, row pendingRow) {
 	var perr error
 	switch PendingOpKind(row.Op) {
 	case PendingOpCreate, PendingOpUpdate:
+		// A scoped row (this / this-and-future) is a split, not a
+		// whole-series write: replay it through PushInstance with
+		// the original occurrence time + new fields from the queued
+		// payload. The following sync pass reconciles the local
+		// rows (clamped master, new series, override) from the
+		// server state the replay produced.
+		if row.Scope == string(EditScopeThis) || row.Scope == string(EditScopeThisAndFuture) {
+			in := EventInput{
+				CalendarID:  row.CalendarID,
+				Summary:     row.Payload.Summary,
+				Description: row.Payload.Description,
+				Location:    row.Payload.Location,
+				DTStartUnix: row.Payload.DTStartUnix,
+				DTEndUnix:   row.Payload.DTEndUnix,
+				IsAllDay:    row.Payload.IsAllDay,
+				TZName:      row.Payload.TZName,
+			}
+			if row.Payload.Input != nil {
+				in = *row.Payload.Input
+			}
+			kind := InstanceOpKind(row.Payload.Kind)
+			if kind == "" {
+				kind = InstanceOpUpdate
+			}
+			_, perr = provider.PushInstance(pushCtx, *src, cal, PushInstancePayload{
+				Master:           ev,
+				InstanceTimeUnix: row.Payload.InstanceTimeUnix,
+				Op:               EditScope(row.Scope),
+				Kind:             kind,
+				In:               in,
+			})
+			break
+		}
 		result, presErr := provider.PushEvent(pushCtx, *src, cal, ev)
 		perr = presErr
 		if perr == nil {
@@ -335,6 +413,18 @@ func (q *PendingQueue) processRow(ctx context.Context, row pendingRow) {
 			_ = q.updateEventTransportFields(row.CalendarID, ev.UID, result.ETag, result.ProviderEventID)
 		}
 	case PendingOpDelete:
+		// A scoped delete is a split too (EXDATE / instance delete),
+		// not a whole-series DELETE.
+		if row.Scope == string(EditScopeThis) || row.Scope == string(EditScopeThisAndFuture) {
+			_, perr = provider.PushInstance(pushCtx, *src, cal, PushInstancePayload{
+				Master:           ev,
+				InstanceTimeUnix: row.Payload.InstanceTimeUnix,
+				Op:               EditScope(row.Scope),
+				Kind:             InstanceOpDelete,
+				In:               EventInput{DTStartUnix: row.Payload.InstanceTimeUnix, DTEndUnix: row.Payload.InstanceTimeUnix},
+			})
+			break
+		}
 		perr = provider.DeleteRemote(pushCtx, *src, cal, ev)
 	default:
 		// Unknown op — drop the row.

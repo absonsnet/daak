@@ -114,6 +114,15 @@ type sendQueueService struct {
 	workerRunning bool
 	workerStop    chan struct{}
 
+	// reactionMu serialises the replace-if-pending check-then-delete-
+	// then-queue in QueueReaction within this process, so two
+	// reactions picked at the same instant from two windows cannot
+	// both pass the check. The cross-process guard is migration 56's
+	// partial unique index on live reaction rows; QueueReaction maps
+	// its constraint failure back through the same replace/reject
+	// logic (see enqueueReactionWithConflictRetry).
+	reactionMu sync.Mutex
+
 	// freshDispatchHeld is the restart gate (re-audit finding R14):
 	// while held, dispatchDue skips rows with no dispatch attempt
 	// yet (attempts == 0) — rows still inside, or just past, their
@@ -348,6 +357,16 @@ func (s *sendQueueService) QueueReaction(accountID string, from smtp.Address, to
 	// way — it never reached the recipient, so the new emoji
 	// supersedes it. A failed row is left alone: it stays in the
 	// Outbox for Retry and does not block a new reaction.
+	//
+	// The whole check-then-delete-then-queue is held under
+	// reactionMu, so two picks at the same instant in this process
+	// serialise instead of both passing the check. The viewer
+	// process has its own sendQueueService, so the mutex is not the
+	// cross-process guard — migration 56's partial unique index on
+	// live reaction rows is, and its constraint failure is mapped
+	// back through the same replace/reject logic below.
+	s.reactionMu.Lock()
+	defer s.reactionMu.Unlock()
 	if reactionMessageID != "" {
 		active, err := s.store.ActiveReaction(reactionMessageID)
 		if err != nil {
@@ -401,7 +420,20 @@ func (s *sendQueueService) QueueReaction(accountID string, from smtp.Address, to
 		CreatedAt:         now,
 	}
 	if err := s.store.Enqueue(item); err != nil {
-		return QueueSendResult{}, err
+		// The partial unique index (migration 56) is the atomic
+		// backstop for the check above: a concurrent queue of a
+		// reaction for the same message — from the viewer process,
+		// which has its own service and mutex — fails here, and
+		// the conflict is resolved through the same
+		// replace-if-pending / reject-if-sending logic instead of
+		// surfacing a raw database error.
+		if reactionMessageID != "" && strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			if retryErr := s.enqueueReactionWithConflictRetry(item, reactionMessageID); retryErr != nil {
+				return QueueSendResult{}, retryErr
+			}
+		} else {
+			return QueueSendResult{}, err
+		}
 	}
 
 	log.Info().
@@ -428,6 +460,44 @@ func (s *sendQueueService) QueueReaction(accountID string, from smtp.Address, to
 		DelaySeconds: delay,
 		SendAt:       sendAt.Format(time.RFC3339),
 	}, nil
+}
+
+// enqueueReactionWithConflictRetry resolves a UNIQUE constraint
+// failure from Enqueue: another process queued a reaction for the
+// same message between this call's check and its insert. The live row
+// is re-checked (ActiveReaction): if it is sending, the new reaction
+// is rejected; if it is pending, the other process's row won the
+// race — it is deleted and the insert retried once. If the row is
+// gone (undone in another window), the insert is retried once. A
+// second constraint failure means the race was lost again, and the
+// caller reports the message as already queued.
+func (s *sendQueueService) enqueueReactionWithConflictRetry(item sendqueue.Item, reactionMessageID string) error {
+	active, err := s.store.ActiveReaction(reactionMessageID)
+	if err != nil {
+		return err
+	}
+	if active == nil {
+		if err := s.store.Enqueue(item); err != nil {
+			if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+				return fmt.Errorf("reaction for message %q is already queued for send", reactionMessageID)
+			}
+			return err
+		}
+		return nil
+	}
+	if active.Status == sendqueue.StatusSending {
+		return fmt.Errorf("reaction for message %q is already being sent", reactionMessageID)
+	}
+	if _, err := s.store.DeletePendingReaction(reactionMessageID); err != nil {
+		return err
+	}
+	if err := s.store.Enqueue(item); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return fmt.Errorf("reaction for message %q is already queued for send", reactionMessageID)
+		}
+		return err
+	}
+	return nil
 }
 
 // UndoSend cancels a queued send that has not dispatched yet and

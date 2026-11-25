@@ -41,6 +41,12 @@
     mode?: ComposerMode
     existing?: backend.Event | null
     scope?: 'this' | 'this-and-future' | 'all'
+    // The selected occurrence's start/end (unix seconds) when editing
+    // one occurrence of a recurring event. The composer shows the
+    // occurrence's times (not the master's first occurrence), and the
+    // original start is sent back as the edit's instance identity.
+    instanceStartUnix?: number
+    instanceEndUnix?: number
     defaultStart?: Date | null
     defaultCalendarId?: string
     onClose?: () => void
@@ -52,6 +58,8 @@
     mode = 'create',
     existing = null,
     scope = 'all',
+    instanceStartUnix,
+    instanceEndUnix,
     defaultStart = null,
     defaultCalendarId = '',
     onClose,
@@ -343,8 +351,19 @@
     description = ev.description || ''
     descriptionHTML = ev.descriptionHTML || ''
     isAllDay = !!ev.isAllDay
-    const startInTz = toZonedTime(new Date(ev.dtstartUnix * 1000), tz)
-    const endInTz = toZonedTime(new Date(ev.dtendUnix * 1000), tz)
+    // Editing one occurrence of a recurring event shows THAT
+    // occurrence's times: ev is the master, whose dtstartUnix is the
+    // first occurrence. Only for scope=this / this-and-future — a
+    // whole-series edit (scope=all) still starts from the master's
+    // times, since it rewrites the series itself. instanceEndUnix
+    // defaults to the master's duration past the occurrence start.
+    const scopedEdit = scope === 'this' || scope === 'this-and-future'
+    const startUnix = scopedEdit && instanceStartUnix ? instanceStartUnix : ev.dtstartUnix
+    const endUnix = scopedEdit && instanceEndUnix
+      ? instanceEndUnix
+      : startUnix + (ev.dtendUnix - ev.dtstartUnix)
+    const startInTz = toZonedTime(new Date(startUnix * 1000), tz)
+    const endInTz = toZonedTime(new Date(endUnix * 1000), tz)
     // Wire DTEND is exclusive (next-day midnight) for all-day events per
     // RFC 5545 §3.6.1 — subtract a day so the picker shows the inclusive
     // last day. If a legacy/zero-duration record snuck in (DTEND == DTSTART),
@@ -601,7 +620,14 @@
     try {
       if (mode === 'edit' && existing) {
         await Calendar_UpdateEvent(
-          { eventId: existing.id, ...input } as backend.EventUpdateInput,
+          {
+            eventId: existing.id,
+            // The occurrence being edited — the backend uses it as the
+            // instance identity (RECURRENCE-ID / split point), never
+            // the edited dtstartUnix above.
+            originalInstanceTimeUnix: instanceStartUnix || undefined,
+            ...input,
+          } as backend.EventUpdateInput,
           scope,
         )
         toasts.success($_('calendar.composer.toastUpdated'))
