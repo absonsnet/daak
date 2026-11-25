@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"github.com/absonsnet/daak/internal/database"
 	"github.com/absonsnet/daak/internal/folder"
 	"github.com/absonsnet/daak/internal/message"
+	"github.com/absonsnet/daak/internal/sendqueue"
 )
 
 // --- Unsubscribe tests -----------------------------------------------------
@@ -227,6 +229,50 @@ func TestUnsubscribeMailto(t *testing.T) {
 	// Recorded as completed.
 	if has, err := uta.app.messageStore.HasUnsubscribed("deals@shop.example", "acc-1"); err != nil || !has {
 		t.Fatalf("HasUnsubscribed = %v, err = %v, want true", has, err)
+	}
+}
+
+// TestUnsubscribeMailtoSentSaveFailureLeavesWarning (fourth-audit
+// finding 46): the unsubscribe email is delivered but its Sent copy
+// cannot be saved — the failure must leave the same persistent
+// "sent but not saved" Outbox warning a normal send leaves, not
+// just a log line.
+func TestUnsubscribeMailtoSentSaveFailureLeavesWarning(t *testing.T) {
+	uta := newUnsubscribeTestApp(t)
+	uta.app.composeOps.sentSaveOverride = func(_ context.Context, _ string, _ []byte) error {
+		return fmt.Errorf("IMAP APPEND refused")
+	}
+	// Pre-install the queue service with no Wails emitter (the
+	// sendqueue harness pattern): the unsubscribeDeps closure must
+	// still be the real one — ensureSendQueueService returns this
+	// service — but a bare test App has no Wails context, and the
+	// runtime's EventsEmit fatals on it.
+	uta.app.sendQueue = &sendQueueService{store: sendqueue.NewStore(uta.db), ctx: context.Background()}
+	uta.seedMessage(t, "msg-1", "inbox-1", "deals@shop.example", "<mailto:unsub@shop.example?subject=unsub-42>", false)
+
+	if _, err := uta.deps(nil).unsubscribeFromMessage(context.Background(), "msg-1"); err != nil {
+		t.Fatalf("unsubscribeFromMessage() error = %v", err)
+	}
+	// The mail was still delivered.
+	if len(uta.sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(uta.sent))
+	}
+	var n int
+	if err := uta.db.QueryRow(`SELECT COUNT(*) FROM send_queue WHERE status = 'sent_unsaved'`).Scan(&n); err != nil {
+		t.Fatalf("count sent_unsaved rows: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("sent_unsaved rows = %d, want 1 (persistent Sent-save warning)", n)
+	}
+	var subject, recipient, lastErr string
+	if err := uta.db.QueryRow(`SELECT subject, recipient, last_error FROM send_queue WHERE status = 'sent_unsaved'`).Scan(&subject, &recipient, &lastErr); err != nil {
+		t.Fatalf("read warning row: %v", err)
+	}
+	if subject != "unsub-42" || recipient != "unsub@shop.example" {
+		t.Errorf("warning row subject/recipient = %q/%q, want unsub-42/unsub@shop.example", subject, recipient)
+	}
+	if !strings.Contains(lastErr, "IMAP APPEND refused") {
+		t.Errorf("warning last_error = %q, want it to name the save failure", lastErr)
 	}
 }
 

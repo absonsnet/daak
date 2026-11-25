@@ -95,6 +95,11 @@ type unsubscribeDeps struct {
 	// default (15s timeout). Tests inject a client pointed at a local
 	// TLS server.
 	httpClient *http.Client
+	// recordSentSaveFailure records the persistent "sent but not
+	// saved to Sent" warning when the unsubscribe email was delivered
+	// but its Sent copy could not be saved (fourth-audit finding
+	// 46). Nil means log only (deps built by hand in tests).
+	recordSentSaveFailure func(accountID, subject, recipient, fromAddress string, saveErr error)
 }
 
 // statusForMessage derives one message's unsubscribe status. Folder
@@ -244,7 +249,16 @@ func (d *unsubscribeDeps) sendUnsubscribeEmail(ctx context.Context, msg *message
 	}
 	if acc, accErr := d.accountStore.Get(msg.AccountID); accErr == nil && acc != nil && !providerAutoSavesSentMail(acc.IMAPHost) {
 		if err := d.composeOps.saveToSentFolder(ctx, msg.AccountID, acc, raw); err != nil {
-			log.Warn().Err(err).Str("accountID", msg.AccountID).Msg("Failed to save unsubscribe email to Sent folder")
+			// The mail was delivered — a bare log line used to be
+			// the only trace of the missing Sent copy
+			// (fourth-audit finding 46). Record the same
+			// persistent "sent but not saved" warning normal
+			// sends get, so the user finds it in the Outbox.
+			if d.recordSentSaveFailure != nil {
+				d.recordSentSaveFailure(msg.AccountID, target.MailtoSubject, target.MailtoAddress, from.Address, err)
+			} else {
+				log.Warn().Err(err).Str("accountID", msg.AccountID).Msg("Failed to save unsubscribe email to Sent folder")
+			}
 		}
 	}
 	return nil
@@ -395,6 +409,9 @@ func (a *App) unsubscribeDeps() *unsubscribeDeps {
 		folderStore:  a.folderStore,
 		composeOps:   &a.composeOps,
 		trash:        a.Trash,
+		recordSentSaveFailure: func(accountID, subject, recipient, fromAddress string, saveErr error) {
+			a.ensureSendQueueService().RecordSentSaveFailure(accountID, subject, recipient, fromAddress, saveErr)
+		},
 	}
 }
 

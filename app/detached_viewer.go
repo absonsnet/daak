@@ -1287,6 +1287,12 @@ func (v *ViewerApp) unsubscribeDeps() *unsubscribeDeps {
 		folderStore:  v.folderStore,
 		composeOps:   &v.composeOps,
 		trash:        v.Trash,
+		recordSentSaveFailure: func(accountID, subject, recipient, fromAddress string, saveErr error) {
+			if v.sendQueue == nil {
+				return
+			}
+			v.sendQueue.RecordSentSaveFailure(accountID, subject, recipient, fromAddress, saveErr)
+		},
 	}
 }
 
