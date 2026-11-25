@@ -36,6 +36,7 @@ import (
 	"github.com/google/uuid"
 
 	coreapi "github.com/absonsnet/daak/internal/core/api/v1"
+	"github.com/absonsnet/daak/internal/logging"
 )
 
 // PendingOpKind enumerates queueable operations.
@@ -376,9 +377,11 @@ func (q *PendingQueue) processRow(ctx context.Context, row pendingRow) {
 		// A scoped row (this / this-and-future) is a split, not a
 		// whole-series write: replay it through PushInstance with
 		// the original occurrence time + new fields from the queued
-		// payload. The following sync pass reconciles the local
-		// rows (clamped master, new series, override) from the
-		// server state the replay produced.
+		// payload. The replay also applies the change locally
+		// (finding 20): the sync that ran before Drain in this
+		// pass already re-fetched the pre-replay server state, so
+		// without the local apply the change would stay invisible
+		// until the next sync.
 		if row.Scope == string(EditScopeThis) || row.Scope == string(EditScopeThisAndFuture) {
 			in := EventInput{
 				CalendarID:  row.CalendarID,
@@ -397,13 +400,17 @@ func (q *PendingQueue) processRow(ctx context.Context, row pendingRow) {
 			if kind == "" {
 				kind = InstanceOpUpdate
 			}
-			_, perr = provider.PushInstance(pushCtx, *src, cal, PushInstancePayload{
+			var result PushInstanceResult
+			result, perr = provider.PushInstance(pushCtx, *src, cal, PushInstancePayload{
 				Master:           ev,
 				InstanceTimeUnix: row.Payload.InstanceTimeUnix,
 				Op:               EditScope(row.Scope),
 				Kind:             kind,
 				In:               in,
 			})
+			if perr == nil {
+				q.applyReplayedInstance(row, result, kind, in)
+			}
 			break
 		}
 		result, presErr := provider.PushEvent(pushCtx, *src, cal, ev)
@@ -416,16 +423,33 @@ func (q *PendingQueue) processRow(ctx context.Context, row pendingRow) {
 		// A scoped delete is a split too (EXDATE / instance delete),
 		// not a whole-series DELETE.
 		if row.Scope == string(EditScopeThis) || row.Scope == string(EditScopeThisAndFuture) {
-			_, perr = provider.PushInstance(pushCtx, *src, cal, PushInstancePayload{
+			var result PushInstanceResult
+			result, perr = provider.PushInstance(pushCtx, *src, cal, PushInstancePayload{
 				Master:           ev,
 				InstanceTimeUnix: row.Payload.InstanceTimeUnix,
 				Op:               EditScope(row.Scope),
 				Kind:             InstanceOpDelete,
 				In:               EventInput{DTStartUnix: row.Payload.InstanceTimeUnix, DTEndUnix: row.Payload.InstanceTimeUnix},
 			})
+			if perr == nil {
+				q.applyReplayedInstance(row, result, InstanceOpDelete, EventInput{})
+			}
 			break
 		}
 		perr = provider.DeleteRemote(pushCtx, *src, cal, ev)
+		if perr == nil {
+			// Finding 28: the sync that ran before Drain in this
+			// pass re-created the local row (the server still had
+			// the event), and the replay just deleted the server
+			// copy — remove the local row in the same step, or the
+			// deleted event pops back up until the next sync.
+			if err := q.store.WithTx(func(tx *sql.Tx) error {
+				return q.store.DeleteEventByUIDTx(tx, row.CalendarID, ev.UID)
+			}); err != nil {
+				log := logging.WithComponent("calendar")
+				log.Warn().Err(err).Str("eventId", row.EventID).Msg("Replayed delete succeeded remotely but the local row could not be removed; the next sync reconciles it")
+			}
+		}
 	default:
 		// Unknown op — drop the row.
 		_ = q.deleteRow(row.ID)
@@ -433,6 +457,34 @@ func (q *PendingQueue) processRow(ctx context.Context, row pendingRow) {
 	}
 
 	q.recordOutcome(row, perr)
+}
+
+// applyReplayedInstance applies a scoped replay's result to the local
+// rows (audit4 finding 20): the sync that ran before Drain in this pass
+// already re-fetched the pre-replay server state, so without this the
+// change would stay invisible until the next sync. Best-effort: the
+// remote replay already succeeded, so a local-apply failure only logs
+// and the next sync reconciles.
+func (q *PendingQueue) applyReplayedInstance(row pendingRow, result PushInstanceResult, kind InstanceOpKind, in EventInput) {
+	master, err := q.store.GetEvent(row.EventID)
+	if err != nil || master == nil {
+		return // already gone locally; nothing to apply
+	}
+	var aerr error
+	switch {
+	case row.Scope == string(EditScopeThis) && kind == InstanceOpUpdate:
+		aerr = applyThisUpdateLocal(q.store, *master, in, row.Payload.InstanceTimeUnix, result)
+	case row.Scope == string(EditScopeThis) && kind == InstanceOpDelete:
+		aerr = applyThisDeleteLocal(q.store, *master, row.Payload.InstanceTimeUnix, result)
+	case row.Scope == string(EditScopeThisAndFuture) && kind == InstanceOpUpdate:
+		aerr = applyThisAndFutureUpdateLocal(q.store, *master, in, row.Payload.InstanceTimeUnix, result)
+	case row.Scope == string(EditScopeThisAndFuture) && kind == InstanceOpDelete:
+		aerr = applyThisAndFutureDeleteLocal(q.store, *master, row.Payload.InstanceTimeUnix, result)
+	}
+	if aerr != nil {
+		log := logging.WithComponent("calendar")
+		log.Warn().Err(aerr).Str("eventId", row.EventID).Msg("Replayed scoped change but its local rows could not be updated; the next sync reconciles them")
+	}
 }
 
 // recordOutcome translates the per-row push result into table state +

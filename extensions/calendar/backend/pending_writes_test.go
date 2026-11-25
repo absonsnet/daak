@@ -19,6 +19,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -398,5 +399,62 @@ func TestPendingQueue_DrainAll_SkipsLocalSources(t *testing.T) {
 	// on the google source (no pending rows = empty drain).
 	if err := queue.DrainAll(context.Background()); err != nil {
 		t.Errorf("DrainAll: %v", err)
+	}
+}
+
+// Audit4 finding 28: replaying a queued whole-series delete must remove
+// the local events row in the same step — the sync that ran before Drain
+// re-created it from the server copy, so leaving it means the deleted
+// event pops back up until the next sync.
+func TestPendingQueue_Drain_DeleteRemovesLocalRow(t *testing.T) {
+	store := newTestStore(t)
+	bus := &recordingEventBus{}
+
+	var deletes int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deletes++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	auth := fakeAuth{target: srv.URL}
+	queue := NewPendingQueue(store, fakeSecrets{password: "x"}, auth, bus)
+	srcID, calID := seedGoogleSource(t, store, "primary")
+
+	now := time.Now().Unix()
+	_ = store.WithTx(func(tx *sql.Tx) error {
+		return store.UpsertEventTx(tx, Event{
+			ID: "evt-row-1", CalendarID: calID, UID: "evt-uid@daak-google",
+			Summary: "Test", DTStartUnix: now, DTEndUnix: now + 3600,
+			ProviderEventID: "server-event-id",
+			ICSBlob:         "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n",
+		})
+	})
+
+	if _, err := queue.Enqueue(PendingOp{
+		SourceID: srcID, CalendarID: calID, EventID: "evt-row-1",
+		Op: PendingOpDelete, Scope: EditScopeAll, CalendarURL: "primary",
+		UID: "evt-uid@daak-google", ProviderEventID: "server-event-id",
+		ETag: `"server-etag"`,
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if err := queue.Drain(context.Background(), srcID); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if deletes != 1 {
+		t.Fatalf("server DELETEs = %d, want 1", deletes)
+	}
+	if row, _ := queue.nextPending(srcID); row != nil {
+		t.Fatalf("expected queue empty after success, got row %+v", row)
+	}
+	_, err := store.GetEvent("evt-row-1")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetEvent after drain-delete = %v, want sql.ErrNoRows (row removed)", err)
 	}
 }
