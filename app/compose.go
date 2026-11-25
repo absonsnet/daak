@@ -216,7 +216,7 @@ func (ops *composeOps) getValidOAuthToken(ctx context.Context, accountID string)
 	}
 
 	// Calculate new expiry time
-	expiresAt := time.Now().Add(time.Duration(newTokenResp.ExpiresIn) * time.Second)
+	expiresAt := oauth2.ExpiryFromNow(newTokenResp.ExpiresIn)
 
 	// Update tokens in store
 	tokens.AccessToken = newTokenResp.AccessToken

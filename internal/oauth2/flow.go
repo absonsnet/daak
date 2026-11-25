@@ -38,6 +38,23 @@ type TokenResponse struct {
 	IDToken      string `json:"id_token,omitempty"` // OpenID Connect
 }
 
+// DefaultTokenLifetimeSeconds is the assumed lifetime for a token whose
+// provider did not state one (ExpiresIn missing or zero). Storing such a
+// token as "expires now" made every use trigger a refresh — and, with
+// rotating refresh tokens, a refresh storm. One hour is the common
+// provider lifetime (Google, Microsoft) and a sane fallback.
+const DefaultTokenLifetimeSeconds = 3600
+
+// ExpiryFromNow converts a token endpoint's expires_in into an absolute
+// expiry time. A missing or zero lifetime defaults to
+// DefaultTokenLifetimeSeconds instead of "already expired".
+func ExpiryFromNow(expiresIn int) time.Time {
+	if expiresIn <= 0 {
+		expiresIn = DefaultTokenLifetimeSeconds
+	}
+	return time.Now().Add(time.Duration(expiresIn) * time.Second)
+}
+
 // UserInfo represents basic user information from ID token or userinfo endpoint
 type UserInfo struct {
 	Email string `json:"email"`
@@ -361,6 +378,13 @@ func (m *Manager) RefreshTokenWithProvider(provider ProviderConfig, refreshToken
 		tokens.RefreshToken = refreshToken
 	}
 
+	// A provider that states no lifetime must not produce an
+	// already-expired token (fourth-audit finding 36): default it here
+	// so every downstream build site sees a sane value.
+	if tokens.ExpiresIn <= 0 {
+		tokens.ExpiresIn = DefaultTokenLifetimeSeconds
+	}
+
 	m.log.Info().
 		Str("provider", provider.Name).
 		Int("expires_in", tokens.ExpiresIn).
@@ -422,6 +446,12 @@ func (m *Manager) exchangeCode(provider ProviderConfig, code, codeVerifier strin
 	var tokens TokenResponse
 	if err := json.Unmarshal(body, &tokens); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	// A provider that states no lifetime must not produce an
+	// already-expired token (fourth-audit finding 36).
+	if tokens.ExpiresIn <= 0 {
+		tokens.ExpiresIn = DefaultTokenLifetimeSeconds
 	}
 
 	return &tokens, nil

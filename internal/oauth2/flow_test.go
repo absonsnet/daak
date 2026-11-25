@@ -386,3 +386,21 @@ func TestCancelThenImmediateRetryKeepsNewSession(t *testing.T) {
 		m.CancelAuthFlow()
 	}
 }
+
+// Fourth-audit finding 36: a token response with no expiry must not be
+// stored as already expired — it defaults to one hour.
+func TestExpiryFromNow_MissingExpiryDefaultsToOneHour(t *testing.T) {
+	before := time.Now()
+	got := ExpiryFromNow(0)
+	if got.Sub(before) < time.Hour-2*time.Second || got.Sub(before) > time.Hour+2*time.Second {
+		t.Errorf("ExpiryFromNow(0) = %v, want ~1h from now", got.Sub(before))
+	}
+	got = ExpiryFromNow(-5)
+	if got.Sub(before) < time.Hour-2*time.Second {
+		t.Errorf("ExpiryFromNow(-5) = %v, want ~1h from now", got.Sub(before))
+	}
+	got = ExpiryFromNow(300)
+	if got.Sub(before) < 290*time.Second || got.Sub(before) > 310*time.Second {
+		t.Errorf("ExpiryFromNow(300) = %v, want ~5m from now", got.Sub(before))
+	}
+}

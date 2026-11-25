@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/absonsnet/daak/internal/account"
@@ -130,13 +131,16 @@ func (a *App) persistOAuthStableID(accountID string, tokens *oauth2.TokenRespons
 }
 
 // clearPendingOAuth drops the whole pending OAuth slot (tokens,
-// email, provider binding). Called on every consume path — success
-// or rejection — so stale tokens from one sign-in can never be
-// retried against another account.
+// email, provider binding, and any stashed custom-provider config).
+// Called on every consume path — success or rejection — so stale
+// tokens from one sign-in can never be retried against another
+// account, and a stale custom-provider record can never be picked
+// up by a later setup step (fourth-audit finding 31).
 func (a *App) clearPendingOAuth() {
 	a.pendingOAuthTokens = nil
 	a.pendingOAuthEmail = ""
 	a.pendingOAuthProvider = ""
+	a.pendingCustomProvider = nil
 }
 
 func (a *App) CompleteOAuthAccountSetup(provider, email, accountName, displayName, color string) (*account.Account, error) {
@@ -231,7 +235,7 @@ func (a *App) CompleteOAuthAccountSetup(provider, email, accountName, displayNam
 	}
 
 	// Calculate token expiry
-	expiresAt := time.Now().Add(time.Duration(a.pendingOAuthTokens.ExpiresIn) * time.Second)
+	expiresAt := oauth2.ExpiryFromNow(a.pendingOAuthTokens.ExpiresIn)
 
 	// Save OAuth tokens
 	tokens := &credentials.OAuthTokens{
@@ -420,7 +424,7 @@ func (a *App) CompleteCustomOAuthAccountSetup(config account.AccountConfig) (*ac
 		return nil, fmt.Errorf("failed to create account: %w", err)
 	}
 
-	expiresAt := time.Now().Add(time.Duration(a.pendingOAuthTokens.ExpiresIn) * time.Second)
+	expiresAt := oauth2.ExpiryFromNow(a.pendingOAuthTokens.ExpiresIn)
 	tokens := &credentials.OAuthTokens{
 		Provider:     customOAuthProviderName,
 		AccessToken:  a.pendingOAuthTokens.AccessToken,
@@ -542,7 +546,7 @@ func (a *App) SavePendingOAuthTokens(accountID string) error {
 	}
 
 	// Calculate expiry time
-	expiresAt := time.Now().Add(time.Duration(a.pendingOAuthTokens.ExpiresIn) * time.Second)
+	expiresAt := oauth2.ExpiryFromNow(a.pendingOAuthTokens.ExpiresIn)
 
 	tokens := &credentials.OAuthTokens{
 		Provider:     provider,
@@ -560,12 +564,39 @@ func (a *App) SavePendingOAuthTokens(accountID string) error {
 	// this existed self-heal on re-authorize (#337/#328).
 	a.persistOAuthStableID(accountID, a.pendingOAuthTokens)
 
-	// Propagate new tokens to any shared mailboxes linked to this account
+	// Propagate new tokens to shared mailboxes linked to this account —
+	// but ONLY to those whose stored provider matches the provider
+	// these tokens were issued for (fourth-audit finding 31). Copying
+	// them blindly into every linked mailbox let one provider's tokens
+	// overwrite another provider's shared mailbox. A mailbox with no
+	// stored provider is skipped, never overwritten.
+	// Propagation failures are surfaced to the caller instead of
+	// logged-and-forgotten: the main account's tokens are already
+	// saved, so the error reports exactly which mailboxes did not get
+	// them.
 	sharedMailboxes, _ := a.accountStore.ListBySharedMailboxParent(accountID)
+	var propagateErrs []string
+	var propagated int
 	for _, sm := range sharedMailboxes {
+		smProvider, perr := a.credStore.GetOAuthProvider(sm.ID)
+		if perr != nil {
+			log.Warn().Err(perr).Str("sharedID", sm.ID).Msg("Could not read shared mailbox provider, skipping token propagation")
+			propagateErrs = append(propagateErrs, fmt.Sprintf("%s: could not read stored provider: %v", sm.ID, perr))
+			continue
+		}
+		if smProvider != provider {
+			log.Warn().Str("sharedID", sm.ID).Str("sharedProvider", smProvider).Str("provider", provider).Msg("Skipping token propagation to shared mailbox with a different provider")
+			continue
+		}
 		if smErr := a.credStore.SetOAuthTokens(sm.ID, tokens); smErr != nil {
 			log.Warn().Err(smErr).Str("sharedID", sm.ID).Msg("Failed to propagate tokens to shared mailbox")
+			propagateErrs = append(propagateErrs, fmt.Sprintf("%s: %v", sm.ID, smErr))
+			continue
 		}
+		propagated++
+	}
+	if propagated > 0 {
+		log.Info().Str("accountID", accountID).Int("sharedMailboxes", propagated).Msg("Propagated OAuth tokens to shared mailboxes")
 	}
 
 	log.Info().
@@ -574,8 +605,13 @@ func (a *App) SavePendingOAuthTokens(accountID string) error {
 		Time("expiresAt", expiresAt).
 		Msg("Pending OAuth tokens saved to account")
 
-	// Clear pending tokens
+	// Clear pending tokens (also drops any stashed custom-provider
+	// record, so a later setup step cannot pick it up).
 	a.clearPendingOAuth()
+
+	if len(propagateErrs) > 0 {
+		return fmt.Errorf("tokens saved to account, but propagation to %d shared mailbox(es) failed: %s", len(propagateErrs), strings.Join(propagateErrs, "; "))
+	}
 
 	return nil
 }
