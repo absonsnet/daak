@@ -236,8 +236,11 @@ func (e *Engine) parseMultipartBody(mr gomessage.MultipartReader, result *Parsed
 		// they aren't lost; the downloader resolves them by the same Title. Must run
 		// before the disposition=="attachment" branch (winmail.dat has that
 		// disposition). part.Body is already transfer-decoded by go-message.
+		// A signature part named winmail.dat is not a TNEF container, so
+		// the filename disjunct excludes signature types (R16 hardening;
+		// the ms-tnef content type itself can never be a signature part).
 		if contentType == "application/ms-tnef" ||
-			(disposition == "attachment" && strings.EqualFold(dispParams["filename"], "winmail.dat")) {
+			(disposition == "attachment" && !isSignaturePart(contentType) && strings.EqualFold(dispParams["filename"], "winmail.dat")) {
 			// Read maxPartSize+1 so a part landing exactly on the cap is
 			// not misread as truncated (finding 26).
 			raw, _ := io.ReadAll(io.LimitReader(part.Body, maxPartSize+1))
@@ -282,8 +285,13 @@ func (e *Engine) parseMultipartBody(mr gomessage.MultipartReader, result *Parsed
 			continue
 		}
 
-		// Handle file attachments
-		if disposition == "attachment" {
+		// Handle file attachments. Signature parts are not attachments:
+		// when verification fails the signature part stays in the raw
+		// message, and counting it would store a phantom attachment with
+		// no download source (re-audit finding R16). A failed signature
+		// falls through to the text-part walk below, which ignores it
+		// (only text/plain and text/html become body text).
+		if disposition == "attachment" && !isSignaturePart(contentType) {
 			result.HasAttachments = true
 			// If the attachment has a Content-ID, it's meant to be displayed inline in the HTML
 			// (referenced via cid:contentID), even if Content-Disposition says "attachment"
@@ -417,6 +425,16 @@ func (e *Engine) parseSinglePartBody(entity *gomessage.Entity, result *ParsedBod
 	contentID := strings.Trim(entity.Header.Get("Content-ID"), "<>")
 	isNonTextBody := contentType != "" && !strings.HasPrefix(contentType, "text/") &&
 		!isSignaturePart(contentType)
+	// A lone signature part is neither an attachment nor body text:
+	// when verification fails it stays in the raw message, and counting
+	// it would store a phantom attachment with no download source and
+	// set has_attachments, which also excludes the message from
+	// re-fetch (re-audit finding R16). Without this guard the
+	// disposition disjunct below still matched it even though
+	// isNonTextBody already excludes signatures.
+	if isSignaturePart(contentType) {
+		return
+	}
 	if disposition == "attachment" || isNonTextBody {
 		result.HasAttachments = true
 		isInline := disposition == "inline" || contentID != ""
@@ -485,6 +503,18 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 		Int("rawLen", len(raw)).
 		Msg("Parsing message body")
 
+	// Encrypted mail (S/MIME enveloped-data or PGP/MIME
+	// multipart/encrypted) is not an attachment and has no readable
+	// body text: the encrypted payload is the message itself, stored as
+	// the raw body by the modern parser and decrypted on view. Mirror
+	// that here (re-audit finding R19): without this the encrypted
+	// parts below are classified as attachments, so a message opened
+	// from server search gains a phantom downloadable file (usually
+	// attachment.bin) that is actually the encrypted message.
+	if isEncryptedContentType(topLevelCT) {
+		return "", "", false, false
+	}
+
 	// Check if it's a multipart message
 	mr := entity.MultipartReader()
 	e.log.Debug().Bool("isMultipart", mr != nil).Msg("Multipart detection result")
@@ -514,6 +544,14 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 				Str("disposition", disposition).
 				Str("charset", params["charset"]).
 				Msg("Processing multipart part")
+
+			// An encrypted part or subtree is payload, not an attachment
+			// or body text (R19): skip it whole instead of classifying
+			// its parts. This covers multipart/encrypted nested inside
+			// multipart/mixed, and a lone enveloped S/MIME part.
+			if isEncryptedContentType(part.Header.Get("Content-Type")) {
+				continue
+			}
 
 			// Check for attachments (signature parts are not attachments)
 			if disposition == "attachment" && !isSignaturePart(contentType) {
@@ -635,6 +673,15 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 		disposition, _, _ := mime.ParseMediaType(entity.Header.Get("Content-Disposition"))
 		isNonTextBody := contentType != "" && !strings.HasPrefix(contentType, "text/") &&
 			!isSignaturePart(contentType)
+		// A lone signature part is neither an attachment nor body text —
+		// same gap as the modern single-part branch (re-audit finding
+		// R16): the disposition disjunct below matched it even though
+		// isNonTextBody already excludes signatures. The existing
+		// single-part-signature test only covered the no-disposition
+		// case, where isNonTextBody alone saved it.
+		if isSignaturePart(contentType) {
+			return "", "", false, false
+		}
 		if disposition == "attachment" || isNonTextBody {
 			hasAttachments = true
 			return "", "", true, false
@@ -710,6 +757,12 @@ func (e *Engine) parseNestedMultipart(entity *gomessage.Entity) (bodyText, bodyH
 
 		contentType, params, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
 		disposition, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+
+		// An encrypted part or subtree is payload, not an attachment
+		// (R19) — same skip as the top-level walk in parseMessageBody.
+		if isEncryptedContentType(part.Header.Get("Content-Type")) {
+			continue
+		}
 
 		// Signature parts are not attachments.
 		if disposition == "attachment" && !isSignaturePart(contentType) {
@@ -872,6 +925,26 @@ func (e *Engine) extractAttachmentMetadata(part *gomessage.Entity, messageID, co
 	}
 
 	return att
+}
+
+// isEncryptedContentType reports whether a Content-Type header value is
+// an encrypted payload: S/MIME enveloped-data, PGP/MIME
+// multipart/encrypted (with or without the protocol parameter), or the
+// PGP/MIME version part (application/pgp-encrypted). The encrypted
+// payload is the message itself, never an attachment — see R19.
+func isEncryptedContentType(contentType string) bool {
+	if smime.IsSMIMEEncrypted(contentType) || pgp.IsPGPEncrypted(contentType) {
+		return true
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(mediaType) {
+	case "multipart/encrypted", "application/pgp-encrypted":
+		return true
+	}
+	return false
 }
 
 // isSignaturePart returns true for S/MIME and PGP signature content types

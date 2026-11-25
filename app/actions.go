@@ -509,14 +509,15 @@ func (a *App) moveToFolderCmds(messageIDs []string, destFolderID string) ([]undo
 			delete(a.syncLastRequest, syncKey)
 			a.syncMu.Unlock()
 
-			if err := a.SyncFolder(accountID, destFolderID); err != nil && err != context.Canceled {
-				log.Warn().Err(err).Str("destFolderID", destFolderID).Msg("Failed to sync destination folder after move")
-			}
-
-			// Clean up temporary negative-UID rows left by MoveMessages.
-			// The sync above fetched the real messages with correct UIDs.
-			if err := a.messageStore.DeleteTempUIDs(destFolderID); err != nil {
-				log.Warn().Err(err).Str("destFolderID", destFolderID).Msg("Failed to clean up temp UIDs after move")
+			// Delete the temp rows only once the destination sync has
+			// succeeded AND the real server rows are confirmed in the
+			// destination folder (re-audit finding R15). Deleting them
+			// after a failed sync loses the message's local state even
+			// though the server copy reappears later as new.
+			if _, err := cleanupMovedTempUIDs(a.messageStore, destFolderID, messages, func() error {
+				return a.SyncFolder(accountID, destFolderID)
+			}); err != nil {
+				log.Warn().Err(err).Str("destFolderID", destFolderID).Msg("Keeping temp UIDs after move: destination not reconciled")
 			}
 		}
 	}()

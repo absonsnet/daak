@@ -3,6 +3,7 @@ package auth
 import (
 	"fmt"
 	"net/http"
+	"sync"
 
 	coreapi "github.com/absonsnet/daak/internal/core/api/v1"
 	"github.com/absonsnet/daak/internal/credentials"
@@ -20,6 +21,19 @@ type Broker struct {
 	// honors the same trusted-certificate store as IMAP/SMTP. Nil falls back to
 	// http.DefaultTransport.
 	baseTransport http.RoundTripper
+
+	// refreshLocksMu guards refreshLocks. refreshLocks serialises token
+	// refreshes per (accountID, clientConfigID) across every transport the
+	// broker vends (audit finding R11): each HTTPClient call builds a fresh
+	// bearerRefreshTransport, so a lock owned by the transport itself is
+	// per-instance and two simultaneous extension calls would both refresh
+	// — with rotating refresh tokens the second refresh then fails
+	// invalid_grant on the already-rotated token and surfaces a spurious
+	// re-sign-in prompt. The shared lock means only one refresh runs per
+	// (account, slot); the other callers re-read the stored tokens under
+	// the lock and reuse the fresh ones.
+	refreshLocksMu sync.Mutex
+	refreshLocks   map[string]*sync.Mutex
 }
 
 // NewBroker constructs a Broker bound to the given credential store and
@@ -33,6 +47,40 @@ func NewBroker(credStore *credentials.Store, oauthManager *oauth2.Manager, baseT
 		credStore:     credStore,
 		oauthManager:  oauthManager,
 		baseTransport: baseTransport,
+	}
+}
+
+// refreshLock returns the refresh mutex shared by every transport the broker
+// vends for one (accountID, clientConfigID) pair, creating it on first use.
+// One account can hold several slots (mail, calendar, contacts, ...), each
+// with its own refresh token, so the key includes the client config ID —
+// slots refresh independently.
+func (b *Broker) refreshLock(accountID, clientConfigID string) *sync.Mutex {
+	b.refreshLocksMu.Lock()
+	defer b.refreshLocksMu.Unlock()
+	if b.refreshLocks == nil {
+		b.refreshLocks = make(map[string]*sync.Mutex)
+	}
+	key := accountID + "\x00" + clientConfigID
+	mu, ok := b.refreshLocks[key]
+	if !ok {
+		mu = &sync.Mutex{}
+		b.refreshLocks[key] = mu
+	}
+	return mu
+}
+
+// newRefreshTransport builds the bearer transport for one (account,
+// client-config) pair, sharing the broker's per-pair refresh lock so
+// concurrent clients for the same pair serialise their refreshes.
+func (b *Broker) newRefreshTransport(accountID, clientConfigID string) *bearerRefreshTransport {
+	return &bearerRefreshTransport{
+		base:           b.baseTransport,
+		credStore:      b.credStore,
+		oauthManager:   b.oauthManager,
+		accountID:      accountID,
+		clientConfigID: clientConfigID,
+		refreshMu:      b.refreshLock(accountID, clientConfigID),
 	}
 }
 
@@ -85,13 +133,7 @@ func (b *Broker) HTTPClient(accountID string, scopes []coreapi.AuthScope) (*http
 	}
 
 	return &http.Client{
-		Transport: &bearerRefreshTransport{
-			base:           b.baseTransport,
-			credStore:      b.credStore,
-			oauthManager:   b.oauthManager,
-			accountID:      accountID,
-			clientConfigID: string(clientConfigID),
-		},
+		Transport: b.newRefreshTransport(accountID, string(clientConfigID)),
 	}, nil
 }
 
@@ -142,13 +184,7 @@ func (b *Broker) HTTPClientForExtension(
 			return nil, fmt.Errorf("auth broker: check tokens: %w", terr)
 		}
 		return &http.Client{
-			Transport: &bearerRefreshTransport{
-				base:           b.baseTransport,
-				credStore:      b.credStore,
-				oauthManager:   b.oauthManager,
-				accountID:      accountID,
-				clientConfigID: string(clientConfigID),
-			},
+			Transport: b.newRefreshTransport(accountID, string(clientConfigID)),
 		}, nil
 	}
 
@@ -214,13 +250,7 @@ func (b *Broker) HTTPClientForExtension(
 	}
 
 	return &http.Client{
-		Transport: &bearerRefreshTransport{
-			base:           b.baseTransport,
-			credStore:      b.credStore,
-			oauthManager:   b.oauthManager,
-			accountID:      accountID,
-			clientConfigID: clientConfigID,
-		},
+		Transport: b.newRefreshTransport(accountID, clientConfigID),
 	}, nil
 }
 

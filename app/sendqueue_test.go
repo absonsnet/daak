@@ -1038,3 +1038,123 @@ func TestReemitPendingCountdownsIncludesReactions(t *testing.T) {
 		t.Fatalf("reaction event = %+v, want draftId \"\" / 3s", got[0])
 	}
 }
+
+// TestStartupGateHoldsFreshDispatchUntilReemit is the regression test
+// for re-audit finding R14. The worker starts in Startup, but the
+// Undo countdowns are only re-emitted later, from
+// NotifyStartupComplete — so a row due in the first seconds after
+// launch used to dispatch before its toast ever appeared, and the
+// undo window was lost. Startup now arms a gate that holds fresh
+// (never-attempted) rows until the re-emit runs.
+func TestStartupGateHoldsFreshDispatchUntilReemit(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	var got []map[string]interface{}
+	h.svc.emit = func(event string, data map[string]interface{}) {
+		if event == "sendqueue:queued" {
+			got = append(got, data)
+		}
+	}
+
+	// A row queued just before a restart, still inside its undo window.
+	res := h.queue(t)
+
+	// Simulate Startup: the worker starts (gate armed) before the
+	// frontend has re-emitted the countdowns.
+	h.svc.HoldFreshDispatchUntilCountdownsReemitted()
+
+	// 2s in, still inside the window: the re-emit restores the toast
+	// with the time actually left, and the row must not dispatch
+	// before that happens.
+	h.now = h.now.Add(2 * time.Second)
+	h.svc.ReemitPendingCountdowns()
+	if len(got) != 1 || got[0]["delaySeconds"] != 3 {
+		t.Fatalf("re-emitted %d queued events, want 1 with 3s remaining", len(got))
+	}
+
+	// Past the window, gate released by the re-emit: sends.
+	h.now = h.now.Add(4 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue(after window, gate released) = %d, %v, want 1, nil", n, err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(h.sent))
+	}
+	if item, err := h.svc.store.Get(res.QueueID); err != nil || item != nil {
+		t.Fatalf("row after dispatch = %+v, %v, want deleted", item, err)
+	}
+}
+
+// TestStartupGateHoldsDueRowUntilReemit covers the sharp end of R14:
+// a row whose undo window elapses between Startup and the re-emit
+// (a slow restart, or slow settings/theme/extension loading) must
+// still not dispatch before the re-emit runs. Its toast is gone —
+// the window lapsed — but the gate guarantees the frontend had its
+// chance first, and the row dispatches on the next tick after the
+// re-emit, as before.
+func TestStartupGateHoldsDueRowUntilReemit(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	var got []map[string]interface{}
+	h.svc.emit = func(event string, data map[string]interface{}) {
+		if event == "sendqueue:queued" {
+			got = append(got, data)
+		}
+	}
+	res := h.queue(t)
+
+	h.svc.HoldFreshDispatchUntilCountdownsReemitted()
+
+	// Past the window, re-emit not yet run: must not dispatch.
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 0 {
+		t.Fatalf("dispatchDue(due, gate held) = %d, %v, want 0, nil", n, err)
+	}
+	if len(h.sent) != 0 {
+		t.Fatalf("sent %d messages before the re-emit, want 0", len(h.sent))
+	}
+	if item := h.mustItem(t, res.QueueID); item.Status != sendqueue.StatusPending {
+		t.Fatalf("row status = %q, want pending (still undoable until the gate releases)", item.Status)
+	}
+
+	// The re-emit emits no toast — the window already elapsed — but
+	// releases the gate, so the row dispatches on the next tick.
+	h.svc.ReemitPendingCountdowns()
+	if len(got) != 0 {
+		t.Fatalf("re-emitted %d queued events past the window, want 0", len(got))
+	}
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue(after re-emit) = %d, %v, want 1, nil", n, err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(h.sent))
+	}
+}
+
+// TestStartupGateDoesNotHoldRetryRows: the R14 gate holds only fresh
+// rows. A row in retry backoff (attempts > 0) is not in an undo
+// window, so it must still dispatch while the gate is held.
+func TestStartupGateDoesNotHoldRetryRows(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
+	h.sendErr = fmt.Errorf("failed to connect to SMTP server: connection refused")
+
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 0 {
+		t.Fatalf("dispatchDue(failing) = %d, %v, want 0, nil", n, err)
+	}
+	item := h.mustItem(t, res.QueueID)
+	if item.Status != sendqueue.StatusPending || item.Attempts != 1 {
+		t.Fatalf("after transient failure: %+v, want pending / 1 attempt", item)
+	}
+
+	// Restart with the gate armed; the backoff elapses before the
+	// re-emit runs. The retry must dispatch anyway.
+	h.svc.HoldFreshDispatchUntilCountdownsReemitted()
+	h.now = h.now.Add(61 * time.Second)
+	h.sendErr = nil
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue(retry, gate held) = %d, %v, want 1, nil", n, err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(h.sent))
+	}
+}

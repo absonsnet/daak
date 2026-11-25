@@ -7,6 +7,6 @@ package tray
 // It is never called — Tray.Start only calls it when
 // runtime.GOOS == "windows" — but the reference must resolve on
 // every platform.
-func startTrayWindows(onReady, onExit func(), ready <-chan struct{}) bool {
+func startTrayWindows(onReady, onExit func(), ready <-chan struct{}, onRunReturn func()) bool {
 	return false
 }

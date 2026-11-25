@@ -233,6 +233,12 @@ type App struct {
 	// Credentials (keyring with fallback)
 	credStore *credentials.Store
 
+	// saveContactSourceTokensOverride, when non-nil, replaces the
+	// credential store write in getValidContactSourceOAuthToken. Nil in
+	// production; tests set it to inject a token-save failure
+	// (audit finding R12).
+	saveContactSourceTokensOverride func(sourceID string, tokens *credentials.OAuthTokens) error
+
 	// Certificate trust store (TOFU)
 	certStore *certificate.Store
 
@@ -391,9 +397,11 @@ type App struct {
 	TrayIconICO []byte // Windows .ico bytes
 	TrayIconPNG []byte // PNG bytes for macOS/Linux
 	tray        *tray.Tray
-	// trayStarted reports whether the tray icon is actually up this
-	// session. GetStartHiddenActive consults it: starting hidden with
-	// no tray icon would leave a hidden window with no way back.
+	// trayStarted reports whether the tray icon started this session.
+	// It is set once by startTray and never cleared — it must NOT be
+	// read as "the tray is up right now": a tray that dies mid-session
+	// leaves it stale. canHideOnClose and GetStartHiddenActive
+	// re-check liveness through tray.Alive() before trusting it.
 	trayStarted bool
 
 	// Paths the user chose in a save dialog this session; the post-save
@@ -872,8 +880,14 @@ func (a *App) Startup(ctx context.Context) {
 	// shares this queue and must never start a second worker (see
 	// app/sendqueue.go). The worker's first tick is immediate, so
 	// messages queued while the app was closed (quit mid-countdown)
-	// start sending on launch.
+	// start sending on launch — but fresh rows are held until the
+	// frontend has re-emitted their Undo countdowns (re-audit
+	// finding R14): without the gate, a row due in the first seconds
+	// after launch would dispatch before NotifyStartupComplete runs
+	// ReemitPendingCountdowns and its toast ever appears. Rows whose
+	// window already elapsed, and retry-backoff rows, are not held.
 	a.sendQueue = a.newSendQueueService()
+	a.sendQueue.HoldFreshDispatchUntilCountdownsReemitted()
 	a.sendQueue.StartWorker()
 
 	// Initialize Google Contacts client for OAuth account contact search
@@ -1076,12 +1090,26 @@ func (a *App) NotifyStartupComplete() {
 // on Windows the start waits up to 5s for the tray menu, which
 // would stall the close. Callers fall back to a real quit — never a
 // hidden window with no tray icon to bring it back.
+//
+// trayStarted alone is not trusted: it is set once at startup and
+// never cleared, so a tray that dies mid-session would still claim
+// to be up. Liveness is re-checked here through the tray itself
+// (Alive reports the run loop's exit), which is a single
+// non-blocking channel read — no polling, no restart attempt. A dead
+// tray is not restarted: the library's Quit is once-only and its
+// Windows window class cannot be re-registered, so the safe fallback
+// is a real quit, and the user restarts the app to get the tray back.
 func (a *App) canHideOnClose() bool {
 	if a.settingsStore == nil {
 		return false
 	}
 	runBg, _ := a.settingsStore.GetRunBackground()
-	return runBg && a.trayStarted
+	if !runBg || !a.trayStarted {
+		return false
+	}
+	// A nil tray only exists in tests (NewApp always sets one); there
+	// is no liveness to check there, so the started flag stands.
+	return a.tray == nil || a.tray.Alive()
 }
 
 // startTrayIfBackground shows the system tray icon when Run in
@@ -1306,7 +1334,9 @@ func (a *App) QuitApp() {
 // and the tray icon is actually up. If the tray could not be started,
 // starting hidden would leave a hidden window with no way back, so the
 // window is shown instead. (If Startup has not run yet, trayStarted is
-// false and this fails open the same way.)
+// false and this fails open the same way.) Liveness is re-checked as
+// well as the started flag, so a tray that died between Startup and
+// this check does not strand a hidden window either.
 func (a *App) GetStartHiddenActive() bool {
 	startHidden, _ := a.settingsStore.GetStartHidden()
 	if !startHidden {
@@ -1316,7 +1346,11 @@ func (a *App) GetStartHiddenActive() bool {
 	if !runBg {
 		return false
 	}
-	return a.trayStarted
+	if !a.trayStarted {
+		return false
+	}
+	// A nil tray only exists in tests (NewApp always sets one).
+	return a.tray == nil || a.tray.Alive()
 }
 
 // InitiateShutdown triggers the application quit (called from frontend)
@@ -1482,8 +1516,27 @@ func (a *App) getValidContactSourceOAuthToken(sourceID string) (string, error) {
 			tokens.RefreshToken = newTokenResp.RefreshToken
 		}
 
-		if err := a.credStore.SetContactSourceOAuthTokens(sourceID, tokens); err != nil {
-			log.Warn().Err(err).Msg("Failed to save refreshed contact source OAuth tokens")
+		// Persist the refreshed tokens (audit finding R12): same poison
+		// as the mail path in composeOps.getValidOAuthToken — the provider
+		// has already rotated the refresh token, so a swallowed save
+		// failure leaves the revoked token in storage and the next
+		// refresh fails invalid_grant. Retry, then fail loudly with the
+		// distinct tokens-save-failed event (not a re-auth prompt: the
+		// grant is fine).
+		saveTokens := func() error { return a.credStore.SetContactSourceOAuthTokens(sourceID, tokens) }
+		if a.saveContactSourceTokensOverride != nil {
+			saveTokens = func() error { return a.saveContactSourceTokensOverride(sourceID, tokens) }
+		}
+		if err := saveRefreshedTokensWithRetry(saveTokens); err != nil {
+			log.Error().Err(err).
+				Str("source_id", sourceID).
+				Msg("Failed to save refreshed contact source OAuth tokens after retries")
+			emitOAuthEvent(a.ctx, "oauth:tokens-save-failed", map[string]interface{}{
+				"sourceId": sourceID,
+				"provider": tokens.Provider,
+				"error":    err.Error(),
+			})
+			return "", fmt.Errorf("contact source OAuth tokens refreshed but could not be saved: %w (sign-in is still valid — retry, and re-authorize only if asked)", err)
 		}
 
 		log.Info().

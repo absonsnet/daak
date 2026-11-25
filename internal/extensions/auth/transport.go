@@ -23,7 +23,17 @@ type bearerRefreshTransport struct {
 	accountID      string
 	clientConfigID string
 
-	mu sync.Mutex // guards token retrieval/refresh
+	// refreshMu is the broker-shared per-(account, clientConfig) refresh
+	// lock (see Broker.refreshLock). The lock MUST be shared across
+	// transport instances: the broker vends a fresh transport per
+	// HTTPClient call, so a lock owned by the transport would be
+	// per-instance and concurrent callers would each refresh.
+	refreshMu *sync.Mutex
+	// mu is the fallback lock used only when refreshMu is nil (transport
+	// built without a broker). Correct for a single client, but it cannot
+	// dedup refreshes across sibling transports — always build transports
+	// via Broker.newRefreshTransport in production.
+	mu sync.Mutex
 }
 
 // RoundTrip implements http.RoundTripper.
@@ -45,14 +55,33 @@ func (t *bearerRefreshTransport) RoundTrip(req *http.Request) (*http.Response, e
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 
-	// Refresh under lock to avoid thundering herd.
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	// Remember which access token produced the 401 before refreshing.
+	failedAccessToken := tokens.AccessToken
 
-	// Re-read tokens in case another goroutine refreshed already.
+	// Refresh under the broker-shared lock to avoid thundering herd.
+	// A per-instance lock cannot dedup: every HTTPClient call builds a
+	// fresh transport, so two simultaneous extension calls would each
+	// hold their own lock and both refresh.
+	refreshMu := t.refreshMu
+	if refreshMu == nil {
+		refreshMu = &t.mu
+	}
+	refreshMu.Lock()
+	defer refreshMu.Unlock()
+
+	// Re-read tokens in case another goroutine refreshed already. If the
+	// stored access token no longer matches the one that got the 401,
+	// the refresh already happened — either through another transport
+	// sharing this lock or through the mail-side refresh — so retry with
+	// the fresh token instead of refreshing again. Without this check
+	// the lock alone would not help: the second caller would still
+	// present the already-rotated refresh token and fail invalid_grant.
 	tokens, err = t.credStore.GetOAuthTokensForClientConfig(t.accountID, t.clientConfigID)
 	if err != nil {
 		return nil, fmt.Errorf("auth broker: re-read tokens before refresh: %w", err)
+	}
+	if tokens.AccessToken != "" && tokens.AccessToken != failedAccessToken {
+		return t.do(req, tokens.AccessToken)
 	}
 
 	provider, err := t.resolveProvider()
