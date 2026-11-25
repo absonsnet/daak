@@ -411,6 +411,115 @@ func TestQueueReactionUndoRunsOnUndoHook(t *testing.T) {
 	}
 }
 
+func (h *sendQueueTestHarness) queueReaction(t *testing.T, raw []byte, messageID string) QueueSendResult {
+	t.Helper()
+	res, err := h.svc.QueueReaction("acc-1",
+		smtp.Address{Name: "Me", Address: "me@example.com"},
+		[]string{"alice@example.com"}, raw, "Re: hello", "alice@example.com", messageID)
+	if err != nil {
+		t.Fatalf("QueueReaction: %v", err)
+	}
+	return res
+}
+
+// TestQueueReactionReplacesPendingReaction is the R8 regression
+// test: picking a second emoji inside the undo window must replace
+// the pending reaction mail, not queue a second one — the local
+// pill is replaced by Record, so the queued mail must match it,
+// and the recipient must receive only the second reaction.
+func TestQueueReactionReplacesPendingReaction(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	first := h.queueReaction(t, []byte("thumbs-up bytes"), "msg-1")
+	second := h.queueReaction(t, []byte("heart bytes"), "msg-1")
+	if first.QueueID == second.QueueID {
+		t.Fatalf("second reaction returned the same queue id %q, want a new row replacing the old one", second.QueueID)
+	}
+	items, err := h.svc.store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue rows = %d, want 1 (the first reaction replaced, not duplicated)", len(items))
+	}
+	if items[0].ID != second.QueueID {
+		t.Fatalf("queued row = %q, want the second reaction %q", items[0].ID, second.QueueID)
+	}
+	if got, err := h.svc.store.Get(first.QueueID); err != nil || got != nil {
+		t.Fatalf("Get(first reaction) = %+v, %v, want nil, nil (replaced row deleted)", got, err)
+	}
+
+	// Past the window: exactly one reaction sends, the second one.
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue = %d, %v, want 1, nil", n, err)
+	}
+	if len(h.sent) != 1 || string(h.sent[0]) != "heart bytes" {
+		t.Fatalf("sent = %d messages, want 1 with the heart bytes", len(h.sent))
+	}
+}
+
+// TestQueueReactionReplacesPendingReactionInBackoff: a pending
+// reaction that already failed once (retry backoff) is replaced
+// the same way — it never reached the recipient, so the new emoji
+// supersedes it, with a fresh attempt budget.
+func TestQueueReactionReplacesPendingReactionInBackoff(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	h.sendErr = fmt.Errorf("failed to connect to SMTP server: connection refused")
+	first := h.queueReaction(t, []byte("thumbs-up bytes"), "msg-1")
+
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 0 {
+		t.Fatalf("dispatchDue(failing) = %d, %v, want 0, nil", n, err)
+	}
+	item := h.mustItem(t, first.QueueID)
+	if item.Status != sendqueue.StatusPending || item.Attempts != 1 {
+		t.Fatalf("after transient failure: %+v, want pending / 1 attempt", item)
+	}
+
+	second := h.queueReaction(t, []byte("heart bytes"), "msg-1")
+	items, err := h.svc.store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ID != second.QueueID {
+		t.Fatalf("queue rows = %+v, want only the second reaction", items)
+	}
+	if items[0].Attempts != 0 {
+		t.Fatalf("replacement attempts = %d, want 0 (fresh budget)", items[0].Attempts)
+	}
+	h.sendErr = nil
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue = %d, %v, want 1, nil", n, err)
+	}
+	if len(h.sent) != 1 || string(h.sent[0]) != "heart bytes" {
+		t.Fatalf("sent = %d messages, want 1 with the heart bytes", len(h.sent))
+	}
+}
+
+// TestQueueReactionRejectsWhileSending: once a reaction is claimed
+// for dispatch it cannot be replaced — the send is already running
+// — so a second pick is rejected instead of queueing alongside it.
+func TestQueueReactionRejectsWhileSending(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queueReaction(t, []byte("thumbs-up bytes"), "msg-1")
+	if ok, err := h.svc.store.Claim(res.QueueID, h.now); err != nil || !ok {
+		t.Fatalf("Claim = %v, %v, want true, nil", ok, err)
+	}
+	if _, err := h.svc.QueueReaction("acc-1",
+		smtp.Address{Name: "Me", Address: "me@example.com"},
+		[]string{"alice@example.com"}, []byte("heart bytes"), "Re: hello", "alice@example.com", "msg-1"); err == nil || !strings.Contains(err.Error(), "already being sent") {
+		t.Fatalf("second QueueReaction while sending = %v, want an 'already being sent' error", err)
+	}
+	items, err := h.svc.store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != sendqueue.StatusSending {
+		t.Fatalf("queue rows = %+v, want the one sending reaction", items)
+	}
+}
+
 func TestQueueReactionFailedDispatchRetries(t *testing.T) {
 	h := newSendQueueTestHarness(t)
 	h.sendErr = fmt.Errorf("failed to connect to SMTP server: connection refused")
@@ -563,6 +672,159 @@ func TestQueueSendRejectsDuplicateDraft(t *testing.T) {
 	}
 	if _, err := h.svc.QueueSend("acc-1", testComposeMessage(), res.DraftID); err != nil {
 		t.Fatalf("QueueSend after undo: %v, want success", err)
+	}
+}
+
+// TestQueueSendRejectsWhenFailedRowExists is the R9 regression
+// test: after a send fails, the row sits in the Outbox as failed
+// and the draft is still in Drafts — re-sending from Drafts must
+// be rejected and pointed at Retry, not enqueue a second row with
+// a new Message-ID that could dispatch alongside a Retry of the
+// old row. Retry itself reuses the failed row, so the retried mail
+// keeps the original Message-ID.
+func TestQueueSendRejectsWhenFailedRowExists(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
+
+	full, err := h.svc.store.GetForSend(res.QueueID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored smtp.ComposeMessage
+	if err := json.Unmarshal([]byte(full.MessageJSON), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.MessageID == "" {
+		t.Fatal("queued message has no Message-ID stored, want one assigned at queue time")
+	}
+
+	// Fail the send permanently: the row stays failed in the Outbox.
+	h.sendErr = fmt.Errorf("failed to login to SMTP server: 535 Authentication failed")
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 0 {
+		t.Fatalf("dispatchDue(failing) = %d, %v, want 0, nil", n, err)
+	}
+	item := h.mustItem(t, res.QueueID)
+	if item.Status != sendqueue.StatusFailed {
+		t.Fatalf("after permanent failure: %+v, want failed", item)
+	}
+
+	// Re-sending the same draft is rejected, with a Retry pointer.
+	if _, err := h.svc.QueueSend("acc-1", testComposeMessage(), res.DraftID); err == nil || !strings.Contains(err.Error(), "Retry") {
+		t.Fatalf("QueueSend after failure = %v, want an error pointing at Retry", err)
+	}
+	items, err := h.svc.store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue rows = %d, want 1 (no second row enqueued)", len(items))
+	}
+
+	// Retry is the way back — and it reuses the failed row's
+	// Message-ID, so the retried mail is recognisably the same mail.
+	if err := h.svc.RetrySendQueueItem(res.QueueID); err != nil {
+		t.Fatalf("RetrySendQueueItem: %v", err)
+	}
+	retried, err := h.svc.store.GetForSend(res.QueueID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retriedMsg smtp.ComposeMessage
+	if err := json.Unmarshal([]byte(retried.MessageJSON), &retriedMsg); err != nil {
+		t.Fatal(err)
+	}
+	if retriedMsg.MessageID != stored.MessageID {
+		t.Fatalf("retried Message-ID = %q, want the original %q", retriedMsg.MessageID, stored.MessageID)
+	}
+	h.sendErr = nil
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue(after retry) = %d, %v, want 1, nil", n, err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(h.sent))
+	}
+}
+
+// TestRetrySendQueueItemRejectsWhenLiveRowExists: Retry must refuse
+// while another live row already exists for the same draft —
+// otherwise a Retry plus the live row would dispatch the same
+// content twice. (The live row here is seeded directly through the
+// store: QueueSend would already refuse to create it while the
+// failed row exists, and the partial unique index allows a failed
+// row and a live row for the same draft to coexist.)
+func TestRetrySendQueueItemRejectsWhenLiveRowExists(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	res := h.queue(t)
+
+	h.sendErr = fmt.Errorf("failed to login to SMTP server: 535 Authentication failed")
+	h.now = h.now.Add(6 * time.Second)
+	if _, err := h.svc.dispatchDue(h.now); err != nil {
+		t.Fatal(err)
+	}
+	if item := h.mustItem(t, res.QueueID); item.Status != sendqueue.StatusFailed {
+		t.Fatalf("after permanent failure: %+v, want failed", item)
+	}
+
+	live := sendqueue.Item{
+		ID:          "q-live",
+		AccountID:   "acc-1",
+		DraftID:     res.DraftID,
+		Kind:        sendqueue.KindMessage,
+		MessageJSON: `{"subject":"hi"}`,
+		Subject:     "hi",
+		Recipient:   "ada@example.com",
+		FromAddress: "me@example.com",
+		To:          []string{"ada@example.com"},
+		Status:      sendqueue.StatusPending,
+		MaxAttempts: sendqueue.DefaultMaxAttempts,
+		SendAt:      h.now.Add(5 * time.Second),
+		DueAt:       h.now.Add(5 * time.Second),
+		CreatedAt:   h.now,
+	}
+	if err := h.svc.store.Enqueue(live); err != nil {
+		t.Fatalf("Enqueue(live row alongside failed row): %v", err)
+	}
+
+	if err := h.svc.RetrySendQueueItem(res.QueueID); err == nil || !strings.Contains(err.Error(), "live queued send") {
+		t.Fatalf("RetrySendQueueItem with a live row = %v, want a 'live queued send' error", err)
+	}
+	if item := h.mustItem(t, res.QueueID); item.Status != sendqueue.StatusFailed {
+		t.Fatalf("failed row after refused retry: %+v, want still failed", item)
+	}
+	if item := h.mustItem(t, "q-live"); item.Status != sendqueue.StatusPending {
+		t.Fatalf("live row after refused retry: %+v, want still pending", item)
+	}
+}
+
+// TestRetryReactionRejectsWhenLiveReactionExists: the same guard in
+// the other direction for reactions — retrying a failed reaction
+// while a newer live reaction is queued for the same message would
+// send both emojis.
+func TestRetryReactionRejectsWhenLiveReactionExists(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	failed := sendqueue.Item{
+		ID: "r-failed", AccountID: "acc-1", Kind: sendqueue.KindReaction,
+		RawMessage: []byte("thumbs-up bytes"), ReactionMessageID: "msg-1",
+		Subject: "Re: hello", Recipient: "alice@example.com",
+		FromAddress: "me@example.com", To: []string{"alice@example.com"},
+		Status: sendqueue.StatusFailed, MaxAttempts: sendqueue.DefaultMaxAttempts,
+		SendAt: h.now, DueAt: h.now, CreatedAt: h.now,
+	}
+	live := failed
+	live.ID = "r-live"
+	live.RawMessage = []byte("heart bytes")
+	live.Status = sendqueue.StatusPending
+	for _, it := range []sendqueue.Item{failed, live} {
+		if err := h.svc.store.Enqueue(it); err != nil {
+			t.Fatalf("Enqueue(%s): %v", it.ID, err)
+		}
+	}
+	if err := h.svc.RetrySendQueueItem("r-failed"); err == nil || !strings.Contains(err.Error(), "live queued reaction") {
+		t.Fatalf("RetrySendQueueItem(failed reaction with live reaction) = %v, want a 'live queued reaction' error", err)
+	}
+	if item := h.mustItem(t, "r-failed"); item.Status != sendqueue.StatusFailed {
+		t.Fatalf("failed reaction after refused retry: %+v, want still failed", item)
 	}
 }
 

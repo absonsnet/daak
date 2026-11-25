@@ -504,6 +504,59 @@ func (s *Store) HasActiveForDraft(draftID string) (bool, error) {
 	return n > 0, nil
 }
 
+// HasFailedForDraft reports whether the draft already has a failed
+// queued send sitting in the Outbox. QueueSend uses it to reject a
+// re-send from Drafts: the failed row is the one to Retry, and a
+// second row would dispatch a second copy (with a new Message-ID)
+// alongside a Retry of the old row. A failed row is deliberately
+// NOT "active" (see HasActiveForDraft) — the live-row guard and the
+// failed-row guard are separate checks with separate errors.
+func (s *Store) HasFailedForDraft(draftID string) (bool, error) {
+	if draftID == "" {
+		return false, nil
+	}
+	var n int
+	if err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM send_queue
+		WHERE draft_id = ? AND status = 'failed'
+	`, draftID).Scan(&n); err != nil {
+		return false, fmt.Errorf("sendqueue: check failed draft: %w", err)
+	}
+	return n > 0, nil
+}
+
+// ActiveReaction returns the live queued reaction for one message
+// (internal id) — status 'pending' (still in the undo window or
+// waiting on a retry backoff) or 'sending' (being dispatched right
+// now) — oldest first, or (nil, nil) when there is none. A failed
+// reaction row is not live: it stays in the Outbox for Retry and
+// does not block a new reaction. QueueReaction uses it to replace a
+// pending reaction with the new one, or reject while one is sending.
+func (s *Store) ActiveReaction(messageID string) (*Item, error) {
+	if messageID == "" {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`
+		SELECT `+listColumns+`
+		FROM send_queue
+		WHERE kind = 'reaction' AND reaction_message_id = ?
+			AND status IN ('pending', 'sending')
+		ORDER BY created_at ASC, id ASC LIMIT 1
+	`, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("sendqueue: active reaction: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, nil
+	}
+	item, err := scanItem(rows)
+	if err != nil {
+		return nil, fmt.Errorf("sendqueue: scan active reaction: %w", err)
+	}
+	return &item, nil
+}
+
 // RequeueSending is used by tests to put a 'sending' item back to
 // pending without waiting for the stale-claim window.
 func (s *Store) RequeueSending(id string) error {
