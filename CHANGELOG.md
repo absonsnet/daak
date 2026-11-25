@@ -1,5 +1,19 @@
 # CHANGELOG
 
+**v0.7.40 - 25-11-2026**
+---
+
+- Calendar and contacts no longer trigger a false "sign in again" prompt when two of them refresh the sign-in at the same moment: extensions now share one refresh per account, so only one refresh runs and the other reuses the fresh sign-in
+- If saving a refreshed sign-in fails, the app now says so loudly instead of carrying on with tokens that will fail next time: the save is retried, and if it still fails you get a clear error instead of a misleading re-sign-in prompt; the new sign-in key is also saved first so a partial failure still leaves a working key behind
+- Cancelling a sign-in and immediately retrying no longer kills the retry: the old sign-in's cleanup now only clears its own session, never the new one
+- A message queued just before a restart can no longer send before its Undo toast appears: the send worker now holds fresh messages until the countdowns are shown again, with a 60-second safety release so mail can never strand
+- Moving a message no longer loses its read state when the destination sync fails, and moving from a popup window now syncs the destination and cleans up the same way as the main window, so no duplicate is left behind
+- A signed email with a bad signature no longer shows a fake attachment that cannot be opened: signature parts are now skipped in every parser path
+- Editing or deleting one day of a repeating event now works on calendars signed in with Google/Microsoft: the single-occurrence edit now uses the sign-in connection instead of asking for a password that doesn't exist
+- Closing the window no longer hides Daak when the tray icon has died mid-session: the app now checks the tray is actually alive before hiding, and quits for real instead when it isn't
+- Opening an encrypted email from server search no longer shows a fake downloadable attachment: the encrypted body is no longer mistaken for an attachment file
+- A huge message opened from server search is now correctly flagged as cut short: the "truncated" flag is saved on the search path, and view-source now says when the source itself was cut short
+
 **v0.7.39 - 25-11-2026**
 ---
 

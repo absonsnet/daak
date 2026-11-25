@@ -60,15 +60,15 @@
       </div>
 
       <div class="space-y-4 max-h-[60vh] overflow-y-auto text-sm">
-        <p>🚀 Welcome to {APP_NAME} v0.7.39!</p>
+        <p>🚀 Welcome to {APP_NAME} v0.7.40!</p>
 
-        <p>v0.7.39 fixes the first ten issues found in the re-audit:</p>
+        <p>v0.7.40 fixes the next ten issues found in the re-audit:</p>
 
         <ul class="list-disc pl-6 space-y-1">
-          <li>🔁 Contact sync and mail sync are safer: failed contact changes are retried instead of lost, and old mail still on the server is no longer deleted by a period sync</li>
-          <li>📬 Mail Merge is safer: Send now reuses one Message-ID on retry and Resume, queue sends clear before the Sent save, and moved messages are no longer wrongly marked as failed</li>
-          <li>📅 Calendar conflicts now catch cancellations, organiser, alarm and exception changes, and writes with no known server stamp re-check before saving</li>
-          <li>⏪ Reactions now replace instead of doubling inside the undo window, failed sends block re-sending the same draft, and a failed message body can be retried from the viewer</li>
+          <li>🔐 Sign-in is steadier: no more false re-sign-in prompts from double refreshes, failed token saves now fail loudly, and cancelling a sign-in no longer kills the retry</li>
+          <li>⏪ Undo is safer on restart: fresh messages wait until the Undo countdown is shown again, and moves only clean up once the destination sync confirms the copy</li>
+          <li>📅 Editing one day of a repeating event now works on Google/Microsoft calendars, and a dead tray icon can no longer strand the window</li>
+          <li>📬 Search results are cleaner: encrypted mail shows no fake attachment, and huge messages opened from search are correctly flagged as cut short</li>
         </ul>
 
         <p>🏷 See the full change log here:</p>

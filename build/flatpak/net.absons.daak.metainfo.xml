@@ -375,6 +375,13 @@
   </provides>
 
   <releases>
+    <release version="0.7.40" date="2026-11-25">
+      <description>
+        <ul>
+          <li>Ten more re-audit fixes: extension sign-in refreshes are single-flight per account so no false re-sign-in prompt, failed token saves fail loudly instead of poisoning the next refresh, cancelling a sign-in no longer kills the retry, restart Undo toasts can no longer be lost to the worker, moves clean up only after the destination sync confirms the copy, bad signatures no longer show phantom attachments, single-occurrence edits work on OAuth calendars, a dead tray no longer strands the window, encrypted mail from search shows no phantom attachment, and truncated bodies from search are flagged</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.39" date="2026-11-25">
       <description>
         <ul>
