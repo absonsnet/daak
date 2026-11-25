@@ -881,7 +881,11 @@ func (s *Store) Create(m *Message) error {
 // keys have no ON UPDATE CASCADE, so changing id fails outright), and reset
 // received_at to "now" on every re-sync. received_at is therefore first-seen
 // time, set on insert only; thread_id is computed by finalizeSavedHeaders
-// after the save.
+// after the save. read_receipt_handled is local-only state too (fourth-audit
+// finding 58): a header re-sync carries the fresh message's default (false),
+// so overwriting it would reset an already-answered receipt and prompt
+// again — a batch retry after a partial save, or a server UID reuse,
+// would re-ask a question the user already answered.
 func (s *Store) Upsert(m *Message) error {
 	// Reuse the stored id on conflict: it is the primary key referenced by
 	// attachment/reaction rows, and the caller (header sync) needs m.ID to
@@ -924,7 +928,7 @@ func (s *Store) Upsert(m *Message) error {
 			is_answered=excluded.is_answered, is_forwarded=excluded.is_forwarded,
 			is_draft=excluded.is_draft, is_deleted=excluded.is_deleted,
 			size=excluded.size,
-			read_receipt_to=excluded.read_receipt_to, read_receipt_handled=excluded.read_receipt_handled,
+			read_receipt_to=excluded.read_receipt_to,
 			list_unsubscribe=excluded.list_unsubscribe,
 			list_unsubscribe_post=excluded.list_unsubscribe_post,
 			category=excluded.category, sub_category=excluded.sub_category,
