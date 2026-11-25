@@ -200,6 +200,8 @@ export function DeleteIdentity(arg1:string):Promise<void>;
 
 export function DeleteLocalMessages(arg1:Array<string>):Promise<void>;
 
+export function DeleteMessagesFromServer(arg1:Array<string>):Promise<void>;
+
 export function DeletePGPKey(arg1:string):Promise<void>;
 
 export function DeletePGPSenderKey(arg1:string):Promise<void>;

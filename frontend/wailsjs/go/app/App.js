@@ -354,6 +354,10 @@ export function DeleteLocalMessages(arg1) {
   return window['go']['app']['App']['DeleteLocalMessages'](arg1);
 }
 
+export function DeleteMessagesFromServer(arg1) {
+  return window['go']['app']['App']['DeleteMessagesFromServer'](arg1);
+}
+
 export function DeletePGPKey(arg1) {
   return window['go']['app']['App']['DeletePGPKey'](arg1);
 }
