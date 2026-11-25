@@ -28,6 +28,7 @@ import (
 	"github.com/absonsnet/daak/internal/oauth2"
 	"github.com/absonsnet/daak/internal/pgp"
 	"github.com/absonsnet/daak/internal/platform"
+	"github.com/absonsnet/daak/internal/sendqueue"
 	"github.com/absonsnet/daak/internal/settings"
 	"github.com/absonsnet/daak/internal/smime"
 	"github.com/absonsnet/daak/internal/smtp"
@@ -887,9 +888,25 @@ func (c *ComposerApp) SendMessage(accountID string, msg smtp.ComposeMessage) err
 		c.cancelDraftSync()
 	}
 
-	_, err := c.composeOps.sendMessage(c.ctx, accountID, msg, c.currentDraft)
+	// A Sent-folder save failure does not fail the send (the mail
+	// was already accepted by SMTP), but it is recorded as a
+	// persistent "Sent save failed" Outbox warning (re-audit
+	// finding R24) in the shared queue DB, so the main window can
+	// show it — a swallowed error would leave a delivered mail
+	// with no record anywhere in Daak.
+	_, err, sentSaveErr := c.composeOps.sendMessage(c.ctx, accountID, msg, c.currentDraft)
 	if err != nil {
 		return err
+	}
+	if sentSaveErr != nil && c.sendQueue != nil {
+		c.sendQueue.recordSentSaveFailure(sendqueue.Item{
+			AccountID:   accountID,
+			Kind:        sendqueue.KindMessage,
+			Subject:     msg.Subject,
+			Recipient:   firstRecipient(msg),
+			FromAddress: msg.From.Address,
+			To:          msg.AllRecipients(),
+		}, time.Now(), sentSaveErr)
 	}
 
 	// Post-send: IPC notification + state cleanup
