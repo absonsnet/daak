@@ -96,6 +96,7 @@ func TestMarkUnresolvedAsFailed_AttachmentOnlyNotFlagged(t *testing.T) {
 			[]message.BodyUpdate{{MessageID: "orig-1", HasAttachments: true}},
 			map[string]fetchedSize{"orig-1": {received: 5000, reported: 5000}},
 			nil,
+			nil,
 		)
 
 		var flag int
@@ -115,6 +116,7 @@ func TestMarkUnresolvedAsFailed_AttachmentOnlyNotFlagged(t *testing.T) {
 			[]string{"orig-1"},
 			[]message.BodyUpdate{{MessageID: "orig-1"}},
 			map[string]fetchedSize{"orig-1": {received: 5000, reported: 5000}},
+			nil,
 			nil,
 		)
 
@@ -191,7 +193,7 @@ func TestBatchUIDLookup_PlaceholderNeverMarkedBodyFailed(t *testing.T) {
 
 	// Simulate the empty-batch outcome: the server returned nothing for
 	// the requested IDs, so they are charged — but only the requested ones.
-	engine.markUnresolvedAsFailed(fetchable, nil, nil, nil)
+	engine.markUnresolvedAsFailed(fetchable, nil, nil, nil, nil)
 
 	var flag int
 	if err := db.QueryRow(`SELECT body_failed FROM messages WHERE id = ?`, "real-1").Scan(&flag); err != nil {
@@ -322,5 +324,44 @@ func TestBodyFailedReactionDetectedAfterRetry(t *testing.T) {
 	}
 	if !isHidden(t, db, "react-1") {
 		t.Fatal("reaction email is not hidden after retry, want is_hidden=1")
+	}
+}
+
+// Audit4 findings 22 + 23: a timed-out parse and an empty fetch must
+// never charge body_failed — both are deferred so the next sync retries.
+func TestMarkUnresolvedAsFailed_DeferredIDsNotFlagged(t *testing.T) {
+	engine, db, msgStore, _ := newReactionHandleTestEngine(t)
+	seedHandleTestMessage(t, msgStore, "orig-1", "<defer-1@example.com>", "", "alice@example.com", "Alice")
+	seedHandleTestMessage(t, msgStore, "orig-2", "<defer-2@example.com>", "", "alice@example.com", "Alice")
+
+	engine.markUnresolvedAsFailed(
+		[]string{"orig-1", "orig-2"},
+		[]message.BodyUpdate{{MessageID: "orig-1"}, {MessageID: "orig-2"}},
+		map[string]fetchedSize{
+			"orig-1": {received: 5000, reported: 5000},
+			"orig-2": {received: 0, reported: 5000},
+		},
+		nil,
+		map[string]bool{"orig-1": true, "orig-2": true},
+	)
+
+	for _, id := range []string{"orig-1", "orig-2"} {
+		var flag int
+		if err := db.QueryRow(`SELECT body_failed FROM messages WHERE id = ?`, id).Scan(&flag); err != nil {
+			t.Fatalf("query body_failed %s: %v", id, err)
+		}
+		if flag != 0 {
+			t.Errorf("body_failed = %d for deferred %s, want 0", flag, id)
+		}
+	}
+}
+
+// Audit4 finding 22: a timed-out parse defers the body update even
+// when the fallback produced partial text — the partial body must
+// never be stored as complete.
+func TestDeferBodyUpdate_TimedOutParse(t *testing.T) {
+	pb := &ProcessedBody{MessageID: "msg-1", BodyText: "partial fallback", ParseTimedOut: true, ReceivedBytes: 5000, ReportedSize: 5000}
+	if !deferBodyUpdate(pb) {
+		t.Fatalf("deferBodyUpdate(timed-out parse) = false, want true")
 	}
 }

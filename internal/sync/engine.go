@@ -79,6 +79,13 @@ type ParsedBody struct {
 	// from another part is resolved regardless (see
 	// BodyUpdate.HasUsableContent).
 	TextPartsFailed bool
+	// ParseTimedOut records that the parse hit its time budget and the
+	// returned body is only the plain-text fallback: attachment
+	// metadata from the timed-out pass is unknown, so the result must
+	// never be stored as a complete body (audit4 finding 22). The
+	// fetch layer treats it as deferred — body_fetched stays 0 and
+	// the message is re-fetched next sync.
+	ParseTimedOut bool
 	// Reaction is set when the message is an email reaction (Gmail's
 	// text/vnd.google.email-reaction+json part or an RFC 9078
 	// Content-Disposition: reaction part). Nil for regular messages.
