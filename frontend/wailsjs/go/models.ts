@@ -33,8 +33,10 @@ export namespace account {
 	    archiveFolderPath?: string;
 	    allMailFolderPath?: string;
 	    starredFolderPath?: string;
-	    createdAt: time.Time;
-	    updatedAt: time.Time;
+	    // Go type: time
+	    createdAt: any;
+	    // Go type: time
+	    updatedAt: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Account(source);
@@ -74,8 +76,8 @@ export namespace account {
 	        this.archiveFolderPath = source["archiveFolderPath"];
 	        this.allMailFolderPath = source["allMailFolderPath"];
 	        this.starredFolderPath = source["starredFolderPath"];
-	        this.createdAt = this.convertValues(source["createdAt"], time.Time);
-	        this.updatedAt = this.convertValues(source["updatedAt"], time.Time);
+	        this.createdAt = this.convertValues(source["createdAt"], null);
+	        this.updatedAt = this.convertValues(source["updatedAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -185,8 +187,10 @@ export namespace account {
 	    signaturePlacement: string;
 	    signatureSeparator: boolean;
 	    orderIndex: number;
-	    createdAt: time.Time;
-	    updatedAt: time.Time;
+	    // Go type: time
+	    createdAt: any;
+	    // Go type: time
+	    updatedAt: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Identity(source);
@@ -208,8 +212,8 @@ export namespace account {
 	        this.signaturePlacement = source["signaturePlacement"];
 	        this.signatureSeparator = source["signatureSeparator"];
 	        this.orderIndex = source["orderIndex"];
-	        this.createdAt = this.convertValues(source["createdAt"], time.Time);
-	        this.updatedAt = this.convertValues(source["updatedAt"], time.Time);
+	        this.createdAt = this.convertValues(source["createdAt"], null);
+	        this.updatedAt = this.convertValues(source["updatedAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -327,7 +331,8 @@ export namespace app {
 	    subject: string;
 	    type: string;
 	    typeLabel: string;
-	    date: time.Time;
+	    // Go type: time
+	    date: any;
 	    extractKind?: string;
 	    extractValue?: string;
 	
@@ -346,7 +351,7 @@ export namespace app {
 	        this.subject = source["subject"];
 	        this.type = source["type"];
 	        this.typeLabel = source["typeLabel"];
-	        this.date = this.convertValues(source["date"], time.Time);
+	        this.date = this.convertValues(source["date"], null);
 	        this.extractKind = source["extractKind"];
 	        this.extractValue = source["extractValue"];
 	    }
@@ -737,7 +742,8 @@ export namespace app {
 	    emoji: string;
 	    reactorEmail: string;
 	    reactorName: string;
-	    createdAt: time.Time;
+	    // Go type: time
+	    createdAt: any;
 	    isOwn: boolean;
 	
 	    static createFrom(source: any = {}) {
@@ -749,7 +755,7 @@ export namespace app {
 	        this.emoji = source["emoji"];
 	        this.reactorEmail = source["reactorEmail"];
 	        this.reactorName = source["reactorName"];
-	        this.createdAt = this.convertValues(source["createdAt"], time.Time);
+	        this.createdAt = this.convertValues(source["createdAt"], null);
 	        this.isOwn = source["isOwn"];
 	    }
 	
@@ -875,7 +881,8 @@ export namespace app {
 	    isOAuth: boolean;
 	    provider: string;
 	    email: string;
-	    expiresAt: time.Time;
+	    // Go type: time
+	    expiresAt: any;
 	    isExpired: boolean;
 	    needsReauth: boolean;
 	
@@ -888,7 +895,7 @@ export namespace app {
 	        this.isOAuth = source["isOAuth"];
 	        this.provider = source["provider"];
 	        this.email = source["email"];
-	        this.expiresAt = this.convertValues(source["expiresAt"], time.Time);
+	        this.expiresAt = this.convertValues(source["expiresAt"], null);
 	        this.isExpired = source["isExpired"];
 	        this.needsReauth = source["needsReauth"];
 	    }
@@ -2035,10 +2042,13 @@ export namespace backend {
 	    status: string;
 	    attempts: number;
 	    maxAttempts: number;
-	    nextAttemptAt: time.Time;
+	    // Go type: time
+	    nextAttemptAt: any;
 	    lastError?: string;
-	    createdAt: time.Time;
-	    sentAt?: time.Time;
+	    // Go type: time
+	    createdAt: any;
+	    // Go type: time
+	    sentAt?: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new QueuedItem(source);
@@ -2057,10 +2067,10 @@ export namespace backend {
 	        this.status = source["status"];
 	        this.attempts = source["attempts"];
 	        this.maxAttempts = source["maxAttempts"];
-	        this.nextAttemptAt = this.convertValues(source["nextAttemptAt"], time.Time);
+	        this.nextAttemptAt = this.convertValues(source["nextAttemptAt"], null);
 	        this.lastError = source["lastError"];
-	        this.createdAt = this.convertValues(source["createdAt"], time.Time);
-	        this.sentAt = this.convertValues(source["sentAt"], time.Time);
+	        this.createdAt = this.convertValues(source["createdAt"], null);
+	        this.sentAt = this.convertValues(source["sentAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -2220,9 +2230,9 @@ export namespace carddav {
 	    path: string;
 	    name: string;
 	    enabled: boolean;
-	    writable: boolean;
 	    sync_token?: string;
-	    last_synced_at?: time.Time;
+	    // Go type: time
+	    last_synced_at?: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Addressbook(source);
@@ -2235,9 +2245,8 @@ export namespace carddav {
 	        this.path = source["path"];
 	        this.name = source["name"];
 	        this.enabled = source["enabled"];
-	        this.writable = source["writable"];
 	        this.sync_token = source["sync_token"];
-	        this.last_synced_at = this.convertValues(source["last_synced_at"], time.Time);
+	        this.last_synced_at = this.convertValues(source["last_synced_at"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -2262,8 +2271,6 @@ export namespace carddav {
 	    path: string;
 	    name: string;
 	    description?: string;
-	    writable: boolean;
-	    writableKnown?: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new AddressbookInfo(source);
@@ -2274,8 +2281,6 @@ export namespace carddav {
 	        this.path = source["path"];
 	        this.name = source["name"];
 	        this.description = source["description"];
-	        this.writable = source["writable"];
-	        this.writableKnown = source["writableKnown"];
 	    }
 	}
 	export class Source {
@@ -2288,10 +2293,13 @@ export namespace carddav {
 	    enabled: boolean;
 	    writable: boolean;
 	    sync_interval: number;
-	    last_synced_at?: time.Time;
+	    // Go type: time
+	    last_synced_at?: any;
 	    last_error?: string;
-	    last_error_at?: time.Time;
-	    created_at: time.Time;
+	    // Go type: time
+	    last_error_at?: any;
+	    // Go type: time
+	    created_at: any;
 	    addressbooks?: Addressbook[];
 	
 	    static createFrom(source: any = {}) {
@@ -2309,10 +2317,10 @@ export namespace carddav {
 	        this.enabled = source["enabled"];
 	        this.writable = source["writable"];
 	        this.sync_interval = source["sync_interval"];
-	        this.last_synced_at = this.convertValues(source["last_synced_at"], time.Time);
+	        this.last_synced_at = this.convertValues(source["last_synced_at"], null);
 	        this.last_error = source["last_error"];
-	        this.last_error_at = this.convertValues(source["last_error_at"], time.Time);
-	        this.created_at = this.convertValues(source["created_at"], time.Time);
+	        this.last_error_at = this.convertValues(source["last_error_at"], null);
+	        this.created_at = this.convertValues(source["created_at"], null);
 	        this.addressbooks = this.convertValues(source["addressbooks"], Addressbook);
 	    }
 	
@@ -2346,7 +2354,6 @@ export namespace carddav {
 	    sync_interval: number;
 	    enabled_addressbooks?: string[];
 	    addressbook_names?: Record<string, string>;
-	    addressbook_writable?: Record<string, boolean>;
 	
 	    static createFrom(source: any = {}) {
 	        return new SourceConfig(source);
@@ -2365,14 +2372,14 @@ export namespace carddav {
 	        this.sync_interval = source["sync_interval"];
 	        this.enabled_addressbooks = source["enabled_addressbooks"];
 	        this.addressbook_names = source["addressbook_names"];
-	        this.addressbook_writable = source["addressbook_writable"];
 	    }
 	}
 	export class SourceError {
 	    source_id: string;
 	    source_name: string;
 	    error: string;
-	    error_at: time.Time;
+	    // Go type: time
+	    error_at: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new SourceError(source);
@@ -2383,7 +2390,7 @@ export namespace carddav {
 	        this.source_id = source["source_id"];
 	        this.source_name = source["source_name"];
 	        this.error = source["error"];
-	        this.error_at = this.convertValues(source["error_at"], time.Time);
+	        this.error_at = this.convertValues(source["error_at"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -2447,8 +2454,10 @@ export namespace contact {
 	    kind?: string;
 	    avatar_url?: string;
 	    send_count: number;
-	    last_used: time.Time;
-	    created_at: time.Time;
+	    // Go type: time
+	    last_used: any;
+	    // Go type: time
+	    created_at: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Contact(source);
@@ -2462,8 +2471,8 @@ export namespace contact {
 	        this.kind = source["kind"];
 	        this.avatar_url = source["avatar_url"];
 	        this.send_count = source["send_count"];
-	        this.last_used = this.convertValues(source["last_used"], time.Time);
-	        this.created_at = this.convertValues(source["created_at"], time.Time);
+	        this.last_used = this.convertValues(source["last_used"], null);
+	        this.created_at = this.convertValues(source["created_at"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -2526,10 +2535,13 @@ export namespace draft {
 	    syncStatus: string;
 	    imapUid?: number;
 	    folderId?: string;
-	    lastSyncAttempt?: time.Time;
+	    // Go type: time
+	    lastSyncAttempt?: any;
 	    syncError?: string;
-	    createdAt: time.Time;
-	    updatedAt: time.Time;
+	    // Go type: time
+	    createdAt: any;
+	    // Go type: time
+	    updatedAt: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Draft(source);
@@ -2557,10 +2569,10 @@ export namespace draft {
 	        this.syncStatus = source["syncStatus"];
 	        this.imapUid = source["imapUid"];
 	        this.folderId = source["folderId"];
-	        this.lastSyncAttempt = this.convertValues(source["lastSyncAttempt"], time.Time);
+	        this.lastSyncAttempt = this.convertValues(source["lastSyncAttempt"], null);
 	        this.syncError = source["syncError"];
-	        this.createdAt = this.convertValues(source["createdAt"], time.Time);
-	        this.updatedAt = this.convertValues(source["updatedAt"], time.Time);
+	        this.createdAt = this.convertValues(source["createdAt"], null);
+	        this.updatedAt = this.convertValues(source["updatedAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -2598,7 +2610,8 @@ export namespace folder {
 	    highestModSeq: number;
 	    totalCount: number;
 	    unreadCount: number;
-	    lastSync?: time.Time;
+	    // Go type: time
+	    lastSync?: any;
 	    subscribed: boolean;
 	
 	    static createFrom(source: any = {}) {
@@ -2618,7 +2631,7 @@ export namespace folder {
 	        this.highestModSeq = source["highestModSeq"];
 	        this.totalCount = source["totalCount"];
 	        this.unreadCount = source["unreadCount"];
-	        this.lastSync = this.convertValues(source["lastSync"], time.Time);
+	        this.lastSync = this.convertValues(source["lastSync"], null);
 	        this.subscribed = source["subscribed"];
 	    }
 	
@@ -2808,7 +2821,8 @@ export namespace mailmerge {
 	    status: string;
 	    error?: string;
 	    messageId?: string;
-	    timestamp: time.Time;
+	    // Go type: time
+	    timestamp: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new RowResult(source);
@@ -2821,7 +2835,7 @@ export namespace mailmerge {
 	        this.status = source["status"];
 	        this.error = source["error"];
 	        this.messageId = source["messageId"];
-	        this.timestamp = this.convertValues(source["timestamp"], time.Time);
+	        this.timestamp = this.convertValues(source["timestamp"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -2844,7 +2858,8 @@ export namespace mailmerge {
 	}
 	export class Run {
 	    id: string;
-	    createdAt: time.Time;
+	    // Go type: time
+	    createdAt: any;
 	    accountId: string;
 	    deliverMode: string;
 	    status: string;
@@ -2864,7 +2879,7 @@ export namespace mailmerge {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
-	        this.createdAt = this.convertValues(source["createdAt"], time.Time);
+	        this.createdAt = this.convertValues(source["createdAt"], null);
 	        this.accountId = source["accountId"];
 	        this.deliverMode = source["deliverMode"];
 	        this.status = source["status"];
@@ -2966,7 +2981,6 @@ export namespace mailmerge {
 	    capLimit: number;
 	    accountId: string;
 	    attachmentDir: string;
-	    alreadySent?: string[];
 	
 	    static createFrom(source: any = {}) {
 	        return new RunRequest(source);
@@ -2987,7 +3001,6 @@ export namespace mailmerge {
 	        this.capLimit = source["capLimit"];
 	        this.accountId = source["accountId"];
 	        this.attachmentDir = source["attachmentDir"];
-	        this.alreadySent = source["alreadySent"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -3010,7 +3023,8 @@ export namespace mailmerge {
 	}
 	export class RunSummary {
 	    id: string;
-	    createdAt: time.Time;
+	    // Go type: time
+	    createdAt: any;
 	    accountId: string;
 	    deliverMode: string;
 	    status: string;
@@ -3029,7 +3043,7 @@ export namespace mailmerge {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
-	        this.createdAt = this.convertValues(source["createdAt"], time.Time);
+	        this.createdAt = this.convertValues(source["createdAt"], null);
 	        this.accountId = source["accountId"];
 	        this.deliverMode = source["deliverMode"];
 	        this.status = source["status"];
@@ -3198,7 +3212,8 @@ export namespace message {
 	    ccList?: string;
 	    bccList?: string;
 	    replyTo?: string;
-	    date: time.Time;
+	    // Go type: time
+	    date: any;
 	    snippet?: string;
 	    isRead: boolean;
 	    isStarred: boolean;
@@ -3232,7 +3247,8 @@ export namespace message {
 	    pgpSignerKeyId?: string;
 	    pgpEncrypted?: boolean;
 	    hasPGP?: boolean;
-	    receivedAt: time.Time;
+	    // Go type: time
+	    receivedAt: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Message(source);
@@ -3255,7 +3271,7 @@ export namespace message {
 	        this.ccList = source["ccList"];
 	        this.bccList = source["bccList"];
 	        this.replyTo = source["replyTo"];
-	        this.date = this.convertValues(source["date"], time.Time);
+	        this.date = this.convertValues(source["date"], null);
 	        this.snippet = source["snippet"];
 	        this.isRead = source["isRead"];
 	        this.isStarred = source["isStarred"];
@@ -3289,7 +3305,7 @@ export namespace message {
 	        this.pgpSignerKeyId = source["pgpSignerKeyId"];
 	        this.pgpEncrypted = source["pgpEncrypted"];
 	        this.hasPGP = source["hasPGP"];
-	        this.receivedAt = this.convertValues(source["receivedAt"], time.Time);
+	        this.receivedAt = this.convertValues(source["receivedAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -3318,7 +3334,8 @@ export namespace message {
 	    unreadCount: number;
 	    hasAttachments: boolean;
 	    isStarred: boolean;
-	    latestDate: time.Time;
+	    // Go type: time
+	    latestDate: any;
 	    participants: Address[];
 	    messageIds: string[];
 	    isEncrypted: boolean;
@@ -3347,7 +3364,7 @@ export namespace message {
 	        this.unreadCount = source["unreadCount"];
 	        this.hasAttachments = source["hasAttachments"];
 	        this.isStarred = source["isStarred"];
-	        this.latestDate = this.convertValues(source["latestDate"], time.Time);
+	        this.latestDate = this.convertValues(source["latestDate"], null);
 	        this.participants = this.convertValues(source["participants"], Address);
 	        this.messageIds = source["messageIds"];
 	        this.isEncrypted = source["isEncrypted"];
@@ -3390,7 +3407,8 @@ export namespace message {
 	    unreadCount: number;
 	    hasAttachments: boolean;
 	    isStarred: boolean;
-	    latestDate: time.Time;
+	    // Go type: time
+	    latestDate: any;
 	    participants: Address[];
 	    messageIds: string[];
 	    isEncrypted: boolean;
@@ -3424,7 +3442,7 @@ export namespace message {
 	        this.unreadCount = source["unreadCount"];
 	        this.hasAttachments = source["hasAttachments"];
 	        this.isStarred = source["isStarred"];
-	        this.latestDate = this.convertValues(source["latestDate"], time.Time);
+	        this.latestDate = this.convertValues(source["latestDate"], null);
 	        this.participants = this.convertValues(source["participants"], Address);
 	        this.messageIds = source["messageIds"];
 	        this.isEncrypted = source["isEncrypted"];
@@ -3493,7 +3511,8 @@ export namespace message {
 	    subject: string;
 	    fromName: string;
 	    fromEmail: string;
-	    date: time.Time;
+	    // Go type: time
+	    date: any;
 	    snippet: string;
 	    isRead: boolean;
 	    isStarred: boolean;
@@ -3515,7 +3534,7 @@ export namespace message {
 	        this.subject = source["subject"];
 	        this.fromName = source["fromName"];
 	        this.fromEmail = source["fromEmail"];
-	        this.date = this.convertValues(source["date"], time.Time);
+	        this.date = this.convertValues(source["date"], null);
 	        this.snippet = source["snippet"];
 	        this.isRead = source["isRead"];
 	        this.isStarred = source["isStarred"];
@@ -3557,12 +3576,15 @@ export namespace pgp {
 	    userId: string;
 	    algorithm: string;
 	    keySize: number;
-	    createdAtKey?: time.Time;
-	    expiresAtKey?: time.Time;
+	    // Go type: time
+	    createdAtKey?: any;
+	    // Go type: time
+	    expiresAtKey?: any;
 	    isDefault: boolean;
 	    isExpired: boolean;
 	    hasPrivate: boolean;
-	    createdAt: time.Time;
+	    // Go type: time
+	    createdAt: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Key(source);
@@ -3578,12 +3600,12 @@ export namespace pgp {
 	        this.userId = source["userId"];
 	        this.algorithm = source["algorithm"];
 	        this.keySize = source["keySize"];
-	        this.createdAtKey = this.convertValues(source["createdAtKey"], time.Time);
-	        this.expiresAtKey = this.convertValues(source["expiresAtKey"], time.Time);
+	        this.createdAtKey = this.convertValues(source["createdAtKey"], null);
+	        this.expiresAtKey = this.convertValues(source["expiresAtKey"], null);
 	        this.isDefault = source["isDefault"];
 	        this.isExpired = source["isExpired"];
 	        this.hasPrivate = source["hasPrivate"];
-	        this.createdAt = this.convertValues(source["createdAt"], time.Time);
+	        this.createdAt = this.convertValues(source["createdAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -3663,11 +3685,15 @@ export namespace pgp {
 	    userId: string;
 	    algorithm: string;
 	    keySize: number;
-	    createdAtKey?: time.Time;
-	    expiresAtKey?: time.Time;
+	    // Go type: time
+	    createdAtKey?: any;
+	    // Go type: time
+	    expiresAtKey?: any;
 	    source: string;
-	    collectedAt: time.Time;
-	    lastSeenAt: time.Time;
+	    // Go type: time
+	    collectedAt: any;
+	    // Go type: time
+	    lastSeenAt: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new SenderKey(source);
@@ -3682,11 +3708,11 @@ export namespace pgp {
 	        this.userId = source["userId"];
 	        this.algorithm = source["algorithm"];
 	        this.keySize = source["keySize"];
-	        this.createdAtKey = this.convertValues(source["createdAtKey"], time.Time);
-	        this.expiresAtKey = this.convertValues(source["expiresAtKey"], time.Time);
+	        this.createdAtKey = this.convertValues(source["createdAtKey"], null);
+	        this.expiresAtKey = this.convertValues(source["expiresAtKey"], null);
 	        this.source = source["source"];
-	        this.collectedAt = this.convertValues(source["collectedAt"], time.Time);
-	        this.lastSeenAt = this.convertValues(source["lastSeenAt"], time.Time);
+	        this.collectedAt = this.convertValues(source["collectedAt"], null);
+	        this.lastSeenAt = this.convertValues(source["lastSeenAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -3746,11 +3772,15 @@ export namespace sendqueue {
 	    status: string;
 	    attempts: number;
 	    maxAttempts: number;
-	    sendAt: time.Time;
-	    dueAt: time.Time;
+	    // Go type: time
+	    sendAt: any;
+	    // Go type: time
+	    dueAt: any;
 	    lastError?: string;
-	    createdAt: time.Time;
-	    sentAt?: time.Time;
+	    // Go type: time
+	    createdAt: any;
+	    // Go type: time
+	    sentAt?: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Item(source);
@@ -3770,11 +3800,11 @@ export namespace sendqueue {
 	        this.status = source["status"];
 	        this.attempts = source["attempts"];
 	        this.maxAttempts = source["maxAttempts"];
-	        this.sendAt = this.convertValues(source["sendAt"], time.Time);
-	        this.dueAt = this.convertValues(source["dueAt"], time.Time);
+	        this.sendAt = this.convertValues(source["sendAt"], null);
+	        this.dueAt = this.convertValues(source["dueAt"], null);
 	        this.lastError = source["lastError"];
-	        this.createdAt = this.convertValues(source["createdAt"], time.Time);
-	        this.sentAt = this.convertValues(source["sentAt"], time.Time);
+	        this.createdAt = this.convertValues(source["createdAt"], null);
+	        this.sentAt = this.convertValues(source["sentAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -3851,12 +3881,15 @@ export namespace smime {
 	    issuer: string;
 	    serialNumber: string;
 	    fingerprint: string;
-	    notBefore: time.Time;
-	    notAfter: time.Time;
+	    // Go type: time
+	    notBefore: any;
+	    // Go type: time
+	    notAfter: any;
 	    isDefault: boolean;
 	    isExpired: boolean;
 	    isSelfSigned: boolean;
-	    createdAt: time.Time;
+	    // Go type: time
+	    createdAt: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Certificate(source);
@@ -3871,12 +3904,12 @@ export namespace smime {
 	        this.issuer = source["issuer"];
 	        this.serialNumber = source["serialNumber"];
 	        this.fingerprint = source["fingerprint"];
-	        this.notBefore = this.convertValues(source["notBefore"], time.Time);
-	        this.notAfter = this.convertValues(source["notAfter"], time.Time);
+	        this.notBefore = this.convertValues(source["notBefore"], null);
+	        this.notAfter = this.convertValues(source["notAfter"], null);
 	        this.isDefault = source["isDefault"];
 	        this.isExpired = source["isExpired"];
 	        this.isSelfSigned = source["isSelfSigned"];
-	        this.createdAt = this.convertValues(source["createdAt"], time.Time);
+	        this.createdAt = this.convertValues(source["createdAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -3936,10 +3969,14 @@ export namespace smime {
 	    issuer: string;
 	    serialNumber: string;
 	    fingerprint: string;
-	    notBefore: time.Time;
-	    notAfter: time.Time;
-	    collectedAt: time.Time;
-	    lastSeenAt: time.Time;
+	    // Go type: time
+	    notBefore: any;
+	    // Go type: time
+	    notAfter: any;
+	    // Go type: time
+	    collectedAt: any;
+	    // Go type: time
+	    lastSeenAt: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new SenderCert(source);
@@ -3953,10 +3990,10 @@ export namespace smime {
 	        this.issuer = source["issuer"];
 	        this.serialNumber = source["serialNumber"];
 	        this.fingerprint = source["fingerprint"];
-	        this.notBefore = this.convertValues(source["notBefore"], time.Time);
-	        this.notAfter = this.convertValues(source["notAfter"], time.Time);
-	        this.collectedAt = this.convertValues(source["collectedAt"], time.Time);
-	        this.lastSeenAt = this.convertValues(source["lastSeenAt"], time.Time);
+	        this.notBefore = this.convertValues(source["notBefore"], null);
+	        this.notAfter = this.convertValues(source["notAfter"], null);
+	        this.collectedAt = this.convertValues(source["collectedAt"], null);
+	        this.lastSeenAt = this.convertValues(source["lastSeenAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -4092,7 +4129,8 @@ export namespace sync {
 	    subject: string;
 	    fromName: string;
 	    fromEmail: string;
-	    date: time.Time;
+	    // Go type: time
+	    date: any;
 	    snippet?: string;
 	    isRead: boolean;
 	    isStarred: boolean;
@@ -4113,7 +4151,7 @@ export namespace sync {
 	        this.subject = source["subject"];
 	        this.fromName = source["fromName"];
 	        this.fromEmail = source["fromEmail"];
-	        this.date = this.convertValues(source["date"], time.Time);
+	        this.date = this.convertValues(source["date"], null);
 	        this.snippet = source["snippet"];
 	        this.isRead = source["isRead"];
 	        this.isStarred = source["isStarred"];
@@ -4172,23 +4210,6 @@ export namespace sync {
 		    }
 		    return a;
 		}
-	}
-
-}
-
-export namespace time {
-	
-	export class Time {
-	
-	
-	    static createFrom(source: any = {}) {
-	        return new Time(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	
-	    }
 	}
 
 }
@@ -4453,7 +4474,8 @@ export namespace v1 {
 	    photoMediaType?: string;
 	    photoUrl?: string;
 	    sourceId?: string;
-	    updatedAt: time.Time;
+	    // Go type: time
+	    updatedAt: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Contact(source);
@@ -4479,7 +4501,7 @@ export namespace v1 {
 	        this.photoMediaType = source["photoMediaType"];
 	        this.photoUrl = source["photoUrl"];
 	        this.sourceId = source["sourceId"];
-	        this.updatedAt = this.convertValues(source["updatedAt"], time.Time);
+	        this.updatedAt = this.convertValues(source["updatedAt"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -4679,3 +4701,19 @@ export namespace v1 {
 
 }
 
+export namespace time {
+
+	export class Time {
+
+
+	    static createFrom(source: any = {}) {
+	        return new Time(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+
+	    }
+	}
+
+}
