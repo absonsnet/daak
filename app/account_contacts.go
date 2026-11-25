@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/absonsnet/daak/internal/account"
@@ -289,14 +290,27 @@ func (ops *composeOps) microsoftContactsSourceForAccount(ctx context.Context, ac
 	return "", false
 }
 
-// saveRecipientsToCardDAVContacts saves new recipients as vCards in the
-// first enabled address book of the CardDAV source linked to this account.
-// Before creating, every enabled address book of THAT source is checked:
-// a recipient already in the second (or any other) book of the same source
-// must not be duplicated into the first. The check never looks at another
-// account's source — a contact there does not suppress creating it here.
-// Only writable sources are written to; without a linked writable source
-// this silently falls back to local collected only.
+// saveRecipientsToCardDAVContacts saves new recipients as vCards in
+// the CardDAV source linked to this account, trying each enabled
+// address book of THAT source in turn until one accepts the write
+// (R22). Before creating, every enabled address book of THAT source
+// is checked: a recipient already in the second (or any other) book
+// of the same source must not be duplicated into the first. The
+// check never looks at another account's source — a contact there
+// does not suppress creating it here.
+//
+// Writability is per address book, not per source: books the server
+// has shown read-only (no write privilege at discovery, or a 403 on
+// an earlier PUT — recorded on the book row) are skipped, and a book
+// that refuses a write mid-send is marked read-only and the next
+// writable book tried. Only when no book accepts the recipient is
+// the failure surfaced: the source's last-error is recorded (so
+// Settings → Contacts shows it) and the onCardDAVAutoAddFailure
+// hook fires (production: user-visible warning), instead of the
+// failure being only a log line while the local copy lands and
+// nothing looks wrong. The source-level Writable flag remains the
+// user's opt-out: when it is off, no write is attempted and nothing
+// is reported — that is a deliberate setting, not a failure.
 func (ops *composeOps) saveRecipientsToCardDAVContacts(ctx context.Context, acc *account.Account, recipients []sendRecipient) {
 	log := logging.WithComponent("app.account-contacts")
 	if ops.carddavStore == nil || ops.carddavSyncer == nil {
@@ -322,7 +336,25 @@ func (ops *composeOps) saveRecipientsToCardDAVContacts(ctx context.Context, acc 
 		log.Debug().Str("accountID", acc.ID).Msg("No CardDAV source linked to this account, skipping provider save")
 		return
 	}
+
+	// reportFailure records a persistent failure where the user can
+	// see it (source last-error + the warning hook) instead of only
+	// logging it. Called once per send batch.
+	reportFailure := func(emails []string, err error) {
+		msg := fmt.Sprintf("Could not save %d new contact(s) to %s: %v", len(emails), source.Name, err)
+		log.Warn().Str("sourceID", source.ID).Strs("emails", emails).Err(err).Msg("CardDAV auto-add failed for every address book")
+		if uerr := ops.carddavStore.UpdateSourceSyncStatus(source.ID, msg); uerr != nil {
+			log.Debug().Err(uerr).Msg("Failed to record CardDAV auto-add failure on source")
+		}
+		if ops.onCardDAVAutoAddFailure != nil {
+			ops.onCardDAVAutoAddFailure(source.ID, acc.ID, emails, err)
+		}
+	}
+
 	if !source.Writable {
+		// The user's opt-out for this source: no write is attempted
+		// and nothing is reported — unlike a book that proves
+		// read-only, this is a deliberate setting, not a failure.
 		log.Debug().Str("sourceID", source.ID).Msg("CardDAV source is not writable, skipping provider save")
 		return
 	}
@@ -330,16 +362,42 @@ func (ops *composeOps) saveRecipientsToCardDAVContacts(ctx context.Context, acc 
 	addressbooks, err := ops.carddavStore.ListEnabledAddressbooks(source.ID)
 	if err != nil || len(addressbooks) == 0 {
 		log.Debug().Err(err).Str("sourceID", source.ID).Msg("No enabled address book for CardDAV source")
+		reportFailure(collectEmails(recipients), fmt.Errorf("no enabled address book for source %q", source.Name))
 		return
 	}
-	ab := addressbooks[0]
+
+	// Candidate books, in stored order: only books not already known
+	// read-only. A book that refuses a write below is skipped for
+	// the rest of the batch (see provenReadOnly).
+	candidates := make([]*carddav.Addressbook, 0, len(addressbooks))
+	for _, ab := range addressbooks {
+		if ab != nil && ab.Writable {
+			candidates = append(candidates, ab)
+		}
+	}
+	if len(candidates) == 0 {
+		names := make([]string, 0, len(addressbooks))
+		for _, ab := range addressbooks {
+			if ab != nil {
+				names = append(names, ab.Name)
+			}
+		}
+		reportFailure(collectEmails(recipients), fmt.Errorf("all address books of source %q are read-only (%s)", source.Name, strings.Join(names, ", ")))
+		return
+	}
 
 	client, err := ops.carddavSyncer.ClientForSource(source)
 	if err != nil {
 		log.Debug().Err(err).Str("sourceID", source.ID).Msg("No CardDAV client for source, skipping provider save")
+		reportFailure(collectEmails(recipients), err)
 		return
 	}
 
+	var failed []string
+	var lastErr error
+	// provenReadOnly collects books that refused a write during
+	// this batch, so later recipients skip them without re-trying.
+	provenReadOnly := make(map[string]bool)
 	for _, r := range recipients {
 		exists, err := ops.carddavContactExistsInSource(r.email, addressbooks)
 		if err != nil {
@@ -356,12 +414,52 @@ func (ops *composeOps) saveRecipientsToCardDAVContacts(ctx context.Context, acc 
 			NFamily: family,
 			Emails:  []contact.RecordEmail{{Email: r.email, IsPrimary: true}},
 		}
-		if _, err := ops.carddavStore.CreateRecord(ab.ID, rec, client); err != nil {
-			log.Debug().Err(err).Str("email", r.email).Msg("Failed to save recipient to CardDAV address book")
-			continue
+		saved := false
+		for _, ab := range candidates {
+			if provenReadOnly[ab.ID] {
+				continue
+			}
+			// Fresh record id per attempt: a PUT that the server
+			// accepted but we failed to mirror locally must not be
+			// retried under the same href into another book.
+			attempt := *rec
+			attempt.ID = ""
+			if _, err := ops.carddavStore.CreateRecord(ab.ID, &attempt, client); err != nil {
+				lastErr = err
+				if carddav.IsWriteForbidden(err) {
+					// The server has positively shown this
+					// book read-only: remember it, skip it
+					// for the rest of the batch, try the next.
+					log.Warn().Err(err).Str("email", r.email).Str("addressbook", ab.Name).Msg("CardDAV address book refused the write, trying the next writable book")
+					provenReadOnly[ab.ID] = true
+					if serr := ops.carddavStore.SetAddressbookWritable(ab.ID, false); serr != nil {
+						log.Debug().Err(serr).Str("addressbookID", ab.ID).Msg("Failed to record address book as read-only")
+					}
+				} else {
+					log.Debug().Err(err).Str("email", r.email).Str("addressbook", ab.Name).Msg("Failed to save recipient to CardDAV address book, trying the next book")
+				}
+				continue
+			}
+			log.Info().Str("email", r.email).Str("accountID", acc.ID).Str("addressbook", ab.Name).Msg("Saved new recipient to CardDAV address book")
+			saved = true
+			break
 		}
-		log.Info().Str("email", r.email).Str("accountID", acc.ID).Str("addressbook", ab.Name).Msg("Saved new recipient to CardDAV address book")
+		if !saved {
+			failed = append(failed, r.email)
+		}
 	}
+	if len(failed) > 0 {
+		reportFailure(failed, lastErr)
+	}
+}
+
+// collectEmails returns the recipients' emails in order.
+func collectEmails(recipients []sendRecipient) []string {
+	emails := make([]string, 0, len(recipients))
+	for _, r := range recipients {
+		emails = append(emails, r.email)
+	}
+	return emails
 }
 
 // carddavContactExistsInSource reports whether any enabled address book

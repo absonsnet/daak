@@ -1,5 +1,17 @@
 # CHANGELOG
 
+**v8.0.0 - 25-11-2026**
+---
+
+- Cancelling a Mail Merge run now tells you how many messages were cancelled and how many were already sending and will still go out — and cancelling when nothing is queued no longer reports success
+- New contacts now reach the cloud even when the first address book is read-only: each address book's writability is checked, the save moves on to the next writable book, and a failure that can't be worked around is shown instead of only logged
+- A Mail Merge run that fails while recording its failed rows now says so in the run's error, and Resume is offered for any failed run — not only when failed rows were recorded
+- If saving a sent mail to Sent fails, the mail no longer vanishes without a trace: a lasting "Sent — not saved" warning appears in the Outbox naming the message, and it can never be retried into a duplicate
+- When saving settings fails part-way, the message now names the setting that failed, and the dialog reloads the settings as actually saved so the toggles stop showing the wrong state
+- Reactions from non-English Outlook (German, French and others) are now detected and shown on the message instead of staying visible as stray emails, and reaction headers folded across lines are now unfolded before checking
+- New opt-in in the Mail Merge settings: "Count ordinary emails I send toward this hourly limit too" — off by default (the hourly cap counts Mail Merge mail only, as before); when on, ordinary sends through the send queue count toward the same cap; reactions never count
+- If notifications are blocked on macOS, Settings now says so with a button that opens System Settings at Daak's row, and a one-time notice explains how to turn them back on
+
 **v0.7.40 - 25-11-2026**
 ---
 
@@ -81,7 +93,7 @@
 
 - Reactions are now sent in the Outlook fallback style from the screenshot: the human-readable plain and HTML parts carry a banner ("👍 {name} reacted to your message:") followed by the full original message with its From/Sent/To/Subject headers and complete body. The Gmail JSON part and the RFC 9078 reaction part are unchanged
 - Reacting no longer greys out the picker while the reaction sends: the reaction is recorded immediately (the pill shows at once), queued in the Outbox, and sent in the background after the normal Undo delay — the Undo toast appears, and Undo cancels the queued send and removes the pill. After the reaction is sent, removing the pill is local-only (a sent reaction email cannot be retracted). A reaction whose send fails stays in the Outbox with Retry. The detached viewer queues reactions the same way and hands the Undo toast to the main window
-- The Outbox no longer keeps history: sent rows are deleted once a send succeeds and cancelled rows are deleted on Undo, in both the normal send queue and the Mail Merge queue. Failed rows stay with Retry. The Sent folder remains the record of sent mail, and the Mail Merge run log remains the record of Mail Merge runs. Mail Merge's hourly budget now reads the run log instead of the queue (direct sends newly count toward the budget too)
+- The Outbox no longer keeps history: sent rows are deleted once a send succeeds and cancelled rows are deleted on Undo, in both the normal send queue and the Mail Merge queue. Failed rows stay with Retry. The Sent folder remains the record of sent mail, and the Mail Merge run log remains the record of Mail Merge runs. Mail Merge's hourly budget now reads the run log instead of the queue (Mail Merge's own direct sends newly count toward the budget too — ordinary composer sends do not; counting those is an opt-in added in v8.0.0)
 
 **v0.7.33 - 23-11-2026**
 ---

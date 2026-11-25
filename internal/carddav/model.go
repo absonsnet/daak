@@ -52,6 +52,11 @@ type SourceConfig struct {
 	// ("Mike's Contacts") instead of the path's last segment ("contacts",
 	// #366). Optional — missing entries fall back to the path segment.
 	AddressbookNames map[string]string `json:"addressbook_names,omitempty"`
+	// AddressbookWritable maps an enabled addressbook path to the
+	// writability discovery probed for it (R22). Absent entries mean
+	// "unknown" and are stored as writable — the save path still
+	// falls through on a 403 and learns the real value then.
+	AddressbookWritable map[string]bool `json:"addressbook_writable,omitempty"`
 }
 
 // Addressbook represents a single addressbook within a CardDAV source
@@ -61,6 +66,16 @@ type Addressbook struct {
 	Path         string     `json:"path"`
 	Name         string     `json:"name"`
 	Enabled      bool       `json:"enabled"`
+	// Writable is the per-address-book write capability (R22): a
+	// read-only first book must not block writes to a writable
+	// second book of the same source. True when discovery probed a
+	// write privilege, when the server gave no privilege signal
+	// (unknown — optimistic), or for rows created before V55
+	// (migration default); false only once the server has positively
+	// shown the book read-only (no write privilege at discovery, or
+	// a 403 on PUT). The per-source Writable flag remains as the
+	// user's opt-in/opt-out for the source as a whole.
+	Writable     bool       `json:"writable"`
 	SyncToken    string     `json:"sync_token,omitempty"`
 	LastSyncedAt *time.Time `json:"last_synced_at,omitempty"`
 }
@@ -70,6 +85,14 @@ type AddressbookInfo struct {
 	Path        string `json:"path"`
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+	// Writable is the probed per-book writability (R22): true when
+	// the server's current-user-privilege-set for the book includes
+	// a write privilege, or when the probe was inconclusive
+	// (WritableKnown false — optimistic, the save path still falls
+	// through on a 403). WritableKnown is false when the server
+	// gave no privilege signal at all.
+	Writable      bool `json:"writable"`
+	WritableKnown bool `json:"writableKnown,omitempty"`
 }
 
 // Contact represents a contact synced from CardDAV

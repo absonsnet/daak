@@ -1,7 +1,34 @@
 #import <UserNotifications/UserNotifications.h>
+#import <AppKit/AppKit.h>
 
-// Forward declaration of the Go callback (defined via //export in notifier_darwin.go)
+// Forward declarations of the Go callbacks (defined via //export in notifier_darwin.go)
 extern void goNotificationCallback(char *accountId, char *folderId, char *threadId);
+extern void goNotificationPermissionChanged(int status);
+
+// Status codes returned to Go — must match
+// darwinAuthorizationStatusToPermission in permission.go.
+static const int kNotifStatusAuthorized = 0;
+static const int kNotifStatusDenied = 1;
+static const int kNotifStatusNotDetermined = 2;
+static const int kNotifStatusUnknown = 3;
+
+// Maps a UNNotificationSettings snapshot to a status code. Provisional
+// and ephemeral authorization still deliver notifications, so they
+// count as authorized.
+static int statusFromSettings(UNNotificationSettings *settings) {
+    switch (settings.authorizationStatus) {
+        case UNAuthorizationStatusAuthorized:
+        case UNAuthorizationStatusProvisional:
+        case UNAuthorizationStatusEphemeral:
+            return kNotifStatusAuthorized;
+        case UNAuthorizationStatusDenied:
+            return kNotifStatusDenied;
+        case UNAuthorizationStatusNotDetermined:
+            return kNotifStatusNotDetermined;
+        default:
+            return kNotifStatusUnknown;
+    }
+}
 
 // Delegate that handles notification interactions and foreground presentation
 @interface DaakNotificationDelegate : NSObject <UNUserNotificationCenterDelegate>
@@ -58,6 +85,14 @@ void setupNotifications(void) {
                 return;
             }
             NSLog(@"[Daak] Notification authorization granted: %d", granted);
+            // Report the resulting status to Go so the app can surface a
+            // denial (Settings row + one-time notice) instead of silently
+            // dropping every later notification. The settings snapshot —
+            // not the granted flag — decides: dismissing the prompt
+            // without choosing leaves the status not-determined.
+            [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
+                goNotificationPermissionChanged(statusFromSettings(settings));
+            }];
         }];
     });
 }
@@ -105,4 +140,51 @@ void showNotification(const char *title, const char *body,
 // cancelNotifications removes all delivered notifications.
 void cancelNotifications(void) {
     [[UNUserNotificationCenter currentNotificationCenter] removeAllDeliveredNotifications];
+}
+
+// getNotificationPermissionStatus returns the live authorization status
+// as a kNotifStatus* code. getNotificationSettingsWithCompletionHandler
+// is async, so this blocks the calling thread on a semaphore — bounded
+// by a 2s timeout, after which it reports unknown rather than hanging.
+// Callers must invoke it from a Go goroutine, never the macOS main
+// thread and never on a hot path.
+int getNotificationPermissionStatus(void) {
+    __block int result = kNotifStatusUnknown;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[UNUserNotificationCenter currentNotificationCenter]
+        getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
+            result = statusFromSettings(settings);
+            dispatch_semaphore_signal(sem);
+        }];
+    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC);
+    if (dispatch_semaphore_wait(sem, timeout) != 0) {
+        NSLog(@"[Daak] Notification settings query timed out, reporting unknown");
+    }
+    return result;
+}
+
+// openNotificationSettings opens the macOS Notifications settings pane,
+// deep-linked to this app's own row via the ?id= bundle identifier so
+// the user lands on Daak's toggle instead of the pane's top level.
+// The URL form changed in macOS 13 (Ventura): System Settings panes
+// moved from legacy com.apple.preference.* identifiers to
+// com.apple.<Pane>-Settings.extension bundle IDs. The legacy form
+// still opens the pane on macOS 12 and earlier (and reportedly still
+// resolves on 13+), but the extension form is the current one, so the
+// version picks the right form per OS.
+void openNotificationSettings(void) {
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"net.absons.daak";
+    NSURL *url = nil;
+    if (@available(macOS 13.0, *)) {
+        NSString *urlString = [NSString stringWithFormat:
+            @"x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=%@", bundleID];
+        url = [NSURL URLWithString:urlString];
+    } else if (@available(macOS 12.0, *)) {
+        NSString *urlString = [NSString stringWithFormat:
+            @"x-apple.systempreferences:com.apple.preference.notifications?id=%@", bundleID];
+        url = [NSURL URLWithString:urlString];
+    } else {
+        url = [NSURL fileURLWithPath:@"/System/Library/PreferencePanes/Notifications.prefPane"];
+    }
+    [[NSWorkspace sharedWorkspace] openURL:url];
 }

@@ -34,12 +34,13 @@ import (
 // in the test DB, so draft cleanup after a send only touches the
 // local draft row (no IMAP leg).
 type sendQueueTestHarness struct {
-	svc        *sendQueueService
-	db         *database.DB
-	draftStore *draft.Store
-	sent       [][]byte
-	sendErr    error
-	now        time.Time
+	svc         *sendQueueService
+	db          *database.DB
+	draftStore  *draft.Store
+	sent        [][]byte
+	sendErr     error
+	sentSaveErr error // when non-nil, the Sent-folder save fails (R24 tests)
+	now         time.Time
 }
 
 func newSendQueueTestHarness(t *testing.T) *sendQueueTestHarness {
@@ -79,7 +80,7 @@ func newSendQueueTestHarness(t *testing.T) *sendQueueTestHarness {
 			h.sent = append(h.sent, raw)
 			return nil
 		},
-		sentSaveOverride: func(_ context.Context, _ string, _ []byte) error { return nil },
+		sentSaveOverride: func(_ context.Context, _ string, _ []byte) error { return h.sentSaveErr },
 	}
 	h.db = db
 	h.draftStore = draftStore
@@ -1156,5 +1157,137 @@ func TestStartupGateDoesNotHoldRetryRows(t *testing.T) {
 	}
 	if len(h.sent) != 1 {
 		t.Fatalf("sent %d messages, want 1", len(h.sent))
+	}
+}
+
+// TestSentSaveFailureLeavesPersistentWarning is the re-audit
+// finding R24 regression test: SMTP accepts the mail, the queue row
+// is deleted at accept, and then the Sent-folder save fails. The
+// delivered mail must not vanish with only a log line — a
+// persistent Outbox warning row must record it, naming the subject
+// and recipient, and the mail must count as sent (no retry, no
+// second copy on a later tick).
+func TestSentSaveFailureLeavesPersistentWarning(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	h.sentSaveErr = fmt.Errorf("failed to append to Sent folder: connection reset")
+	var events []map[string]interface{}
+	h.svc.emit = func(event string, data map[string]interface{}) {
+		if event == "sendqueue:sent-save-failed" {
+			events = append(events, data)
+		}
+	}
+	res := h.queue(t)
+
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue = %d, %v, want 1, nil (the mail was delivered)", n, err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("sent %d messages, want 1 (SMTP accepted the mail)", len(h.sent))
+	}
+	// The original queue row is gone (deleted at SMTP accept).
+	if got, err := h.svc.store.Get(res.QueueID); err != nil || got != nil {
+		t.Fatalf("Get(original row) = %+v, %v, want nil, nil (deleted at accept)", got, err)
+	}
+	// Exactly one warning row remains, with the message's identity.
+	items, err := h.svc.store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue rows = %d, want 1 (the Sent-save warning)", len(items))
+	}
+	warning := items[0]
+	if warning.Status != sendqueue.StatusSentUnsaved {
+		t.Fatalf("warning status = %q, want %q", warning.Status, sendqueue.StatusSentUnsaved)
+	}
+	if warning.Subject != "hello" || warning.Recipient != "ada@example.com" {
+		t.Fatalf("warning = %+v, want subject hello / recipient ada@example.com", warning)
+	}
+	if !strings.Contains(warning.LastError, "Sent save failed") || !strings.Contains(warning.LastError, "connection reset") {
+		t.Fatalf("warning lastError = %q, want it to name the Sent save failure", warning.LastError)
+	}
+	if warning.SentAt == nil {
+		t.Fatalf("warning SentAt is nil, want it set (the mail was sent)")
+	}
+	if len(events) != 1 || events[0]["subject"] != "hello" || events[0]["recipient"] != "ada@example.com" {
+		t.Fatalf("sent-save-failed events = %+v, want 1 naming hello / ada@example.com", events)
+	}
+
+	// No second copy on a later tick: the warning row is not due.
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 0 {
+		t.Fatalf("second dispatchDue = %d, %v, want 0, nil", n, err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("sent %d messages after a second tick, want 1", len(h.sent))
+	}
+
+	// Retry refuses the warning row: the recipient already has the
+	// mail, and retrying would deliver a second copy.
+	if err := h.svc.RetrySendQueueItem(warning.ID); err == nil || !strings.Contains(err.Error(), "already sent") {
+		t.Fatalf("RetrySendQueueItem(warning) = %v, want an 'already sent' refusal", err)
+	}
+	if item := h.mustItem(t, warning.ID); item.Status != sendqueue.StatusSentUnsaved {
+		t.Fatalf("warning after refused retry: %+v, want still sent_unsaved", item)
+	}
+}
+
+// TestSentSaveFailureForReactionLeavesWarning is the R24 test for
+// the reaction path: a queued reaction whose Sent save fails gets
+// the same persistent warning row instead of a log line.
+func TestSentSaveFailureForReactionLeavesWarning(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	h.sentSaveErr = fmt.Errorf("failed to append to Sent folder: connection reset")
+	res := h.queueReaction(t, []byte("thumbs-up bytes"), "msg-1")
+
+	h.now = h.now.Add(6 * time.Second)
+	if n, err := h.svc.dispatchDue(h.now); err != nil || n != 1 {
+		t.Fatalf("dispatchDue = %d, %v, want 1, nil", n, err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("sent %d reactions, want 1", len(h.sent))
+	}
+	items, err := h.svc.store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue rows = %d, want 1 (the Sent-save warning)", len(items))
+	}
+	warning := items[0]
+	if warning.Status != sendqueue.StatusSentUnsaved || warning.Kind != sendqueue.KindReaction {
+		t.Fatalf("warning = %+v, want sent_unsaved reaction", warning)
+	}
+	if warning.Subject != "Re: hello" || warning.Recipient != "alice@example.com" {
+		t.Fatalf("warning = %+v, want subject Re: hello / recipient alice@example.com", warning)
+	}
+	if got, err := h.svc.store.Get(res.QueueID); err != nil || got != nil {
+		t.Fatalf("Get(original reaction row) = %+v, %v, want nil, nil (deleted at accept)", got, err)
+	}
+}
+
+// TestSendMessageReturnsSentSaveError is the R24 unit test for the
+// direct-send path: sendMessage reports a failed Sent save as its
+// third return instead of swallowing it, while still reporting the
+// send itself as successful (SMTP accepted the mail).
+func TestSendMessageReturnsSentSaveError(t *testing.T) {
+	h := newSendQueueTestHarness(t)
+	h.sentSaveErr = fmt.Errorf("failed to append to Sent folder: connection reset")
+
+	_, err, sentSaveErr := h.svc.ops.sendMessage(context.Background(), "acc-1", testComposeMessage(), nil)
+	if err != nil {
+		t.Fatalf("sendMessage err = %v, want nil (SMTP accepted the mail)", err)
+	}
+	if sentSaveErr == nil || !strings.Contains(sentSaveErr.Error(), "connection reset") {
+		t.Fatalf("sendMessage sentSaveErr = %v, want the Sent save failure", sentSaveErr)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(h.sent))
+	}
+
+	// With a working Sent save, the third return is nil.
+	h.sentSaveErr = nil
+	if _, err, sentSaveErr := h.svc.ops.sendMessage(context.Background(), "acc-1", testComposeMessage(), nil); err != nil || sentSaveErr != nil {
+		t.Fatalf("sendMessage with a working save = %v, %v, want nil, nil", err, sentSaveErr)
 	}
 }

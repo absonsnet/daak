@@ -317,7 +317,7 @@ func TestQueuePauseResumeCancel(t *testing.T) {
 	// Cancel a run: its queued items are deleted, never sent, and
 	// the run log records them skipped.
 	runID3 := startLaterRun(t, env, testBridgeRows()[:2])
-	if err := env.bridge.MailMerge_CancelQueuedRun(runID3); err != nil {
+	if _, err := env.bridge.MailMerge_CancelQueuedRun(runID3); err != nil {
 		t.Fatal(err)
 	}
 	items, err := env.bridge.MailMerge_ListQueue()
@@ -457,8 +457,15 @@ func TestQueueCancelRunLeavesInFlightItem(t *testing.T) {
 	if err != nil || !claimed {
 		t.Fatalf("claim %v %v", claimed, err)
 	}
-	if err := env.bridge.MailMerge_CancelQueuedRun(runID); err != nil {
+	// R21: the cancel reports what it actually did — 1 cancelled,
+	// 1 in flight — instead of a bare success that hides the
+	// in-flight send.
+	result, err := env.bridge.MailMerge_CancelQueuedRun(runID)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.Cancelled != 1 || result.InFlight != 1 {
+		t.Fatalf("cancel result %+v, want 1 cancelled / 1 in flight", result)
 	}
 	// The queued item is gone and skipped in the log; the in-flight
 	// item is untouched.
@@ -496,6 +503,90 @@ func TestQueueCancelRunLeavesInFlightItem(t *testing.T) {
 	}
 	if run.SentCount != 1 || run.SkippedCount != 1 {
 		t.Fatalf("run after dispatch %+v, want sent 1 / skipped 1", run)
+	}
+}
+
+// TestQueueCancelRunNothingQueuedErrors is the R21 no-op case:
+// cancelling a run whose rows have ALL moved to 'sending' between
+// the list and the delete must error (reporting the in-flight
+// count) instead of returning success having cancelled nothing.
+func TestQueueCancelRunNothingQueuedErrors(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	fakeNow := time.Now().UTC().Truncate(time.Second)
+	env.bridge.nowFunc = func() time.Time { return fakeNow }
+
+	runID := startLaterRun(t, env, testBridgeRows()[:2])
+	items, err := env.bridge.MailMerge_ListQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("queue items %d, want 2", len(items))
+	}
+	for _, item := range items {
+		claimed, err := env.bridge.store.ClaimItem(item.ID, fakeNow)
+		if err != nil || !claimed {
+			t.Fatalf("claim %v %v", claimed, err)
+		}
+	}
+	result, err := env.bridge.MailMerge_CancelQueuedRun(runID)
+	if err == nil || !strings.Contains(err.Error(), "no queued messages to cancel") {
+		t.Fatalf("cancel with nothing queued must error, got result %+v err %v", result, err)
+	}
+	if result.Cancelled != 0 || result.InFlight != 2 {
+		t.Fatalf("cancel result %+v, want 0 cancelled / 2 in flight", result)
+	}
+	// Nothing was deleted: both in-flight rows are still there.
+	for _, item := range items {
+		got, err := env.bridge.store.GetQueueItem(item.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || got.Status != QueueStatusSending {
+			t.Fatalf("item after no-op cancel %+v, want sending", got)
+		}
+	}
+}
+
+// TestQueueCancelItemNoLongerQueuedErrors is the R21 single-item
+// race: an item that left 'queued' between the status check and the
+// delete must error instead of silently returning success. A failed
+// item exercises the same delete-finds-nothing branch
+// deterministically (its status is no longer 'queued').
+func TestQueueCancelItemNoLongerQueuedErrors(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	fakeNow := time.Now().UTC().Truncate(time.Second)
+	env.bridge.nowFunc = func() time.Time { return fakeNow }
+
+	runID := startLaterRun(t, env, testBridgeRows()[:1])
+	items, err := env.bridge.MailMerge_ListQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue items %d, want 1", len(items))
+	}
+	item := items[0]
+	if err := env.bridge.store.UpdateItemAttempt(item.ID, DefaultMaxQueueAttempts, QueueStatusFailed, fakeNow, "boom"); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.bridge.MailMerge_CancelQueuedItem(item.ID); err == nil || !strings.Contains(err.Error(), "no longer queued") {
+		t.Fatalf("cancel of a non-queued item must error, got %v", err)
+	}
+	// The failed row was not deleted by the cancel.
+	got, err := env.bridge.store.GetQueueItem(item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Status != QueueStatusFailed {
+		t.Fatalf("item after refused cancel %+v, want failed", got)
+	}
+	run, err := env.bridge.MailMerge_GetRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.SkippedCount != 0 {
+		t.Fatalf("run after refused cancel %+v, want 0 skipped", run)
 	}
 }
 

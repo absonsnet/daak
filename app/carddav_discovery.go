@@ -166,6 +166,25 @@ func (a *App) autoDiscoverCardDAVForAccount(acc *account.Account, password strin
 
 		paths := make([]string, 0, len(addressbooks))
 		names := make(map[string]string, len(addressbooks))
+		// Per-book writability (R22): keep only what the probe
+		// actually established. A book the server showed read-only
+		// is stored read-only; an inconclusive probe is left out
+		// of the map and stores as writable (optimistic — the save
+		// path still falls through on a 403). The source is marked
+		// writable when at least one book may take writes; when
+		// every book is known read-only there is nowhere to write
+		// to, so the source is not writable either. Previously every
+		// discovered source was marked writable without checking.
+		writableByPath := make(map[string]bool, len(addressbooks))
+		anyWritable := false
+		for _, ab := range addressbooks {
+			if ab.WritableKnown {
+				writableByPath[ab.Path] = ab.Writable
+			}
+			if ab.Writable {
+				anyWritable = true
+			}
+		}
 		for _, ab := range addressbooks {
 			paths = append(paths, ab.Path)
 			if ab.Name != "" {
@@ -180,10 +199,11 @@ func (a *App) autoDiscoverCardDAVForAccount(acc *account.Account, password strin
 			Password:            password,
 			AccountID:           acc.ID,
 			Enabled:             true,
-			Writable:            true,
+			Writable:            anyWritable,
 			SyncInterval:        60,
 			EnabledAddressbooks: paths,
 			AddressbookNames:    names,
+			AddressbookWritable: writableByPath,
 		})
 		if err != nil {
 			log.Debug().Err(err).Str("url", baseURL).Str("accountID", acc.ID).Msg("Failed to create auto-discovered CardDAV source")

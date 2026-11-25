@@ -41,7 +41,10 @@ import (
 //
 // A dispatched row is deleted, not kept as history — the Outbox
 // holds no sent or cancelled rows; the Sent folder is the record.
-// Failed rows stay, with Retry.
+// Failed rows stay, with Retry. The one exception is a row whose
+// Sent-folder save failed after SMTP accepted the mail (re-audit
+// finding R24): it stays as a 'sent_unsaved' warning, because the
+// delivered mail has no Sent copy and no other record.
 //
 // The worker runs ONLY in the main process (App.Startup). The
 // detached composer shares the same DB file and the same queue, but
@@ -130,6 +133,21 @@ type sendQueueService struct {
 	// local reaction record (the pill); a normal send has no
 	// reaction to remove. Nil-safe: the detached composer passes none.
 	onUndo func(item sendqueue.Item)
+
+	// onNormalSendAccepted runs at SMTP-accept time for a normal
+	// (KindMessage) send dispatched by this worker — inside the
+	// afterSMTP hook in sendOne, the moment the server accepts the
+	// mail. The App sets it to record the send toward the Mail
+	// Merge hourly budget when that opt-in is on (re-audit R27).
+	// Best-effort by design: it has no error return, sendOne
+	// recovers a panic from it, and a failure inside it can never
+	// fail the send. It is NEVER called for reactions
+	// (sendReactionItem does not use it): reactions are tiny
+	// user-initiated messages, not bulk mail, and counting them
+	// could block a Mail Merge run because the user reacted to
+	// emails. Nil-safe: tests and the detached composer (which
+	// never runs a worker) pass none.
+	onNormalSendAccepted func(sentAt time.Time)
 }
 
 func (s *sendQueueService) clock() time.Time {
@@ -510,6 +528,13 @@ func (s *sendQueueService) RetrySendQueueItem(queueID string) error {
 	if item == nil {
 		return fmt.Errorf("queued send %q not found", queueID)
 	}
+	// A Sent-save warning is not a failed send: the mail was
+	// already delivered, only its Sent copy is missing (re-audit
+	// finding R24). Retrying it would deliver a second copy to a
+	// recipient who already has it, so Retry refuses it outright.
+	if item.Status == sendqueue.StatusSentUnsaved {
+		return fmt.Errorf("message %q was already sent — only its copy in Sent is missing, so there is nothing to retry; check with the recipient", item.Subject)
+	}
 	if item.Kind == sendqueue.KindReaction && item.ReactionMessageID != "" {
 		active, err := s.store.ActiveReaction(item.ReactionMessageID)
 		if err != nil {
@@ -814,10 +839,41 @@ func (s *sendQueueService) sendOne(item sendqueue.Item, now time.Time) bool {
 				log.Warn().Err(merr).Str("queue_id", item.ID).Msg("Message accepted by SMTP but failed to delete or mark sent")
 			}
 		}
+		// Counted toward the Mail Merge hourly budget when the
+		// opt-in is on (re-audit R27): the bridge method itself
+		// no-ops when the opt-in is off or the extension is
+		// disabled, and the App's hook drops its error — the mail
+		// is already out, so a count write can never fail a send.
+		// A panic inside the hook is recovered here so it cannot
+		// lose the post-send bookkeeping; the send still succeeds
+		// either way. Reactions never reach this hook
+		// (sendReactionItem has no such call).
+		if s.onNormalSendAccepted != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Warn().Interface("panic", r).Str("queue_id", item.ID).Msg("Normal-send budget hook panicked; send still succeeded")
+					}
+				}()
+				s.onNormalSendAccepted(now)
+			}()
+		}
 	}
-	if _, err := s.ops.sendMessageWithHook(s.ctx, full.AccountID, msg, d, markAccepted); err != nil {
+	if _, err, sentSaveErr := s.ops.sendMessageWithHook(s.ctx, full.AccountID, msg, d, markAccepted); err != nil {
 		s.recordFailure(*full, now, err)
 		return false
+	} else if sentSaveErr != nil {
+		// SMTP accepted the mail — it is delivered — but the
+		// Sent-folder save failed, and the queue row is already
+		// gone (markAccepted deleted it at accept). Record the
+		// persistent warning instead of a log line (re-audit
+		// finding R24), and do NOT emit sendqueue:sent: there is
+		// no Sent copy for its "View message" action to open.
+		// No Sent sync either — there is nothing new in Sent to
+		// pick up. The mail counts as sent: no retry, no second
+		// copy.
+		s.recordSentSaveFailure(*full, now, sentSaveErr)
+		return true
 	}
 	// Sent: the afterSMTP hook above already deleted the row the
 	// moment SMTP accepted the mail; this is the fallback for a
@@ -880,12 +936,15 @@ func (s *sendQueueService) sendReactionItem(item sendqueue.Item, now time.Time) 
 		}
 	}
 	// Save to Sent via IMAP APPEND exactly like a normal send:
-	// skipped when the provider auto-saves Sent mail, and a save
-	// failure only warns — the send already succeeded, and the Sent
-	// sync will pick the message up later either way.
+	// skipped when the provider auto-saves Sent mail. A save
+	// failure used to only warn — the send already succeeded, and
+	// the Sent sync will pick the message up later either way — but
+	// the queue row is already deleted (above), so a failed save
+	// left the delivered reaction with no record anywhere in Daak.
+	// Record the persistent warning instead (re-audit finding R24).
 	if acc, accErr := s.ops.accountStore.Get(item.AccountID); accErr == nil && acc != nil && !providerAutoSavesSentMail(acc.IMAPHost) {
 		if err := s.ops.saveToSentFolder(s.ctx, item.AccountID, acc, item.RawMessage); err != nil {
-			log.Warn().Err(err).Str("accountID", item.AccountID).Msg("Failed to save reaction to Sent folder")
+			s.recordSentSaveFailure(item, now, err)
 		}
 	}
 	log.Info().
@@ -967,6 +1026,77 @@ func sameAddressPtr(a, b *smtp.Address) bool {
 		return a == b
 	}
 	return strings.EqualFold(strings.TrimSpace(a.Address), strings.TrimSpace(b.Address)) && a.Name == b.Name
+}
+
+// recordSentSaveFailure records a persistent, user-visible
+// warning for a mail that SMTP accepted but whose Sent-folder save
+// then failed (re-audit finding R24). The queue row for a queued
+// send is already deleted by then (the afterSMTP hook deletes it
+// at accept, before the Sent save), and a direct send never had
+// one — so without this row the delivered mail would vanish from
+// Daak entirely, with only a log line to show for it.
+//
+// The warning is a new Outbox row with status 'sent_unsaved'
+// carrying the subject, recipient and the save error, so the user
+// can find it after a restart and check with the recipient. It is
+// deliberately NOT a 'failed' row: a failed row offers Retry, and
+// retrying this mail would deliver a second copy to someone who
+// already has it. The row's DraftID (when present) is traceability
+// only — the queue guards (HasActiveForDraft, HasFailedForDraft)
+// only look at pending/sending/failed rows, so it never blocks a
+// later send. The row also stamps SentAt: the mail was sent, only
+// its Sent copy is missing.
+//
+// Callers emit nothing themselves: this records the row and emits
+// sendqueue:updated (Outbox refresh) plus sendqueue:sent-save-failed
+// (immediate toast naming the message) here, so every path —
+// queued dispatch, reaction dispatch, direct send — warns the
+// same way. When the row itself cannot be written, the error is
+// logged: there is no further durable place to put the warning.
+func (s *sendQueueService) recordSentSaveFailure(item sendqueue.Item, now time.Time, saveErr error) {
+	log := logging.WithComponent("sendqueue")
+	warning := sendqueue.Item{
+		ID:          uuid.New().String(),
+		AccountID:   item.AccountID,
+		DraftID:     item.DraftID,
+		Kind:        item.Kind,
+		Subject:     item.Subject,
+		Recipient:   item.Recipient,
+		FromAddress: item.FromAddress,
+		To:          item.To,
+		Status:      sendqueue.StatusSentUnsaved,
+		Attempts:    item.Attempts,
+		MaxAttempts: item.MaxAttempts,
+		SendAt:      item.SendAt,
+		DueAt:       item.DueAt,
+		LastError:   fmt.Sprintf("Sent save failed: %v — message was delivered but no copy was saved to Sent; check with the recipient.", saveErr),
+		CreatedAt:   now,
+		SentAt:      &now,
+	}
+	if warning.Kind == "" {
+		warning.Kind = sendqueue.KindMessage
+	}
+	if err := s.store.Enqueue(warning); err != nil {
+		log.Error().Err(err).
+			Str("account_id", item.AccountID).
+			Str("subject", item.Subject).
+			Str("recipient", item.Recipient).
+			Msg("Message sent but Sent save failed, and the Sent-save warning itself could not be recorded")
+		return
+	}
+	log.Warn().Err(saveErr).
+		Str("queue_id", warning.ID).
+		Str("account_id", item.AccountID).
+		Str("subject", item.Subject).
+		Str("recipient", item.Recipient).
+		Msg("Message sent but could not be saved to Sent folder; recorded as a Sent-save warning in the Outbox")
+	s.emitEvent("sendqueue:updated", nil)
+	s.emitEvent("sendqueue:sent-save-failed", map[string]interface{}{
+		"queueId":   warning.ID,
+		"accountId": item.AccountID,
+		"subject":   item.Subject,
+		"recipient": item.Recipient,
+	})
 }
 
 // recordFailure records one failed dispatch: permanent errors fail
@@ -1076,6 +1206,19 @@ func (a *App) newSendQueueService() *sendQueueService {
 				return "", fmt.Errorf("save draft returned no draft")
 			}
 			return res.Draft.ID, nil
+		},
+		// Count a dispatched normal send toward the Mail Merge
+		// hourly budget when the R27 opt-in is on. The bridge
+		// method no-ops when the opt-in is off or the extension is
+		// disabled, and its error is dropped on purpose: the mail
+		// is already accepted by SMTP, so a count write can never
+		// fail a send. The detached composer never runs a worker,
+		// so its service (newComposerSendQueueService) sets no
+		// hook — the main process's worker is the single recorder.
+		onNormalSendAccepted: func(sentAt time.Time) {
+			if a.MailMergeBridge != nil {
+				_ = a.MailMergeBridge.MailMerge_RecordNormalSend(sentAt)
+			}
 		},
 	}
 }

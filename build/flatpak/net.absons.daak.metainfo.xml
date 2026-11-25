@@ -375,6 +375,13 @@
   </provides>
 
   <releases>
+    <release version="8.0.0" date="2026-11-25">
+      <description>
+        <ul>
+          <li>Eight more re-audit fixes, completing the re-audit: Mail Merge cancel now reports cancelled vs in-flight counts, contacts fall through to the next writable address book with failures surfaced, failed Mail Merge runs always offer Resume, a failed Sent save leaves a lasting Outbox warning instead of vanishing, settings-save failures name the failing setting and resync the dialog, non-English Outlook reactions are detected, the Mail Merge hourly cap gains an opt-in to count ordinary sends, and a blocked macOS notification permission is surfaced in Settings with a one-time notice</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.40" date="2026-11-25">
       <description>
         <ul>

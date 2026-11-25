@@ -10,6 +10,7 @@ import {pgp} from '../models';
 import {smime} from '../models';
 import {v1} from '../models';
 import {mailmerge} from '../models';
+import {time} from '../models';
 import {draft} from '../models';
 import {contact} from '../models';
 
@@ -99,7 +100,7 @@ export function LookupWKD(arg1:string):Promise<string>;
 
 export function MailMerge_CancelQueuedItem(arg1:string):Promise<void>;
 
-export function MailMerge_CancelQueuedRun(arg1:string):Promise<void>;
+export function MailMerge_CancelQueuedRun(arg1:string):Promise<backend.CancelQueuedRunResult>;
 
 export function MailMerge_CancelRemaining(arg1:string):Promise<void>;
 
@@ -134,6 +135,8 @@ export function MailMerge_PickAttachmentDir():Promise<string>;
 export function MailMerge_PickFile(arg1:string):Promise<string>;
 
 export function MailMerge_Preview(arg1:mailmerge.Template,arg2:Array<Record<string, string>>,arg3:Array<number>):Promise<Array<mailmerge.RenderedMessage>>;
+
+export function MailMerge_RecordNormalSend(arg1:time.Time):Promise<void>;
 
 export function MailMerge_ResumeQueue():Promise<void>;
 

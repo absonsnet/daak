@@ -13,6 +13,8 @@ void setupNotifications(void);
 void showNotification(const char *title, const char *body,
                       const char *accountId, const char *folderId, const char *threadId);
 void cancelNotifications(void);
+int getNotificationPermissionStatus(void);
+void openNotificationSettings(void);
 */
 import "C"
 
@@ -61,13 +63,38 @@ func goNotificationCallback(accountId *C.char, folderId *C.char, threadId *C.cha
 	go handler(data)
 }
 
+//export goNotificationPermissionChanged
+func goNotificationPermissionChanged(status C.int) {
+	n := darwinNotif
+	if n == nil {
+		return
+	}
+
+	n.mu.RLock()
+	handler := n.permissionHandler
+	n.mu.RUnlock()
+
+	if handler == nil {
+		return
+	}
+
+	permission := darwinAuthorizationStatusToPermission(int(status))
+	n.log.Info().Str("status", string(permission)).Msg("Notification permission changed")
+
+	// Dispatch to a goroutine — this callback runs on an arbitrary
+	// macOS queue, and the handler emits Wails events and writes
+	// settings, which must not run on a system-owned thread.
+	go handler(permission)
+}
+
 // darwinNotifier uses UNUserNotificationCenter for notifications on macOS
 // with click handling via inline CGo Objective-C.
 type darwinNotifier struct {
-	appName      string
-	clickHandler ClickHandler
-	mu           sync.RWMutex
-	log          zerolog.Logger
+	appName           string
+	clickHandler      ClickHandler
+	permissionHandler func(PermissionStatus)
+	mu                sync.RWMutex
+	log               zerolog.Logger
 }
 
 func newPlatformNotifier(appName string, useDirectDBus bool) Notifier {
@@ -113,4 +140,28 @@ func (n *darwinNotifier) SetClickHandler(handler ClickHandler) {
 	n.mu.Lock()
 	n.clickHandler = handler
 	n.mu.Unlock()
+}
+
+// PermissionStatus queries the live UNUserNotificationCenter authorization
+// status. The ObjC helper blocks (bounded by a 2s timeout) while the
+// async settings query completes; callers must not invoke it on the
+// macOS main thread or on a hot path such as per-message delivery.
+func (n *darwinNotifier) PermissionStatus() PermissionStatus {
+	return darwinAuthorizationStatusToPermission(int(C.getNotificationPermissionStatus()))
+}
+
+// SetPermissionChangeHandler registers the callback invoked when the
+// user answers the authorization prompt (reported from the
+// requestAuthorization completion in setupNotifications).
+func (n *darwinNotifier) SetPermissionChangeHandler(handler func(PermissionStatus)) {
+	n.mu.Lock()
+	n.permissionHandler = handler
+	n.mu.Unlock()
+}
+
+// openSystemNotificationSettings opens the macOS System Settings
+// Notifications pane, deep-linked to this app's own row.
+func openSystemNotificationSettings() error {
+	C.openNotificationSettings()
+	return nil
 }

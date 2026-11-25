@@ -324,14 +324,18 @@ func (a *API) createCardDAVContact(input coreapi.ContactCreateInput, email strin
 		if err != nil {
 			return "", fmt.Errorf("contacts.CreateContact: list addressbooks for %s: %w", input.SourceID, err)
 		}
+		// Prefer a book not known read-only (R22): the first enabled
+		// book may be read-only while a later one takes writes.
+		// A book whose writability was never probed stores as
+		// writable, so it stays a candidate here.
 		for _, ab := range abs {
-			if ab != nil && ab.Enabled {
+			if ab != nil && ab.Enabled && ab.Writable {
 				addressbookID = ab.ID
 				break
 			}
 		}
 		if addressbookID == "" {
-			return "", fmt.Errorf("contacts.CreateContact: source %s has no enabled addressbook to write to", input.SourceID)
+			return "", fmt.Errorf("contacts.CreateContact: source %s has no enabled writable addressbook to write to", input.SourceID)
 		}
 	}
 

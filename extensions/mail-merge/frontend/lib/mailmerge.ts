@@ -234,6 +234,11 @@ export interface MailMergeQueueStats {
 export interface MailMergeQueueConfig {
   perHour: number
   paused: boolean
+  // countNormalSends (re-audit R27, opt-in, default false): when
+  // true, normal composer sends dispatched through the Outbox also
+  // count toward the same hourly budget; when false (the default)
+  // the budget counts Mail Merge mail only.
+  countNormalSends: boolean
 }
 
 export interface MailMergeDispatchResult {
@@ -241,6 +246,11 @@ export interface MailMergeDispatchResult {
   failed: number
   remaining: number
   queued: number
+}
+
+export interface MailMergeCancelQueuedRunResult {
+  cancelled: number
+  inFlight: number
 }
 
 export interface MailMergeContactsResult {

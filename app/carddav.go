@@ -81,9 +81,12 @@ func (a *App) AddContactSource(config carddav.SourceConfig) (*carddav.Source, er
 		}
 	}
 
-	// Create addressbooks based on enabled paths
+	// Create addressbooks based on enabled paths, keeping the
+	// per-book writability discovery probed (R22). Paths without a
+	// probed value default to writable — the save path still falls
+	// through on a 403 and learns the real value then.
 	for _, path := range config.EnabledAddressbooks {
-		_, err := a.carddavStore.CreateAddressbook(source.ID, path, addressbookDisplayName(config.AddressbookNames, path), true)
+		_, err := a.carddavStore.CreateAddressbookWritable(source.ID, path, addressbookDisplayName(config.AddressbookNames, path), true, addressbookWritable(config.AddressbookWritable, path))
 		if err != nil {
 			log.Warn().Err(err).Str("path", path).Msg("Failed to create addressbook")
 		}
@@ -157,7 +160,7 @@ func (a *App) UpdateContactSource(id string, config carddav.SourceConfig) error 
 			if _, exists := existingByPath[path]; exists {
 				continue
 			}
-			if _, err := a.carddavStore.CreateAddressbook(id, path, addressbookDisplayName(config.AddressbookNames, path), true); err != nil {
+			if _, err := a.carddavStore.CreateAddressbookWritable(id, path, addressbookDisplayName(config.AddressbookNames, path), true, addressbookWritable(config.AddressbookWritable, path)); err != nil {
 				log.Warn().Err(err).Str("path", path).Msg("Failed to create new addressbook")
 			}
 		}
@@ -633,6 +636,21 @@ func (a *App) CancelContactSourceOAuthFlow() {
 	a.pendingContactSourceOAuthProvider = ""
 
 	wailsRuntime.EventsEmit(a.ctx, "contact-source-oauth:cancelled", nil)
+}
+
+// addressbookWritable resolves the stored writability for one
+// addressbook path from a discovery probe (R22). An absent entry
+// means the probe was inconclusive (or the caller never probed) and
+// stores as writable — the save path still falls through on a 403
+// and learns the real value then.
+func addressbookWritable(probed map[string]bool, path string) bool {
+	if probed == nil {
+		return true
+	}
+	if writable, ok := probed[path]; ok {
+		return writable
+	}
+	return true
 }
 
 // addressbookDisplayName resolves the stored name for an addressbook path:

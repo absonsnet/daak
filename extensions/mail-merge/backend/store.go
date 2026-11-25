@@ -110,6 +110,24 @@ ALTER TABLE mailmerge_runs ADD COLUMN error TEXT NOT NULL DEFAULT '';
 ALTER TABLE mailmerge_run_rows ADD COLUMN message_id TEXT NOT NULL DEFAULT '';
 `,
 	},
+	{
+		// v6 (v8.0.0, re-audit R27): one timestamped row per
+		// normal (non-Mail-Merge) send counted toward the hourly
+		// budget, when the opt-in QueueConfig.CountNormalSends is
+		// on. The normal send queue deletes its rows on success,
+		// so without this table a counted normal send would leave
+		// no durable record. Rows older than the rolling hourly
+		// window are pruned when a new one is recorded — the table
+		// holds at most about an hour's worth of sends.
+		Version: 6,
+		SQL: `
+CREATE TABLE IF NOT EXISTS mailmerge_external_sends (
+	id      INTEGER PRIMARY KEY AUTOINCREMENT,
+	sent_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mailmerge_external_sends_sent_at ON mailmerge_external_sends (sent_at);
+`,
+	},
 }
 
 // Store wraps the per-extension DB for the Mail Merge extension. Lives
@@ -583,9 +601,12 @@ func queueColumnsQualified() string {
 // CountSentSince counts run-log rows marked sent at or after `since` —
 // the hourly budget check. It reads the run log, not the queue:
 // sent queue rows are deleted on success, and the run log is the
-// record. (Direct sends also write RowSent rows, so they count toward
-// the budget too — more conservative than before, when only queued
-// sends counted.)
+// record. "Direct sends" here means Mail Merge's own direct-send
+// mode (DeliverMode "send"), which writes RowSent rows — NOT normal
+// composer sends, which never write run rows and so never count
+// here. Normal sends count only when the opt-in is on, via
+// RecordExternalSend + CountExternalSentSince (re-audit R27); the
+// budget check in queue.go adds the two counts together.
 func (s *Store) CountSentSince(since time.Time) (int, error) {
 	var n int
 	err := s.DB().QueryRow(`
@@ -616,6 +637,75 @@ func (s *Store) OldestSentSince(since time.Time) (time.Time, bool, error) {
 	t, err := time.Parse(time.RFC3339Nano, raw.String)
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("mail-merge: parse oldest sent: %w", err)
+	}
+	return t, true, nil
+}
+
+// ---------------------------------------------------------------------------
+// Counted normal sends (re-audit R27, opt-in)
+// ---------------------------------------------------------------------------
+// When QueueConfig.CountNormalSends is on, each normal send
+// dispatched through the host send queue writes one row here at
+// SMTP-accept time (see MailMerge_RecordNormalSend in queue.go).
+// The send queue deletes its own rows on success, so this table is
+// the only durable record a counted normal send leaves. One row per
+// send, timestamp only — the count query is a single indexed
+// COUNT(*) over the rolling hourly window. Reactions are NOT
+// recorded here: they are tiny user-initiated messages, not bulk
+// mail, and counting them could block a Mail Merge run because the
+// user reacted to emails.
+
+// RecordExternalSend records one counted normal send at `sentAt`
+// and prunes rows older than the rolling hourly window (older rows
+// can never count toward any future window, since the window only
+// moves forward). The caller treats an error as best-effort — a
+// count write must never fail a send.
+func (s *Store) RecordExternalSend(sentAt time.Time) error {
+	if _, err := s.DB().Exec(`
+		INSERT INTO mailmerge_external_sends (sent_at) VALUES (?)
+	`, sentAt.UTC().Format(time.RFC3339Nano)); err != nil {
+		return fmt.Errorf("mail-merge: record external send: %w", err)
+	}
+	// Prune best-effort: a prune failure must not fail the record
+	// itself (the row was already inserted), and stale rows are
+	// harmless — the count queries filter by `since` either way.
+	_, _ = s.DB().Exec(`
+		DELETE FROM mailmerge_external_sends WHERE sent_at < ?
+	`, sentAt.Add(-time.Hour).UTC().Format(time.RFC3339Nano))
+	return nil
+}
+
+// CountExternalSentSince counts recorded normal sends at or after
+// `since`.
+func (s *Store) CountExternalSentSince(since time.Time) (int, error) {
+	var n int
+	err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM mailmerge_external_sends
+		WHERE sent_at >= ?
+	`, since.UTC().Format(time.RFC3339Nano)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("mail-merge: count external sent since: %w", err)
+	}
+	return n, nil
+}
+
+// OldestExternalSentSince returns the earliest recorded normal send
+// at or after `since`. False when nothing was recorded in the window.
+func (s *Store) OldestExternalSentSince(since time.Time) (time.Time, bool, error) {
+	var raw sql.NullString
+	err := s.DB().QueryRow(`
+		SELECT MIN(sent_at) FROM mailmerge_external_sends
+		WHERE sent_at >= ?
+	`, since.UTC().Format(time.RFC3339Nano)).Scan(&raw)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("mail-merge: oldest external sent since: %w", err)
+	}
+	if !raw.Valid {
+		return time.Time{}, false, nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw.String)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("mail-merge: parse oldest external sent: %w", err)
 	}
 	return t, true, nil
 }

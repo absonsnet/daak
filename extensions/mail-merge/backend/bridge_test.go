@@ -658,6 +658,65 @@ func TestBridgeLaterRunWholeFailureIsFailed(t *testing.T) {
 	}
 }
 
+func TestBridgeWholeRunFailureRowRecordingSurfaced(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	// The store is lazy-init on the first bridge call; open it
+	// before installing the fault-injection trigger.
+	if err := env.bridge.ensureInit(); err != nil {
+		t.Fatal(err)
+	}
+	// Fault injection: fail every INSERT into the run-rows table
+	// while leaving SELECTs and the runs table alone, so the
+	// whole-run failure path runs with row recording broken.
+	if _, err := env.bridge.store.DB().Exec(`
+		CREATE TRIGGER r23_fail_row_inserts BEFORE INSERT ON mailmerge_run_rows
+		BEGIN SELECT RAISE(ABORT, 'r23 test: row recording unavailable'); END;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	env.factory.createErr = errors.New("dial tcp: connection refused")
+	runID, err := env.bridge.MailMerge_StartRun(hostmm.RunRequest{
+		Template: testBridgeTemplate(), Rows: testBridgeRows(),
+		DeliverMode: "send", AccountID: "acc1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRun(t, env.bridge, runID)
+	// The run is still status failed with the connect error — but
+	// no failed rows could be recorded.
+	if run.Status != hostmm.RunFailed {
+		t.Fatalf("run status %q, want failed", run.Status)
+	}
+	if run.FailedCount != 0 || len(run.Rows) != 0 {
+		t.Fatalf("run %+v, want 0 recorded failed rows", run)
+	}
+	// R23: the row-recording failure is surfaced on the run's error
+	// text instead of being swallowed — the empty row log looks
+	// like there is nothing to resume, so the run must say so.
+	if !strings.Contains(run.Error, "connection refused") || !strings.Contains(run.Error, "could not record 3 failed row(s)") {
+		t.Fatalf("run error %q, want the connect error plus the row-recording failure", run.Error)
+	}
+	// The failed run is still resumable despite zero recorded
+	// failed rows: fix the connection, drop the fault, resume —
+	// ResumeRun re-runs the whole stored request for a failed run
+	// with no failed rows. This is the backend condition the
+	// frontend Resume button now reads (status failed, not
+	// failedCount > 0).
+	env.factory.createErr = nil
+	if _, err := env.bridge.store.DB().Exec(`DROP TRIGGER r23_fail_row_inserts`); err != nil {
+		t.Fatal(err)
+	}
+	newID, err := env.bridge.MailMerge_ResumeRun(runID)
+	if err != nil {
+		t.Fatalf("resume from a failed run with no recorded failed rows must proceed: %v", err)
+	}
+	newRun := waitForRun(t, env.bridge, newID)
+	if newRun.Status != hostmm.RunDone || newRun.SentCount != 3 || newRun.TotalRows != 3 {
+		t.Fatalf("resumed run %+v, want done with 3 sent", newRun)
+	}
+}
+
 func TestBridgeCancelRun(t *testing.T) {
 	env := newBridgeTestEnv(t)
 	if err := env.bridge.MailMerge_CancelRun("no-such-run"); err == nil {

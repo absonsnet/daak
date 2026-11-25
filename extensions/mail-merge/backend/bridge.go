@@ -10,6 +10,7 @@ import (
 	"time"
 
 	coreapi "github.com/absonsnet/daak/internal/core/api/v1"
+	"github.com/absonsnet/daak/internal/logging"
 	hostmm "github.com/absonsnet/daak/internal/mailmerge"
 	"github.com/absonsnet/daak/internal/platform"
 	"github.com/google/uuid"
@@ -784,7 +785,10 @@ func (b *MailMergeBridge) launchExecution(run *hostmm.Run, req hostmm.RunRequest
 			// not cancelled: the error is stored on the run and
 			// every row the run never processed is recorded
 			// RowFailed, so ResumeRun can re-run it.
-			b.failWholeRun(run, req, indexMap, err)
+			if recErr := b.failWholeRun(run, req, indexMap, err); recErr != nil {
+				slog := logging.WithComponent("mailmerge")
+				slog.Warn().Err(recErr).Msg("Mail Merge whole-run failure: failed rows could not be recorded")
+			}
 			deactivate()
 			return
 		}
@@ -821,7 +825,15 @@ func (b *MailMergeBridge) launchExecution(run *hostmm.Run, req hostmm.RunRequest
 // after partial progress) are left alone. indexMap translates the
 // executed request's row positions back to the persisted run's row
 // indices (nil = identity, for fresh runs).
-func (b *MailMergeBridge) failWholeRun(run *hostmm.Run, req hostmm.RunRequest, indexMap []int, runErr error) {
+//
+// It returns the row-recording error, if saving the failed rows
+// themselves failed: the run is still marked failed, and the failure
+// is appended to the run's error text, so the user sees the log is
+// incomplete instead of silently losing the failed rows. A failed
+// run with no recorded failed rows is still resumable — ResumeRun
+// re-runs the whole stored request then — and the Resume button is
+// gated on the failed status, not on the failed count.
+func (b *MailMergeBridge) failWholeRun(run *hostmm.Run, req hostmm.RunRequest, indexMap []int, runErr error) error {
 	_, indices := hostmm.SliceRows(req.Rows, req.StartRow, req.StopRow)
 	logged := map[int]bool{}
 	if existing, err := b.store.GetRun(run.ID); err == nil && existing != nil {
@@ -830,6 +842,8 @@ func (b *MailMergeBridge) failWholeRun(run *hostmm.Run, req hostmm.RunRequest, i
 		}
 	}
 	now := time.Now()
+	var recordErr error
+	unrecorded := 0
 	for pos, origIndex := range indices {
 		idx := origIndex
 		if indexMap != nil {
@@ -841,20 +855,32 @@ func (b *MailMergeBridge) failWholeRun(run *hostmm.Run, req hostmm.RunRequest, i
 		if logged[idx] {
 			continue
 		}
-		_ = b.store.SaveRowResult(run.ID, hostmm.RowResult{
+		if err := b.store.SaveRowResult(run.ID, hostmm.RowResult{
 			Index: idx, Status: hostmm.RowFailed,
 			Error: runErr.Error(), Timestamp: now,
-		})
+		}); err != nil {
+			unrecorded++
+			if recordErr == nil {
+				recordErr = err
+			}
+		}
 	}
 	final, ferr := b.store.GetRun(run.ID)
 	if ferr != nil || final == nil {
-		return
+		if recordErr != nil {
+			return recordErr
+		}
+		return ferr
 	}
 	final.RecomputeCounts()
 	final.Status = hostmm.RunFailed
 	final.Error = runErr.Error()
+	if recordErr != nil {
+		final.Error += fmt.Sprintf(" (could not record %d failed row(s): %v; Resume re-runs the whole run)", unrecorded, recordErr)
+	}
 	_ = b.store.UpdateRunStatusAndCounts(final)
 	b.emitRunUpdated(run.ID)
+	return recordErr
 }
 
 // sendBatch is the shared implementation of SendNextBatch (capped) and
@@ -1048,7 +1074,10 @@ func (b *MailMergeBridge) launchQueueExecution(run *hostmm.Run, req hostmm.RunRe
 			// (e.g. a bad base64 global attachment) — same contract
 			// as launchExecution: mark failed, record the
 			// unprocessed rows failed, keep the error on the run.
-			b.failWholeRun(run, req, indexMap, err)
+			if recErr := b.failWholeRun(run, req, indexMap, err); recErr != nil {
+				slog := logging.WithComponent("mailmerge")
+				slog.Warn().Err(recErr).Msg("Mail Merge whole-run failure: failed rows could not be recorded")
+			}
 			deactivate()
 			return
 		}

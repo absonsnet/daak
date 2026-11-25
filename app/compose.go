@@ -25,6 +25,7 @@ import (
 	"github.com/absonsnet/daak/internal/oauth2"
 	"github.com/absonsnet/daak/internal/pgp"
 	"github.com/absonsnet/daak/internal/platform"
+	"github.com/absonsnet/daak/internal/sendqueue"
 	"github.com/absonsnet/daak/internal/settings"
 	"github.com/absonsnet/daak/internal/smime"
 	"github.com/absonsnet/daak/internal/smtp"
@@ -79,6 +80,16 @@ type composeOps struct {
 	googleContactsClient    *contact.GoogleContactsClient
 	microsoftContactsSyncer *contact.MicrosoftContactsSyncer
 	getContactSourceToken   func(sourceID string) (string, error)
+
+	// onCardDAVAutoAddFailure, when non-nil, is called (once per send
+	// batch) when one or more recipients could not be saved to any
+	// address book of the sending account's CardDAV source (R22).
+	// Production wires it to a user-visible warning (Wails event +
+	// desktop notification); tests set it to capture the failure.
+	// Nil means log-only — the detached composer/viewer leave it nil
+	// because their sends go through the main process queue, where
+	// the save (and the warning) happens.
+	onCardDAVAutoAddFailure func(sourceID, accountID string, emails []string, err error)
 
 	// msContactsSourceCache maps mail account IDs to their Microsoft
 	// contacts source IDs (see microsoftContactsSourceForAccount).
@@ -552,7 +563,16 @@ func (ops *composeOps) sendRawMessage(ctx context.Context, accountID, from strin
 //
 // sendMessage is sendMessageWithHook with no hook; see that method for
 // the hook's contract.
-func (ops *composeOps) sendMessage(ctx context.Context, accountID string, msg smtp.ComposeMessage, d *draft.Draft) (*account.Account, error) {
+//
+// The third return is the Sent-folder save error, if any (re-audit
+// finding R24): the mail was already accepted by SMTP when the save
+// runs, so a save failure never fails the send — but it must not be
+// swallowed either, or a delivered mail vanishes from Daak with no
+// trace. Callers record it as a persistent "Sent save failed"
+// warning (see sendQueueService.recordSentSaveFailure). It is nil
+// when the provider auto-saves Sent mail (no save attempted) or the
+// save succeeded.
+func (ops *composeOps) sendMessage(ctx context.Context, accountID string, msg smtp.ComposeMessage, d *draft.Draft) (*account.Account, error, error) {
 	return ops.sendMessageWithHook(ctx, accountID, msg, d, nil)
 }
 
@@ -572,7 +592,13 @@ func (ops *composeOps) sendMessage(ctx context.Context, accountID string, msg sm
 // window to the SMTP return itself; combined with the stable
 // Message-ID assigned at queue time, a redispatch after a crash
 // carries the same identity as the first attempt.
-func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string, msg smtp.ComposeMessage, d *draft.Draft, afterSMTP func(raw []byte)) (*account.Account, error) {
+//
+// The third return is the Sent-folder save error (see sendMessage):
+// non-nil only when SMTP already accepted the mail and the save then
+// failed. Callers must surface it as a persistent warning, never
+// drop it — the queue row is already gone by then, so without the
+// warning the delivered mail has no record anywhere in Daak.
+func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string, msg smtp.ComposeMessage, d *draft.Draft, afterSMTP func(raw []byte)) (*account.Account, error, error) {
 	log := logging.WithComponent("composeOps")
 
 	log.Info().
@@ -585,10 +611,10 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 	// Get account
 	acc, err := ops.accountStore.Get(accountID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get account: %w", err)
+		return nil, fmt.Errorf("failed to get account: %w", err), nil
 	}
 	if acc == nil {
-		return nil, fmt.Errorf("account not found: %s", accountID)
+		return nil, fmt.Errorf("account not found: %s", accountID), nil
 	}
 
 	// Receive-only accounts have no SMTP wiring; reject sends before any
@@ -597,13 +623,13 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 	// caller — surface a clear error rather than dialing a non-existent
 	// SMTP server.
 	if acc.NoOutgoingServer {
-		return nil, fmt.Errorf("account %q is configured as receive-only (no outgoing server)", acc.Email)
+		return nil, fmt.Errorf("account %q is configured as receive-only (no outgoing server)", acc.Email), nil
 	}
 
 	// Build RFC822 message
 	rawMsg, err := msg.ToRFC822()
 	if err != nil {
-		return nil, fmt.Errorf("failed to build message: %w", err)
+		return nil, fmt.Errorf("failed to build message: %w", err), nil
 	}
 
 	fromEmail := msg.From.Address
@@ -612,7 +638,7 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 	if ops.shouldSignMessage(accountID, msg.SignMessage) {
 		signedMsg, signErr := ops.smimeSigner.SignMessage(accountID, fromEmail, rawMsg)
 		if signErr != nil {
-			return nil, fmt.Errorf("failed to sign message: %w", signErr)
+			return nil, fmt.Errorf("failed to sign message: %w", signErr), nil
 		}
 		rawMsg = signedMsg
 		log.Info().Str("accountID", accountID).Msg("Message signed with S/MIME")
@@ -622,7 +648,7 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 	if ops.shouldEncryptMessage(accountID, msg.EncryptMessage) {
 		encryptedMsg, encErr := ops.smimeEncryptor.EncryptMessage(accountID, fromEmail, msg.AllRecipients(), rawMsg)
 		if encErr != nil {
-			return nil, fmt.Errorf("failed to encrypt message: %w", encErr)
+			return nil, fmt.Errorf("failed to encrypt message: %w", encErr), nil
 		}
 		rawMsg = encryptedMsg
 		log.Info().Str("accountID", accountID).Msg("Message encrypted with S/MIME")
@@ -632,7 +658,7 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 	if !msg.SignMessage && ops.shouldPGPSignMessage(accountID, msg.PGPSignMessage) {
 		signedMsg, signErr := ops.pgpSigner.SignMessage(accountID, fromEmail, rawMsg)
 		if signErr != nil {
-			return nil, fmt.Errorf("failed to PGP sign message: %w", signErr)
+			return nil, fmt.Errorf("failed to PGP sign message: %w", signErr), nil
 		}
 		rawMsg = signedMsg
 		log.Info().Str("accountID", accountID).Msg("Message signed with PGP")
@@ -642,7 +668,7 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 	if !msg.EncryptMessage && ops.shouldPGPEncryptMessage(accountID, msg.PGPEncryptMessage) {
 		encryptedMsg, encErr := ops.pgpEncryptor.EncryptMessage(accountID, fromEmail, msg.AllRecipients(), rawMsg)
 		if encErr != nil {
-			return nil, fmt.Errorf("failed to PGP encrypt message: %w", encErr)
+			return nil, fmt.Errorf("failed to PGP encrypt message: %w", encErr), nil
 		}
 		rawMsg = encryptedMsg
 		log.Info().Str("accountID", accountID).Msg("Message encrypted with PGP")
@@ -650,11 +676,11 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 
 	recipients := msg.AllRecipients()
 	if len(recipients) == 0 {
-		return nil, fmt.Errorf("no recipients specified")
+		return nil, fmt.Errorf("no recipients specified"), nil
 	}
 
 	if err := ops.sendRawMessage(ctx, accountID, msg.From.Address, recipients, rawMsg); err != nil {
-		return nil, err
+		return nil, err, nil
 	}
 
 	// SMTP accepted the mail: record that durably before any
@@ -664,12 +690,19 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 		afterSMTP(rawMsg)
 	}
 
-	// Save to Sent folder (using IMAP APPEND) if provider doesn't auto-save
+	// Save to Sent folder (using IMAP APPEND) if provider doesn't auto-save.
+	// A failure here must not fail the send — SMTP already accepted
+	// the mail — but it is returned (re-audit finding R24) so the
+	// caller can record a persistent "Sent save failed" warning:
+	// the queue row is already gone (afterSMTP above deleted it),
+	// so a swallowed error would leave a delivered mail with no
+	// record anywhere in Daak.
+	var sentSaveErr error
 	if !providerAutoSavesSentMail(acc.IMAPHost) {
 		log.Info().Str("host", acc.IMAPHost).Msg("Provider doesn't auto-save, using IMAP APPEND")
 		if err := ops.saveToSentFolder(ctx, accountID, acc, rawMsg); err != nil {
 			log.Warn().Err(err).Msg("Failed to save message to Sent folder")
-			// Don't fail the send operation if saving fails
+			sentSaveErr = err
 		}
 	}
 
@@ -699,7 +732,7 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 	}
 
 	log.Info().Str("accountID", accountID).Msg("Message sent successfully")
-	return acc, nil
+	return acc, nil, sentSaveErr
 }
 
 // readFileAsAttachment reads a file and creates a ComposerAttachment.
@@ -765,10 +798,25 @@ func pickAttachmentFiles(ctx context.Context) ([]ComposerAttachment, error) {
 
 // SendMessage sends an email via SMTP.
 // The message is composed in the frontend and sent to the backend.
+// A Sent-folder save failure does not fail the send (the mail was
+// already accepted by SMTP), but it is recorded as a persistent
+// "Sent save failed" Outbox warning (re-audit finding R24) instead
+// of vanishing with only a log line.
 func (a *App) SendMessage(accountID string, msg smtp.ComposeMessage) error {
-	_, err := a.composeOps.sendMessage(a.ctx, accountID, msg, nil)
+	_, err, sentSaveErr := a.composeOps.sendMessage(a.ctx, accountID, msg, nil)
 	if err != nil {
 		return err
+	}
+	if sentSaveErr != nil {
+		a.ensureSendQueueService().recordSentSaveFailure(sendqueue.Item{
+			AccountID:   accountID,
+			Kind:        sendqueue.KindMessage,
+			Subject:     msg.Subject,
+			Recipient:   firstRecipient(msg),
+			FromAddress: msg.From.Address,
+			To:          msg.AllRecipients(),
+		}, time.Now(), sentSaveErr)
+		return nil
 	}
 	go func() {
 		if err := a.syncSentFolder(accountID); err != nil {
@@ -777,6 +825,16 @@ func (a *App) SendMessage(accountID string, msg smtp.ComposeMessage) error {
 		}
 	}()
 	return nil
+}
+
+// firstRecipient returns the first To address of a composed message,
+// "" when there is none. Used for the "Sent save failed" Outbox
+// warning, which names the message by subject and recipient.
+func firstRecipient(msg smtp.ComposeMessage) string {
+	if len(msg.To) > 0 {
+		return msg.To[0].Address
+	}
+	return ""
 }
 
 // handleExternalMailto handles a mailto URL received from a second instance.

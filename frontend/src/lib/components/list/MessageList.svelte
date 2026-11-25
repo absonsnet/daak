@@ -214,7 +214,10 @@
   // (in the undo window or on retry backoff) and carry the draft to
   // reopen on Undo; reactions are `kind: 'reaction'` (same pending
   // window, no draft); Mail Merge rows are `kind: 'mailmerge'`
-  // with status 'queued'. ListQueue returns nil when the extension
+  // with status 'queued'. A row with status 'sent_unsaved' is a
+  // delivered mail whose Sent copy could not be saved (re-audit
+  // finding R24) — a persistent warning with no Retry, since the
+  // recipient already has it. ListQueue returns nil when the extension
   // is disabled, so a disabled extension reads as an empty outbox.
   // One shared row shape; the template branches on `kind` for the
   // Undo/Retry/Cancel actions. Sent and cancelled rows are deleted
@@ -250,13 +253,20 @@
   // go out on their own countdown, so the button enables on those.
   const waitingMailMergeItems = $derived(waitingQueueItems.filter((i) => i.kind === 'mailmerge'))
   const failedQueueItems = $derived(queueItems.filter((i) => i.status === 'failed'))
+  // Re-audit finding R24: mail that was delivered but whose Sent
+  // copy could not be saved. These rows are warnings, not failures
+  // — the recipient already has the mail, so there is no Retry —
+  // and they stay in the Outbox until the user has seen them.
+  const sentUnsavedQueueItems = $derived(queueItems.filter((i) => i.status === 'sent_unsaved'))
 
-  // Waiting, then failed — each group only when non-empty (the
-  // template skips empty groups). Sent and cancelled rows are
-  // deleted by the backend, so there is no history group.
+  // Waiting, then failed, then sent-but-unsaved — each group only
+  // when non-empty (the template skips empty groups). Sent and
+  // cancelled rows are deleted by the backend, so there is no
+  // history group.
   const queueGroups = $derived([
     { key: 'waiting', label: $_('messageList.outboxStatusQueued'), items: waitingQueueItems },
     { key: 'failed', label: $_('messageList.outboxStatusFailed'), items: failedQueueItems },
+    { key: 'sentUnsaved', label: $_('messageList.outboxStatusSentUnsaved'), items: sentUnsavedQueueItems },
   ].filter((g) => g.items.length > 0))
 
   async function loadQueue() {
@@ -323,6 +333,7 @@
       case 'sending': return $_('messageList.outboxStatusSending')
       case 'sent': return $_('messageList.outboxStatusSent')
       case 'failed': return $_('messageList.outboxStatusFailed')
+      case 'sent_unsaved': return $_('messageList.outboxStatusSentUnsaved')
       case 'cancelled': return $_('messageList.outboxStatusCancelled')
       default: return status
     }
@@ -2683,7 +2694,7 @@
                     {$_('messageList.outboxReaction')}
                   </span>
                 {/if}
-                <span class="flex-shrink-0 px-1.5 py-0.5 text-xs font-medium rounded-full {item.status === 'failed' ? 'bg-destructive/10 text-destructive' : item.status === 'sent' ? 'bg-emerald-500/10 text-emerald-600' : 'bg-muted text-muted-foreground'}">
+                <span class="flex-shrink-0 px-1.5 py-0.5 text-xs font-medium rounded-full {item.status === 'failed' || item.status === 'sent_unsaved' ? 'bg-destructive/10 text-destructive' : item.status === 'sent' ? 'bg-emerald-500/10 text-emerald-600' : 'bg-muted text-muted-foreground'}">
                   {queueStatusLabel(item.status)}
                 </span>
               </button>

@@ -33,15 +33,16 @@ const (
 )
 
 type linuxNotifier struct {
-	appName       string
-	conn          *dbus.Conn
-	clickHandler  ClickHandler
-	notifications map[string]NotificationData // Portal uses string IDs
-	notifyIDs     map[uint32]NotificationData // Direct uses uint32 IDs
-	mu            sync.RWMutex
-	log           zerolog.Logger
-	cancel        context.CancelFunc
-	idCounter     uint64
+	appName           string
+	conn              *dbus.Conn
+	clickHandler      ClickHandler
+	permissionHandler func(PermissionStatus)
+	notifications     map[string]NotificationData // Portal uses string IDs
+	notifyIDs         map[uint32]NotificationData // Direct uses uint32 IDs
+	mu                sync.RWMutex
+	log               zerolog.Logger
+	cancel            context.CancelFunc
+	idCounter         uint64
 
 	// Backend selection
 	backend       notificationBackend
@@ -295,6 +296,22 @@ func (n *linuxNotifier) showDirect(notif Notification) (uint32, error) {
 func (n *linuxNotifier) SetClickHandler(handler ClickHandler) {
 	n.mu.Lock()
 	n.clickHandler = handler
+	n.mu.Unlock()
+}
+
+// PermissionStatus reports PermissionUnknown: Linux notification
+// backends (portal / D-Bus) expose no per-app permission query, so
+// there is no denied state to report. Unknown must not be treated as
+// denied by callers.
+func (n *linuxNotifier) PermissionStatus() PermissionStatus {
+	return PermissionUnknown
+}
+
+// SetPermissionChangeHandler stores the handler; Linux has no OS
+// permission-change signal to invoke it with.
+func (n *linuxNotifier) SetPermissionChangeHandler(handler func(PermissionStatus)) {
+	n.mu.Lock()
+	n.permissionHandler = handler
 	n.mu.Unlock()
 }
 
