@@ -1800,7 +1800,7 @@ func (v *ViewerApp) DownloadAttachment(attachmentID, savePath string) (string, e
 	}
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
-	content, err := downloader.ExtractAttachmentContent(raw, att.Filename)
+	content, err := downloader.ExtractAttachmentContentFor(raw, att)
 	if err != nil {
 		return "", fmt.Errorf("failed to extract attachment: %w", err)
 	}
@@ -2015,12 +2015,12 @@ func (v *ViewerApp) SaveAllAttachments(messageID string) (string, error) {
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
 	savedCount := 0
 	for _, att := range attachments {
-		content, err := downloader.ExtractAttachmentContent(raw, att.Filename)
+		content, err := downloader.ExtractAttachmentContentFor(raw, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract attachment")
 			continue
 		}
-		savePath := filepath.Join(saveDir, att.Filename)
+		savePath := filepath.Join(saveDir, email.DeduplicateFilename(saveDir, att.Filename, usedNames))
 		_, err = downloader.SaveAttachment(att, content, savePath)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save attachment")
@@ -2111,12 +2111,13 @@ func (v *ViewerApp) DownloadEncryptedAttachment(messageID, filename, savePath st
 	}
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
-	content, err := downloader.ExtractAttachmentContent(innerBytes, filename)
+	content, err := downloader.ExtractAttachmentContentFor(innerBytes, &message.Attachment{MessageID: messageID, Filename: filename})
 	if err != nil {
 		return "", fmt.Errorf("failed to extract attachment from decrypted message: %w", err)
 	}
 
 	att := &message.Attachment{
+		MessageID:   messageID,
 		Filename:    filename,
 		ContentType: "application/octet-stream",
 		Size:        len(content),
@@ -2227,13 +2228,14 @@ func (v *ViewerApp) SaveAllEncryptedAttachments(messageID string) (string, error
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
 	savedCount := 0
+	usedNames := map[string]bool{}
 	for _, att := range regularAtts {
-		content, err := downloader.ExtractAttachmentContent(innerBytes, att.Filename)
+		content, err := downloader.ExtractAttachmentContentFor(innerBytes, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract encrypted attachment")
 			continue
 		}
-		savePath := filepath.Join(saveDir, att.Filename)
+		savePath := filepath.Join(saveDir, email.DeduplicateFilename(saveDir, att.Filename, usedNames))
 		_, err = downloader.SaveAttachment(att, content, savePath)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save encrypted attachment")
@@ -2251,9 +2253,10 @@ func (v *ViewerApp) SaveAllEncryptedAttachments(messageID string) (string, error
 func (v *ViewerApp) saveAllAttachmentsViaPortal(messageID string, attachments []*message.Attachment, defaultDir string) (string, error) {
 	log := logging.WithComponent("viewer")
 
+	usedNames := map[string]bool{}
 	filenames := make([]string, len(attachments))
 	for i, att := range attachments {
-		filenames[i] = att.Filename
+		filenames[i] = email.DeduplicateFilename("", att.Filename, usedNames)
 	}
 
 	savePaths, err := platform.PortalSaveFiles("Save All Attachments", filenames, defaultDir)
@@ -2286,7 +2289,7 @@ func (v *ViewerApp) saveAllAttachmentsViaPortal(messageID string, attachments []
 		if i >= len(savePaths) {
 			break
 		}
-		content, err := downloader.ExtractAttachmentContent(raw, att.Filename)
+		content, err := downloader.ExtractAttachmentContentFor(raw, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract attachment")
 			continue
@@ -2308,9 +2311,10 @@ func (v *ViewerApp) saveAllAttachmentsViaPortal(messageID string, attachments []
 func (v *ViewerApp) saveAllEncryptedAttachmentsViaPortal(attachments []*message.Attachment, innerBytes []byte, defaultDir string) (string, error) {
 	log := logging.WithComponent("viewer")
 
+	usedNames := map[string]bool{}
 	filenames := make([]string, len(attachments))
 	for i, att := range attachments {
-		filenames[i] = att.Filename
+		filenames[i] = email.DeduplicateFilename("", att.Filename, usedNames)
 	}
 
 	savePaths, err := platform.PortalSaveFiles("Save All Attachments", filenames, defaultDir)
@@ -2330,7 +2334,7 @@ func (v *ViewerApp) saveAllEncryptedAttachmentsViaPortal(attachments []*message.
 		if i >= len(savePaths) {
 			break
 		}
-		content, err := downloader.ExtractAttachmentContent(innerBytes, att.Filename)
+		content, err := downloader.ExtractAttachmentContentFor(innerBytes, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract encrypted attachment")
 			continue

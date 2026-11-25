@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"testing"
+
+	"github.com/absonsnet/daak/internal/message"
 )
 
 // Audit finding 21: the sync parser stores part.Body, which go-message has
@@ -123,4 +126,75 @@ func TestExtractAttachmentContent_QuotedPrintableNotDoubleDecoded(t *testing.T) 
 	if !bytes.Equal(got, stored) {
 		t.Errorf("downloaded = %q, want stored body %q", got, stored)
 	}
+}
+
+
+// Audit4 finding 29: two attachments with the same filename must be
+// distinguished by size (and content-ID when present), not by name alone.
+func TestExtractAttachmentContentFor_SameFilenameDisambiguatedBySize(t *testing.T) {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "From: a@example.com\r\nTo: b@example.com\r\nSubject: Data\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"B\"\r\n\r\n")
+	fmt.Fprintf(&buf, "--B\r\nContent-Type: application/octet-stream; name=\"report.pdf\"\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n%s\r\n", base64.StdEncoding.EncodeToString([]byte("short")))
+	fmt.Fprintf(&buf, "--B\r\nContent-Type: application/octet-stream; name=\"report.pdf\"\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n%s\r\n", base64.StdEncoding.EncodeToString([]byte("a much longer second file")))
+	fmt.Fprintf(&buf, "--B--\r\n")
+	raw := buf.Bytes()
+
+	d := NewAttachmentDownloader(t.TempDir())
+	got, err := d.ExtractAttachmentContentFor(raw, &message.Attachment{Filename: "report.pdf", Size: len("a much longer second file")})
+	if err != nil {
+		t.Fatalf("ExtractAttachmentContentFor error: %v", err)
+	}
+	if string(got) != "a much longer second file" {
+		t.Errorf("downloaded = %q, want the second same-named file", got)
+	}
+	// Without a size to disambiguate, the first same-named file is returned.
+	got, err = d.ExtractAttachmentContentFor(raw, &message.Attachment{Filename: "report.pdf"})
+	if err != nil {
+		t.Fatalf("ExtractAttachmentContentFor (no size) error: %v", err)
+	}
+	if string(got) != "short" {
+		t.Errorf("downloaded = %q, want the first same-named file", got)
+	}
+}
+
+// Audit4 finding 16: SaveAttachment must not slice an empty or short
+// message ID out of range.
+func TestSaveAttachment_ShortOrEmptyMessageID(t *testing.T) {
+	d := NewAttachmentDownloader(t.TempDir())
+	for _, id := range []string{"", "abc", "12345678"} {
+		p, err := d.SaveAttachment(&message.Attachment{MessageID: id, Filename: "x.txt"}, []byte("hi"), "")
+		if err != nil {
+			t.Fatalf("SaveAttachment(%q) error: %v", id, err)
+		}
+		if p == "" {
+			t.Fatalf("SaveAttachment(%q) returned empty path", id)
+		}
+	}
+}
+
+// Audit4 finding 29: Save All must not overwrite one file with another
+// of the same name.
+func TestDeduplicateFilename(t *testing.T) {
+	dir := t.TempDir()
+	used := map[string]bool{}
+	if got := DeduplicateFilename(dir, "report.pdf", used); got != "report.pdf" {
+		t.Errorf("first = %q, want report.pdf", got)
+	}
+	if got := DeduplicateFilename(dir, "report.pdf", used); got != "report (2).pdf" {
+		t.Errorf("second = %q, want report (2).pdf", got)
+	}
+	if got := DeduplicateFilename(dir, "report.pdf", used); got != "report (3).pdf" {
+		t.Errorf("third = %q, want report (3).pdf", got)
+	}
+	// A file already on disk also forces a new name.
+	if err := writeTestFile(dir, "notes.txt", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if got := DeduplicateFilename(dir, "notes.txt", map[string]bool{}); got != "notes (2).txt" {
+		t.Errorf("on-disk collision = %q, want notes (2).txt", got)
+	}
+}
+
+func writeTestFile(dir, name, content string) error {
+	return os.WriteFile(dir+"/"+name, []byte(content), 0600)
 }
