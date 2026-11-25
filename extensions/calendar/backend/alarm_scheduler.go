@@ -9,12 +9,16 @@ package backend
 //   - Start subscribes to calendar:sync-complete (so newly-arrived alarms
 //     get armed) and system:wake (so missed alarms during sleep are swept
 //     to 'fired' without firing-after-the-fact, and future ones re-armed).
+//   - A periodic re-evaluation tick (fourth-audit finding 33) runs
+//     independently of sync: timers only cover a 24h horizon and local
+//     sources never get a sync tick, so without it reminders for
+//     local-calendar events more than a day away might never be armed.
 //   - time.AfterFunc timers cover the 24h horizon. On wrap-around (>24h
 //     out), Reevaluate doesn't arm anything for that alarm yet — the next
-//     scheduled tick or sync re-pass will pick it up.
+//     periodic tick or sync re-pass will pick it up.
 //
 // The scheduler does NOT walk recurrences or parse VALARMs itself. That
-// happens at sync time via ExtractAlarms (alarm.go), which writes rows
+// happens at sync/write time via ExtractAlarms (alarm.go), which writes rows
 // into event_alarms. The scheduler only reads pending rows and arms
 // time.AfterFunc callbacks.
 
@@ -29,6 +33,19 @@ import (
 
 const alarmHorizon = 24 * time.Hour
 
+// alarmReevaluateInterval is the periodic re-evaluation tick (finding 33).
+// 15 minutes is frequent enough that a reminder entering the 24h horizon
+// is armed promptly, and cheap: one indexed range query per tick.
+const alarmReevaluateInterval = 15 * time.Minute
+
+// alarmRetryDelay is the wait before retrying a notification that failed
+// to show (finding 32); alarmMaxRetries bounds the retries, after which
+// the alarm is marked fired so a broken notifier cannot retry forever.
+const (
+	alarmRetryDelay = time.Minute
+	alarmMaxRetries = 3
+)
+
 type AlarmScheduler struct {
 	store  *Store
 	notif  coreapi.Notifications
@@ -40,16 +57,31 @@ type AlarmScheduler struct {
 	mu     sync.Mutex
 	timers map[string]*time.Timer // alarmID → timer
 
+	// retries counts failed notification attempts per alarm, reset when
+	// the notification is finally shown.
+	retries map[string]int
+
+	// reevaluateInterval is the periodic tick (finding 33); retryDelay
+	// is the wait before retrying a failed notification (finding 32).
+	// Both are fields (not constants) so tests can shrink them.
+	reevaluateInterval time.Duration
+	retryDelay         time.Duration
+
+	ticker *time.Ticker
+
 	unsubs []func()
 }
 
 func NewAlarmScheduler(store *Store, notif coreapi.Notifications, events coreapi.EventBus, log coreapi.Logger) *AlarmScheduler {
 	return &AlarmScheduler{
-		store:  store,
-		notif:  notif,
-		events: events,
-		log:    log,
-		timers: make(map[string]*time.Timer),
+		store:              store,
+		notif:              notif,
+		events:             events,
+		log:                log,
+		timers:             make(map[string]*time.Timer),
+		retries:            make(map[string]int),
+		reevaluateInterval: alarmReevaluateInterval,
+		retryDelay:         alarmRetryDelay,
 	}
 }
 
@@ -107,6 +139,28 @@ func (s *AlarmScheduler) Start(ctx context.Context) context.CancelFunc {
 		s.warn("initial reevaluate: %v", err)
 	}
 
+	// Periodic re-evaluation tick (fourth-audit finding 33): independent
+	// of sync, so reminders for local-calendar events more than a day
+	// away are armed when they enter the 24h horizon. Local sources
+	// never get the sync-complete tick that remote sources rely on.
+	s.mu.Lock()
+	s.ticker = time.NewTicker(s.reevaluateInterval)
+	ticker := s.ticker
+	runCtx := s.ctx
+	s.mu.Unlock()
+	go func() {
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				if err := s.Reevaluate(); err != nil {
+					s.warn("periodic reevaluate: %v", err)
+				}
+			}
+		}
+	}()
+
 	return s.cancel
 }
 
@@ -116,6 +170,10 @@ func (s *AlarmScheduler) Stop() {
 	for id, t := range s.timers {
 		t.Stop()
 		delete(s.timers, id)
+	}
+	if s.ticker != nil {
+		s.ticker.Stop()
+		s.ticker = nil
 	}
 	for _, u := range s.unsubs {
 		u()
@@ -133,6 +191,11 @@ func (s *AlarmScheduler) Stop() {
 // longer matching pending rows (deletes / dismissals), and arms a
 // time.AfterFunc for each new row. Idempotent — safe to call repeatedly.
 func (s *AlarmScheduler) Reevaluate() error {
+	// Sweep orphan rows (event gone, alarm left behind) on every pass,
+	// so a deleted event's reminders can never fire (finding 32).
+	if err := s.store.PruneOrphanAlarms(); err != nil {
+		s.warn("prune orphan alarms: %v", err)
+	}
 	now := time.Now().Unix()
 	pending, err := s.store.PendingAlarmsInRange(now, now+int64(alarmHorizon.Seconds()))
 	if err != nil {
@@ -172,7 +235,11 @@ func (s *AlarmScheduler) Reevaluate() error {
 
 // dispatch fires one alarm: re-reads the row to confirm pending status
 // (user may have dismissed in the UI between arming and firing), shows
-// the notification, marks fired.
+// the notification, marks fired — but ONLY when the notification was
+// actually shown (fourth-audit finding 32). A failed Show leaves the
+// alarm pending and retries after alarmRetryDelay, up to
+// alarmMaxRetries; after that the alarm is marked fired so a broken
+// notifier cannot retry forever. The failure is logged every time.
 func (s *AlarmScheduler) dispatch(alarmID string) {
 	s.mu.Lock()
 	delete(s.timers, alarmID)
@@ -201,18 +268,43 @@ func (s *AlarmScheduler) dispatch(alarmID string) {
 	}
 	body := formatAlarmBody(*ev, a, time.Unix(a.InstanceUnix, 0))
 
-	if s.notif != nil {
-		_ = s.notif.Show(coreapi.NotifyRequest{
-			Title: title,
-			Body:  body,
-			OnClick: coreapi.NotifyClickAction{
-				Kind:        "open-extension",
-				ExtensionID: "calendar",
-				Path:        "/event/" + ev.ID,
-			},
-		})
+	if s.notif == nil {
+		// No notifier wired (tests, headless): nothing can be shown,
+		// so the alarm is done — same as before.
+		_ = s.store.MarkAlarmFired(alarmID, time.Now().Unix())
+		return
 	}
 
+	if err := s.notif.Show(coreapi.NotifyRequest{
+		Title: title,
+		Body:  body,
+		OnClick: coreapi.NotifyClickAction{
+			Kind:        "open-extension",
+			ExtensionID: "calendar",
+			Path:        "/event/" + ev.ID,
+		},
+	}); err != nil {
+		s.warn("alarm notification failed for %s: %v", alarmID, err)
+		s.mu.Lock()
+		attempts := s.retries[alarmID] + 1
+		if attempts > alarmMaxRetries {
+			delete(s.retries, alarmID)
+			s.mu.Unlock()
+			s.warn("alarm %s: notification failed %d times, giving up and marking fired", alarmID, attempts-1)
+			_ = s.store.MarkAlarmFired(alarmID, time.Now().Unix())
+			return
+		}
+		s.retries[alarmID] = attempts
+		s.timers[alarmID] = time.AfterFunc(s.retryDelay, func() {
+			s.dispatch(alarmID)
+		})
+		s.mu.Unlock()
+		return
+	}
+
+	s.mu.Lock()
+	delete(s.retries, alarmID)
+	s.mu.Unlock()
 	_ = s.store.MarkAlarmFired(alarmID, time.Now().Unix())
 }
 

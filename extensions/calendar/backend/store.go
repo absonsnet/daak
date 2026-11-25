@@ -803,10 +803,17 @@ type Event struct {
 // events produce zero or more (depends on the window). RECURRENCE-ID
 // overrides replace the matching default-expanded instance.
 type EventInstance struct {
-	Event              // embed for field reuse; serialized flat in JSON
-	InstanceStartUnix  int64 `json:"instanceStartUnix"`
-	InstanceEndUnix    int64 `json:"instanceEndUnix"`
-	IsRecurrenceOverride bool `json:"isRecurrenceOverride,omitempty"`
+	Event                      // embed for field reuse; serialized flat in JSON
+	InstanceStartUnix    int64 `json:"instanceStartUnix"`
+	InstanceEndUnix      int64 `json:"instanceEndUnix"`
+	IsRecurrenceOverride bool  `json:"isRecurrenceOverride,omitempty"`
+	// RecurrenceIDUnix is the ORIGINAL occurrence start (the RECURRENCE-ID)
+	// for an override instance — it differs from InstanceStartUnix when
+	// the override moved the occurrence. For plain instances it equals
+	// InstanceStartUnix. Alarm templates are keyed by it (fourth-audit
+	// finding 32): looking them up by the new start missed moved
+	// overrides entirely.
+	RecurrenceIDUnix int64 `json:"recurrenceIdUnix,omitempty"`
 }
 
 // EventOverride is one RECURRENCE-ID exception to a master recurring event.
@@ -1361,6 +1368,66 @@ func (s *Store) MarkPastAlarmsFired(now int64) error {
 		WHERE status = 'pending' AND trigger_unix < ?`, now, now)
 	if err != nil {
 		return fmt.Errorf("mark past alarms fired: %w", err)
+	}
+	return nil
+}
+
+// PruneStaleAlarmsTx deletes pending alarm rows for one event that are no
+// longer in the freshly extracted set (fourth-audit finding 32). An edit
+// that moves an event, changes its VALARMs, or drops an occurrence leaves
+// rows behind that UpsertAlarmTx's INSERT OR IGNORE never removes —
+// without pruning, the moved/edited event keeps firing reminders at its
+// old times. keep is the current ExtractAlarms output; matching is by
+// (instance_unix, trigger_unix), not row id, because extraction mints
+// fresh UUIDs on every pass. Fired/dismissed rows are history and are
+// never pruned.
+func (s *Store) PruneStaleAlarmsTx(tx *sql.Tx, eventID string, keep []Alarm) error {
+	keepSet := make(map[[2]int64]struct{}, len(keep))
+	for _, a := range keep {
+		keepSet[[2]int64{a.InstanceUnix, a.TriggerUnix}] = struct{}{}
+	}
+	rows, err := tx.Query(`
+		SELECT id, instance_unix, trigger_unix FROM event_alarms
+		WHERE event_id = ? AND status = 'pending'`, eventID)
+	if err != nil {
+		return fmt.Errorf("list pending alarms for prune: %w", err)
+	}
+	var stale []string
+	for rows.Next() {
+		var id string
+		var inst, trig int64
+		if err := rows.Scan(&id, &inst, &trig); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan alarm for prune: %w", err)
+		}
+		if _, ok := keepSet[[2]int64{inst, trig}]; !ok {
+			stale = append(stale, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("list pending alarms for prune: %w", err)
+	}
+	rows.Close()
+	for _, id := range stale {
+		if _, err := tx.Exec(`DELETE FROM event_alarms WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("prune stale alarm %s: %w", id, err)
+		}
+	}
+	return nil
+}
+
+// PruneOrphanAlarms deletes pending alarm rows whose event no longer
+// exists (defense in depth beside the ON DELETE CASCADE FK — e.g. rows
+// written while FK enforcement was off). Called from the scheduler's
+// re-evaluation pass, so orphans are swept even when no write/sync
+// touches the event.
+func (s *Store) PruneOrphanAlarms() error {
+	_, err := s.DB().Exec(`
+		DELETE FROM event_alarms
+		WHERE status = 'pending' AND event_id NOT IN (SELECT id FROM events)`)
+	if err != nil {
+		return fmt.Errorf("prune orphan alarms: %w", err)
 	}
 	return nil
 }

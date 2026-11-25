@@ -993,6 +993,12 @@ func extractAndUpsertAlarmsTx(store *Store, tx *sql.Tx, ev Event) error {
 			return err
 		}
 	}
+	// Prune rows the new extraction no longer covers (moved/edited
+	// event, changed VALARMs, dropped occurrence) — otherwise the old
+	// rows keep firing at the old times (fourth-audit finding 32).
+	if err := store.PruneStaleAlarmsTx(tx, ev.ID, alarms); err != nil {
+		return err
+	}
 	return nil
 }
 

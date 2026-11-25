@@ -56,7 +56,17 @@ func ExtractAlarms(ev Event, overrides []EventOverride, instances []EventInstanc
 	out := make([]Alarm, 0, len(instances))
 	for _, inst := range instances {
 		templates := masterAlarms
-		if ov, ok := overrideTemplates[inst.InstanceStartUnix]; ok {
+		// Overrides are keyed by RECURRENCE-ID — the ORIGINAL occurrence
+		// start — not by the instance's (possibly moved) new start.
+		// Looking them up by InstanceStartUnix missed every moved
+		// override, so its reminders fell back to the master's
+		// (fourth-audit finding 32). RecurrenceIDUnix is 0 only for
+		// instances built by older callers; fall back to the start.
+		lookupKey := inst.RecurrenceIDUnix
+		if lookupKey == 0 {
+			lookupKey = inst.InstanceStartUnix
+		}
+		if ov, ok := overrideTemplates[lookupKey]; ok {
 			// Override takes precedence; if the override has zero alarms,
 			// it means the user intentionally cleared reminders for that
 			// instance — honor that.

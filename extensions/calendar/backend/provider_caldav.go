@@ -189,6 +189,13 @@ func (p caldavProvider) SyncCalendar(ctx context.Context, src Source, cal Calend
 					return err
 				}
 			}
+			// Prune rows the fresh extraction no longer covers (moved/
+			// edited event, changed VALARMs, dropped occurrence) —
+			// otherwise stale rows keep firing at the old times
+			// (fourth-audit finding 32).
+			if err := p.store.PruneStaleAlarmsTx(tx, eventID, alarms); err != nil {
+				return err
+			}
 		}
 
 		// Delete events that disappeared from the server.

@@ -32,6 +32,7 @@ func ExpandInRange(ev Event, overrides []EventOverride, from, to time.Time) ([]E
 			Event:             ev,
 			InstanceStartUnix: ev.DTStartUnix,
 			InstanceEndUnix:   ev.DTEndUnix,
+			RecurrenceIDUnix:  ev.DTStartUnix,
 		}}, nil
 	}
 
@@ -103,9 +104,14 @@ func ExpandInRange(ev Event, overrides []EventOverride, from, to time.Time) ([]E
 					Event:             ev,
 					InstanceStartUnix: instUnix,
 					InstanceEndUnix:   instUnix + int64(masterDuration.Seconds()),
+					RecurrenceIDUnix:  instUnix,
 				})
 				continue
 			}
+			// The override's identity is the ORIGINAL occurrence start,
+			// not its (possibly moved) new DTSTART — alarm templates
+			// are keyed by it.
+			inst.RecurrenceIDUnix = instUnix
 			out = append(out, inst)
 			continue
 		}
@@ -113,6 +119,7 @@ func ExpandInRange(ev Event, overrides []EventOverride, from, to time.Time) ([]E
 			Event:             ev,
 			InstanceStartUnix: instUnix,
 			InstanceEndUnix:   instUnix + int64(masterDuration.Seconds()),
+			RecurrenceIDUnix:  instUnix,
 		})
 	}
 
