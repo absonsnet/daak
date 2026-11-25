@@ -502,6 +502,57 @@ func TestSetGetRunBackground(t *testing.T) {
 	}
 }
 
+// TestSetRunBackgroundAndStartHidden (fourth-audit finding 57):
+// disabling background mode force-disables start_hidden in the same
+// transaction, so the pair can never land half-applied.
+func TestSetRunBackgroundAndStartHidden(t *testing.T) {
+	store := NewStore(openTestDB(t))
+
+	if err := store.SetRunBackgroundAndStartHidden(true, true); err != nil {
+		t.Fatalf("unexpected error on set: %v", err)
+	}
+	if got, _ := store.GetRunBackground(); !got {
+		t.Error("expected run_background true, got false")
+	}
+	if got, _ := store.GetStartHidden(); !got {
+		t.Error("expected start_hidden true, got false")
+	}
+
+	if err := store.SetRunBackgroundAndStartHidden(false, false); err != nil {
+		t.Fatalf("unexpected error on disable: %v", err)
+	}
+	if got, _ := store.GetRunBackground(); got {
+		t.Error("expected run_background false, got true")
+	}
+	if got, _ := store.GetStartHidden(); got {
+		t.Error("expected start_hidden false after disabling background, got true")
+	}
+}
+
+// TestSetComposerModeAndMailtoMode (fourth-audit finding 57):
+// setting the composer to detached auto-sets mailto mode to
+// detached in the same transaction.
+func TestSetComposerModeAndMailtoMode(t *testing.T) {
+	store := NewStore(openTestDB(t))
+
+	if err := store.SetComposerModeAndMailtoMode("detached", "detached"); err != nil {
+		t.Fatalf("unexpected error on set: %v", err)
+	}
+	if got, _ := store.GetComposerMode(); got != "detached" {
+		t.Errorf("composer mode = %q, want detached", got)
+	}
+	if got, _ := store.GetMailtoMode(); got != "detached" {
+		t.Errorf("mailto mode = %q, want detached", got)
+	}
+
+	if err := store.SetComposerModeAndMailtoMode("bogus", "detached"); err == nil {
+		t.Error("expected error for invalid composer mode, got nil")
+	}
+	if got, _ := store.GetComposerMode(); got != "detached" {
+		t.Errorf("composer mode after failed set = %q, want detached (unchanged)", got)
+	}
+}
+
 func TestSetGetShowUnreadBadge(t *testing.T) {
 	store := NewStore(openTestDB(t))
 
