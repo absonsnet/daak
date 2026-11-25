@@ -160,7 +160,13 @@ func (m *Manager) startAuthFlowInternal(ctx context.Context, providerName string
 // callback server are cleared on EVERY exit path — success, callback
 // failure, state mismatch, token-exchange failure — so a failed flow never
 // leaves a stale session (and port) behind that blocks the next sign-in
-// (audit finding 24).
+// (audit finding 24). The cleanup is identity-checked (see
+// clearSessionFor): the deferred clear must only drop the session this
+// call waited on. A plain clear here would wipe a NEW flow started
+// after a cancel — CancelAuthFlow clears the session at once, so a
+// retry can start while this waiter is still unwinding, and the old
+// waiter's deferred clear would otherwise stop the new flow's server
+// and nil its session (re-audit finding R13).
 func (m *Manager) WaitForCallback(ctx context.Context) (*TokenResponse, string, error) {
 	m.mu.Lock()
 	if m.activeSession == nil || m.callbackServer == nil {
@@ -171,10 +177,12 @@ func (m *Manager) WaitForCallback(ctx context.Context) (*TokenResponse, string, 
 	server := m.callbackServer
 	m.mu.Unlock()
 
-	// Clear the session/server on every exit path. The wait itself runs
-	// outside mu so CancelAuthFlow and a (rejected) concurrent Start can
-	// still observe the in-progress flow while we block here.
-	defer m.clearSession()
+	// Clear this flow's session/server on every exit path. The wait
+	// itself runs outside mu so CancelAuthFlow and a (rejected)
+	// concurrent Start can still observe the in-progress flow while
+	// we block here. Identity-checked: only this session/server pair
+	// is cleared, never a newer flow's (re-audit finding R13).
+	defer m.clearSessionFor(session, server)
 
 	// Use custom provider config if available, otherwise look up by name
 	var provider ProviderConfig
@@ -226,8 +234,11 @@ func (m *Manager) WaitForCallback(ctx context.Context) (*TokenResponse, string, 
 }
 
 // clearSession stops the callback server (if any) and drops the active
-// session. It is the single cleanup path for WaitForCallback (every exit)
-// and CancelAuthFlow, so no failure mode can leave a stale session behind.
+// session, whatever it currently is. It is the cleanup path for
+// CancelAuthFlow only: a cancel is an explicit user action against
+// the flow that is active right now, and it runs atomically under
+// mu, so there is no gap in which a new flow could start between
+// observing the session and clearing it.
 func (m *Manager) clearSession() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -238,7 +249,51 @@ func (m *Manager) clearSession() {
 	m.activeSession = nil
 }
 
-// CancelAuthFlow cancels any active OAuth flow
+// clearSessionFor stops the captured callback server and drops the
+// captured session — but only if they are still the current ones.
+// It is the deferred cleanup for WaitForCallback (every exit path),
+// and the identity check is what keeps finding 24's guarantee
+// intact while fixing re-audit finding R13.
+//
+// Why it must be identity-checked: the defer runs when the waiter
+// returns, which can be AFTER a cancel plus an immediate retry.
+// CancelAuthFlow clears the session at once, so startAuthFlowInternal
+// (which rejects a new flow only while activeSession != nil) lets the
+// retry start while the old waiter is still unwinding — still
+// exchanging a code, or just waking from the stopped server. An
+// unconditional clear at that point would stop the new flow's
+// callback server and nil its session, and the retry would hang or
+// fail. The finding-24 invariant is preserved the other way round:
+// a new flow can only start once the old session is gone (cancelled,
+// or cleared by its own waiter), and this clear can only remove the
+// session it was registered for — it can never touch a newer one.
+//
+// The captured server is stopped even when it is no longer current:
+// it is a distinct object from any new flow's server, and Stop is
+// idempotent, so stopping it cannot affect the new flow — it only
+// guarantees the old port is released on exit paths that did not
+// already stop it. The manager fields, by contrast, are only
+// touched on a pointer match.
+func (m *Manager) clearSessionFor(session *AuthSession, server *CallbackServer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.callbackServer == server {
+		m.callbackServer = nil
+	}
+	if server != nil {
+		server.Stop()
+	}
+	if m.activeSession == session {
+		m.activeSession = nil
+	}
+}
+
+// CancelAuthFlow cancels any active OAuth flow: whatever session is
+// current right now is stopped and dropped, atomically, so a flow
+// that starts after this returns is never touched by this call.
+// (The deferred cleanup in WaitForCallback is identity-checked
+// instead — see clearSessionFor — because that clear runs later,
+// after the waiter unwinds, when a retry may already be active.)
 func (m *Manager) CancelAuthFlow() {
 	m.clearSession()
 }

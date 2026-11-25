@@ -872,8 +872,14 @@ func (a *App) Startup(ctx context.Context) {
 	// shares this queue and must never start a second worker (see
 	// app/sendqueue.go). The worker's first tick is immediate, so
 	// messages queued while the app was closed (quit mid-countdown)
-	// start sending on launch.
+	// start sending on launch — but fresh rows are held until the
+	// frontend has re-emitted their Undo countdowns (re-audit
+	// finding R14): without the gate, a row due in the first seconds
+	// after launch would dispatch before NotifyStartupComplete runs
+	// ReemitPendingCountdowns and its toast ever appears. Rows whose
+	// window already elapsed, and retry-backoff rows, are not held.
 	a.sendQueue = a.newSendQueueService()
+	a.sendQueue.HoldFreshDispatchUntilCountdownsReemitted()
 	a.sendQueue.StartWorker()
 
 	// Initialize Google Contacts client for OAuth account contact search
