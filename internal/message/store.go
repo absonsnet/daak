@@ -559,7 +559,7 @@ func (s *Store) Get(id string) (*Message, error) {
 		SELECT id, account_id, folder_id, uid, message_id, in_reply_to, thread_id,
 		       subject, from_name, from_email, to_list, cc_list, bcc_list, reply_to, date,
 		       snippet, is_read, is_starred, is_answered, is_forwarded, is_draft, is_deleted,
-		       size, has_attachments, body_text, body_html, body_fetched, body_truncated,
+		       size, has_attachments, body_text, body_html, body_fetched, body_truncated, body_failed,
 		       read_receipt_to, read_receipt_handled,
 		       smime_status, smime_signer_email, smime_signer_subject,
 		       smime_encrypted, (smime_raw_body IS NOT NULL) as has_smime,
@@ -584,7 +584,7 @@ func (s *Store) Get(id string) (*Message, error) {
 		&m.ID, &m.AccountID, &m.FolderID, &uidI64, &messageID, &inReplyTo, &threadID,
 		&m.Subject, &m.FromName, &m.FromEmail, &toList, &ccList, &bccList, &replyTo, &dateStr,
 		&snippet, &m.IsRead, &m.IsStarred, &m.IsAnswered, &m.IsForwarded, &m.IsDraft, &m.IsDeleted,
-		&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated,
+		&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated, &m.BodyFailed,
 		&readReceiptTo, &m.ReadReceiptHandled,
 		&smimeStatus, &smimeSignerEmail, &smimeSignerSubject,
 		&m.SMIMEEncrypted, &m.HasSMIME,
@@ -687,7 +687,7 @@ func (s *Store) GetByUID(folderID string, uid uint32) (*Message, error) {
 		SELECT id, account_id, folder_id, uid, message_id, in_reply_to, thread_id,
 		       subject, from_name, from_email, to_list, cc_list, bcc_list, reply_to, date,
 		       snippet, is_read, is_starred, is_answered, is_forwarded, is_draft, is_deleted,
-		       size, has_attachments, body_text, body_html, body_fetched, body_truncated,
+		       size, has_attachments, body_text, body_html, body_fetched, body_truncated, body_failed,
 		       read_receipt_to, read_receipt_handled,
 		       smime_status, smime_signer_email, smime_signer_subject,
 		       smime_encrypted, (smime_raw_body IS NOT NULL) as has_smime,
@@ -712,7 +712,7 @@ func (s *Store) GetByUID(folderID string, uid uint32) (*Message, error) {
 		&m.ID, &m.AccountID, &m.FolderID, &uidI64, &messageID, &inReplyTo, &threadID,
 		&m.Subject, &m.FromName, &m.FromEmail, &toList, &ccList, &bccList, &replyTo, &dateStr,
 		&snippet, &m.IsRead, &m.IsStarred, &m.IsAnswered, &m.IsForwarded, &m.IsDraft, &m.IsDeleted,
-		&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated,
+		&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated, &m.BodyFailed,
 		&readReceiptTo, &m.ReadReceiptHandled,
 		&smimeStatus, &smimeSignerEmail, &smimeSignerSubject,
 		&m.SMIMEEncrypted, &m.HasSMIME,
@@ -1196,6 +1196,53 @@ func (s *Store) GetAllUIDs(folderID string) ([]uint32, error) {
 	return uids, nil
 }
 
+// GetDatesByUID returns the stored header Date for each requested UID in a
+// folder, in one query. UIDs with no row, or with a NULL/unparseable date,
+// map to the zero time — callers treat that as "cannot prove the message
+// is inside the sync window" (see filterPeriodDeletableUIDs in
+// internal/sync). Added for the re-audit finding R2 guard: the period
+// sync's remote listing only covers the window, so the delete loop needs
+// the local dates to tell a real expunge from old mail the listing never
+// covered.
+func (s *Store) GetDatesByUID(folderID string, uids []uint32) (map[uint32]time.Time, error) {
+	out := make(map[uint32]time.Time, len(uids))
+	if len(uids) == 0 {
+		return out, nil
+	}
+
+	placeholders := make([]string, len(uids))
+	args := make([]interface{}, len(uids)+1)
+	args[0] = folderID
+	for i, uid := range uids {
+		placeholders[i] = "?"
+		args[i+1] = uid
+	}
+
+	query := fmt.Sprintf(
+		"SELECT uid, date FROM messages WHERE folder_id = ? AND uid IN (%s)",
+		strings.Join(placeholders, ", "),
+	)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query message dates: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var uid uint32
+		var dateStr sql.NullString
+		if err := rows.Scan(&uid, &dateStr); err != nil {
+			return nil, fmt.Errorf("failed to scan message date: %w", err)
+		}
+		if dateStr.Valid && dateStr.String != "" {
+			out[uid] = parseTimeString(dateStr.String)
+		} else {
+			out[uid] = time.Time{}
+		}
+	}
+	return out, nil
+}
+
 // GetHighestUID returns the highest UID in a folder
 func (s *Store) GetHighestUID(folderID string) (uint32, error) {
 	var uid sql.NullInt64
@@ -1548,7 +1595,12 @@ type BodyUpdate struct {
 	Truncated bool
 	// Enrichment, when set, is persisted alongside the body by
 	// UpdateBodiesBatch (the body pass is where extraction runs).
-	Enrichment         *enrich.Result
+	Enrichment *enrich.Result
+	// TextPartsFailed records, at parse time, that at least one text
+	// part existed but could not be read (re-audit finding R10). It is
+	// in-memory only — no column — and only matters through
+	// HasUsableContent below.
+	TextPartsFailed    bool
 	SMIMEStatus        string
 	SMIMESignerEmail   string
 	SMIMESignerSubject string
@@ -1563,10 +1615,21 @@ type BodyUpdate struct {
 // attachments. This is the shared "resolved" definition for the body_failed
 // flag: markUnresolvedAsFailed (internal/sync) and the flag-clearing in
 // UpdateBody/UpdateBodiesBatch must agree, or a message flips between
-// flagged and cleared on every sync. In particular an attachment-only
-// message is resolved — it legitimately has no body text, and flagging it
-// would leave it permanently body-less for no reason.
+// flagged and cleared on every sync. In particular a genuinely
+// attachment-only message is resolved — it legitimately has no body text,
+// and flagging it would leave it permanently body-less for no reason.
+//
+// Re-audit finding R10 narrows that last case: attachments plus a failed
+// text part, with no body text or HTML at all, is NOT usable content —
+// the text parts existed but produced nothing, so the fetch is unresolved
+// and markUnresolvedAsFailed flags it (full-size fetch) or defers it
+// (truncated fetch), and a re-fetch that fails the same way does not
+// clear a stale flag. Text that was recovered from another part still
+// counts: the failure only matters when nothing textual came out.
 func (u BodyUpdate) HasUsableContent() bool {
+	if u.TextPartsFailed && u.BodyHTML == "" && u.BodyText == "" && !u.SMIMEEncrypted && !u.PGPEncrypted {
+		return false
+	}
 	return u.BodyHTML != "" || u.BodyText != "" || u.SMIMEEncrypted || u.PGPEncrypted || u.HasAttachments
 }
 
@@ -2812,7 +2875,7 @@ func (s *Store) GetConversation(threadID, folderID string) (*Conversation, error
 		SELECT m.id, m.account_id, m.folder_id, m.uid, m.message_id, m.in_reply_to, m.references_list, m.thread_id,
 		       m.subject, m.from_name, m.from_email, m.to_list, m.cc_list, m.bcc_list, m.reply_to, m.date,
 		       m.snippet, m.is_read, m.is_starred, m.is_answered, m.is_forwarded, m.is_draft, m.is_deleted,
-		       m.size, m.has_attachments, m.body_text, m.body_html, m.body_fetched, m.body_truncated,
+		       m.size, m.has_attachments, m.body_text, m.body_html, m.body_fetched, m.body_truncated, m.body_failed,
 		       m.read_receipt_to, m.read_receipt_handled,
 		       m.smime_status, m.smime_signer_email, m.smime_signer_subject,
 		       m.smime_encrypted, (m.smime_raw_body IS NOT NULL) as has_smime,
@@ -2851,7 +2914,7 @@ func (s *Store) GetConversation(threadID, folderID string) (*Conversation, error
 			&m.ID, &m.AccountID, &m.FolderID, &uidI64, &messageID, &inReplyTo, &references, &threadIDVal,
 			&m.Subject, &m.FromName, &m.FromEmail, &toList, &ccList, &bccList, &replyTo, &dateStr,
 			&snippetVal, &m.IsRead, &m.IsStarred, &m.IsAnswered, &m.IsForwarded, &m.IsDraft, &m.IsDeleted,
-			&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated,
+			&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated, &m.BodyFailed,
 			&readReceiptTo, &m.ReadReceiptHandled,
 			&smimeStatus, &smimeSignerEmail, &smimeSignerSubject,
 			&m.SMIMEEncrypted, &m.HasSMIME,
@@ -3513,7 +3576,7 @@ func (s *Store) GetByIDs(ids []string) ([]*Message, error) {
 		SELECT id, account_id, folder_id, uid, message_id, in_reply_to, references_list, thread_id,
 		       subject, from_name, from_email, to_list, cc_list, bcc_list, reply_to, date,
 		       snippet, is_read, is_starred, is_answered, is_forwarded, is_draft, is_deleted,
-		       size, has_attachments, body_text, body_html, body_fetched, body_truncated,
+		       size, has_attachments, body_text, body_html, body_fetched, body_truncated, body_failed,
 		       read_receipt_to, read_receipt_handled,
 		       smime_status, smime_signer_email, smime_signer_subject,
 		       smime_encrypted, (smime_raw_body IS NOT NULL) as has_smime,
@@ -3545,7 +3608,7 @@ func (s *Store) GetByIDs(ids []string) ([]*Message, error) {
 			&m.ID, &m.AccountID, &m.FolderID, &uidI64, &messageID, &inReplyTo, &references, &threadID,
 			&m.Subject, &m.FromName, &m.FromEmail, &toList, &ccList, &bccList, &replyTo, &dateStr,
 			&snippet, &m.IsRead, &m.IsStarred, &m.IsAnswered, &m.IsForwarded, &m.IsDraft, &m.IsDeleted,
-			&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated,
+			&m.Size, &m.HasAttachments, &bodyText, &bodyHTML, &m.BodyFetched, &m.BodyTruncated, &m.BodyFailed,
 			&readReceiptTo, &m.ReadReceiptHandled,
 			&smimeStatus, &smimeSignerEmail, &smimeSignerSubject,
 			&m.SMIMEEncrypted, &m.HasSMIME,

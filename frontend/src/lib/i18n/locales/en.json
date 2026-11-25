@@ -221,6 +221,8 @@
     "noContent": "No content available",
     "downloadingContent": "Downloading message content...",
     "messageTruncated": "This message was truncated because it exceeds the size limit — only the first part is shown.",
+    "bodyFailed": "The message content couldn't be downloaded, so this message may be incomplete.",
+    "retryBody": "Retry download",
     "copy": "Copy",
     "copyLink": "Copy Link",
     "selectAll": "Select All",
