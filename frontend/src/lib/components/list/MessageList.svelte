@@ -277,10 +277,13 @@
   }
 
   const waitingQueueItems = $derived(queueItems.filter((i) => i.status === 'queued' || i.status === 'sending' || i.status === 'pending'))
-  // "Send unsent now" only dispatches Mail Merge rows — normal sends
-  // go out on their own countdown, so the button enables on those.
+  // "Send unsent now" dispatches waiting Mail Merge rows and retries
+  // failed normal sends (fourth-audit finding 51) — waiting normal
+  // sends go out on their own countdown, so the button enables on
+  // Mail Merge rows waiting plus normal rows that failed.
   const waitingMailMergeItems = $derived(waitingQueueItems.filter((i) => i.kind === 'mailmerge'))
   const failedQueueItems = $derived(queueItems.filter((i) => i.status === 'failed'))
+  const failedNormalItems = $derived(failedQueueItems.filter((i) => i.kind !== 'mailmerge'))
   // Re-audit finding R24: mail that was delivered but whose Sent
   // copy could not be saved. These rows are warnings, not failures
   // — the recipient already has the mail, so there is no Retry —
@@ -376,8 +379,25 @@
   async function sendUnsentNow() {
     queueActionBusy = 'send-unsent'
     try {
+      // Failed normal sends are retried one by one (RetrySendQueueItem
+      // reuses the failed row, so no second copy is ever minted) and
+      // Mail Merge's due rows dispatch as before — the button used to
+      // touch Mail Merge only and left normal failed sends stranded
+      // (fourth-audit finding 51). Both counts are reported.
+      const normalResults = await Promise.allSettled(
+        failedNormalItems.map((item) => RetrySendQueueItem(item.id)),
+      )
+      const normalRetried = normalResults.filter((r) => r.status === 'fulfilled').length
+      const normalRetryFailed = normalResults.length - normalRetried
+      for (const r of normalResults) {
+        if (r.status === 'rejected') console.error('Retry normal send failed:', r.reason)
+      }
       const res = (await MailMerge_SendUnsent()) as MailMergeDispatchResult
-      toasts.success(`Send unsent: ${res.sent} sent, ${res.failed} failed, ${res.remaining} still queued.`)
+      let message = `Send unsent: Mail Merge ${res.sent} sent, ${res.failed} failed, ${res.remaining} still queued.`
+      if (normalResults.length > 0) {
+        message += ` Normal sends: ${normalRetried} retried, ${normalRetryFailed} could not be retried.`
+      }
+      toasts.success(message)
       await loadQueue()
     } catch (err) {
       console.error('Send unsent failed:', err)
@@ -2448,7 +2468,7 @@
         <Button
           size="sm"
           variant="outline"
-          disabled={queueActionBusy !== '' || waitingMailMergeItems.length === 0}
+          disabled={queueActionBusy !== '' || (waitingMailMergeItems.length === 0 && failedNormalItems.length === 0)}
           onclick={sendUnsentNow}
         >
           <Icon icon="mdi:send" class="w-4 h-4 mr-1.5" />
