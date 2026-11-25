@@ -19,7 +19,7 @@
   import { cn } from '$lib/utils'
   import { Button } from '$lib/components/ui/button'
   // @ts-ignore - wailsjs bindings
-  import { GetConversations, GetConversationCount, SyncFolder, ForceSyncFolder, CancelFolderSync, SetMessageListSortOrder, GetUnifiedFolderConversations, GetUnifiedFolderCount, SearchConversations, SearchUnifiedFolder, GetSearchCount, GetSearchCountUnifiedFolder, GetFTSIndexStatus, IsFTSIndexing, Trash, DeletePermanently, EmptyTrash, EmptySpam, Undo, IMAPSearchFolder, FetchServerMessage, MarkAsRead, MarkAsUnread, Archive, Star, Unstar, MarkAsSpam, MarkAsNotSpam, MoveToFolder, GetAccounts, GetCategoryCounts, GetInboxTabDefault, MailMerge_ListQueue, MailMerge_SendUnsent, MailMerge_CancelQueuedItem, ListSendQueue, RetrySendQueueItem, DeleteSendQueueItem, GetPendingFlagChangeCount, RetryPendingFlagChanges } from '../../../../wailsjs/go/app/App'
+  import { GetConversations, GetConversationCount, SyncFolder, ForceSyncFolder, CancelFolderSync, SetMessageListSortOrder, GetUnifiedFolderConversations, GetUnifiedFolderCount, SearchConversations, SearchUnifiedFolder, GetSearchCount, GetSearchCountUnifiedFolder, GetFTSIndexStatus, IsFTSIndexing, Trash, DeletePermanently, EmptyTrash, EmptySpam, Undo, IMAPSearchFolder, FetchServerMessage, MarkAsRead, MarkAsUnread, Archive, Star, Unstar, MarkAsSpam, MarkAsNotSpam, MoveToFolder, GetAccounts, GetCategoryCounts, GetInboxTabDefault, MailMerge_ListQueue, MailMerge_SendUnsent, MailMerge_CancelQueuedItem, MailMerge_GetQueueStats, ListSendQueue, GetSendQueueStats, RetrySendQueueItem, DeleteSendQueueItem, GetPendingFlagChangeCount, RetryPendingFlagChanges } from '../../../../wailsjs/go/app/App'
   import { toasts } from '$lib/stores/toast'
   import { _ } from '$lib/i18n'
   import { ConfirmDialog } from '$lib/components/ui/confirm-dialog'
@@ -245,6 +245,11 @@
   let queueItems = $state<OutboxRow[]>([])
   let queueLoading = $state(false)
   let queueError = $state<string | null>(null)
+  // True Outbox totals for the "showing X of Y" note (finding 52):
+  // the lists are capped at 500 / 1000 rows, so shown can be less
+  // than total. Stats-derived; see loadQueue.
+  let outboxShownCount = $state(0)
+  let outboxTotalCount = $state(0)
   let expandedQueueId = $state<string | null>(null)
   let queueActionBusy = $state('')
 
@@ -304,9 +309,11 @@
     queueLoading = true
     queueError = null
     try {
-      const [mmItems, sendItems] = await Promise.all([
+      const [mmItems, sendItems, mmStats, sqStats] = await Promise.all([
         MailMerge_ListQueue(),
         ListSendQueue(),
+        MailMerge_GetQueueStats(),
+        GetSendQueueStats(),
       ])
       // Sent and cancelled rows are deleted by the backend, but a
       // fallback row can survive a failed delete — filter them out
@@ -349,6 +356,18 @@
         sentAt: typeof i.sentAt === 'string' ? i.sentAt : undefined,
       }))
       queueItems = [...sendRows, ...mmRows]
+      // Both lists are capped server-side (500 normal / 1000 Mail
+      // Merge) with no paging, so rows past the cap used to vanish
+      // silently (fourth-audit finding 52). The Stats totals count
+      // every visible row — pending + failed + sent-but-unsaved for
+      // normal sends, queued + failed for Mail Merge — so the note
+      // below can say how many more exist. 'sending' rows have no
+      // Stats bucket and are transient; the max() keeps a mid-
+      // dispatch list from ever reporting a negative hidden count.
+      outboxShownCount = queueItems.length
+      const normalTotal = (sqStats?.pending ?? 0) + (sqStats?.failed ?? 0) + (sqStats?.sentUnsaved ?? 0)
+      const mmTotal = (mmStats?.queued ?? 0) + (mmStats?.failed ?? 0)
+      outboxTotalCount = Math.max(outboxShownCount, normalTotal + mmTotal)
     } catch (err) {
       console.error('Failed to load outbox queue:', err)
       queueError = $_('viewer.failedToLoadMessages')
@@ -2761,6 +2780,11 @@
           <p class="text-xs mt-1">{$_('messageList.outboxEmptyHint')}</p>
         </div>
       {:else}
+        {#if outboxTotalCount > outboxShownCount}
+          <p class="px-4 pt-3 text-xs text-muted-foreground">
+            {$_('messageList.outboxShowingMore', { values: { shown: outboxShownCount, total: outboxTotalCount, hidden: outboxTotalCount - outboxShownCount } })}
+          </p>
+        {/if}
         {#each queueGroups as group (group.key)}
           <div class="px-4 pt-3 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
             {group.label} ({group.items.length})

@@ -127,6 +127,7 @@
     "outboxEmpty": "Nothing waiting to be sent.",
     "outboxEmptyHint": "Messages waiting out their undo delay and messages queued by Mail Merge (Send later) appear here until they are sent.",
     "outboxSendUnsent": "Send unsent now",
+    "outboxShowingMore": "Showing {shown} of {total} — {hidden} more not shown.",
     "outboxCancel": "Cancel",
     "outboxUndo": "Undo send",
     "outboxRetry": "Retry",

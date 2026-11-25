@@ -1,6 +1,7 @@
 package sendqueue
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -297,6 +298,33 @@ func TestStatsCountsFailedAndSentUnsaved(t *testing.T) {
 	}
 	if st.Total != 3 || st.Pending != 1 || st.Failed != 1 || st.SentUnsaved != 1 {
 		t.Fatalf("Stats = %+v, want total 3 / pending 1 / failed 1 / sentUnsaved 1", st)
+	}
+}
+
+// TestListCapVsStatsTotal (fourth-audit finding 52): List() caps at
+// 500 rows, but Stats() must still report the true total — the
+// Outbox "showing X of Y" note reads the totals, so a capped list
+// must never masquerade as the whole queue.
+func TestListCapVsStatsTotal(t *testing.T) {
+	s := NewStore(openTestDB(t))
+	for i := 0; i < 505; i++ {
+		if err := s.Enqueue(testItem(fmt.Sprintf("q%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 500 {
+		t.Fatalf("List() = %d rows, want 500 (the cap)", len(items))
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Total != 505 || st.Pending != 505 {
+		t.Fatalf("Stats = %+v, want total 505 / pending 505", st)
 	}
 }
 
