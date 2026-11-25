@@ -450,6 +450,7 @@
     "failedToSaveSettings": "Failed to save settings.",
     "failedToSaveSetting": "Failed to save {setting}. The dialog now shows the settings as actually saved.",
     "sentSaveFailed": "“{subject}” was sent to {recipient} but no copy was saved to Sent. See the Outbox for details.",
+    "notificationFailed": "New mail arrived, but the desktop notification could not be shown: {title}",
     "failedToSave": "Failed to save.",
     "undoFailed": "Undo failed.",
     "failedToPrepare": "Failed to prepare {mode}. Opening blank composer.",

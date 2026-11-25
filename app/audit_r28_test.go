@@ -77,9 +77,11 @@ func TestR28DeniedPermissionReportedAsDenied(t *testing.T) {
 	}
 }
 
-// The one-time notice fires exactly once for a denied permission: the
-// first claim returns true and persists the flag, the second returns
-// false.
+// The one-time notice fires exactly once for a denied permission —
+// but only once DISPLAYED (fourth-audit finding 54): the check is a
+// peek that keeps returning true until the dialog opens and marks
+// it shown, so a notice claimed but never shown (app closed first)
+// is not consumed.
 func TestR28DeniedNoticeShownExactlyOnce(t *testing.T) {
 	a := newR28TestApp(t, &fakeR28Notifier{status: notification.PermissionDenied})
 
@@ -91,20 +93,42 @@ func TestR28DeniedNoticeShownExactlyOnce(t *testing.T) {
 		t.Fatal("first CheckNotificationDeniedNotice() = false, want true (denial first observed)")
 	}
 
+	// The peek does not consume the notice: a second check before
+	// the dialog opens still reports it pending.
 	second, err := a.CheckNotificationDeniedNotice()
 	if err != nil {
 		t.Fatalf("unexpected error on second check: %v", err)
 	}
-	if second {
-		t.Fatal("second CheckNotificationDeniedNotice() = true, want false (notice already shown)")
+	if !second {
+		t.Fatal("second CheckNotificationDeniedNotice() = false, want true (peek must not claim)")
 	}
 
 	shown, err := a.settingsStore.GetNotificationDeniedNoticeShown()
 	if err != nil {
 		t.Fatalf("unexpected error reading flag: %v", err)
 	}
+	if shown {
+		t.Fatal("notice flag set before the dialog opened, want false")
+	}
+
+	// The dialog opened: mark it shown, and the notice is gone.
+	if err := a.MarkNotificationDeniedNoticeShown(); err != nil {
+		t.Fatalf("MarkNotificationDeniedNoticeShown: %v", err)
+	}
+	third, err := a.CheckNotificationDeniedNotice()
+	if err != nil {
+		t.Fatalf("unexpected error on third check: %v", err)
+	}
+	if third {
+		t.Fatal("third CheckNotificationDeniedNotice() = true, want false (notice already shown)")
+	}
+
+	shown, err = a.settingsStore.GetNotificationDeniedNoticeShown()
+	if err != nil {
+		t.Fatalf("unexpected error reading flag: %v", err)
+	}
 	if !shown {
-		t.Fatal("notice flag not persisted after first claim, want true")
+		t.Fatal("notice flag not persisted after marking shown, want true")
 	}
 }
 

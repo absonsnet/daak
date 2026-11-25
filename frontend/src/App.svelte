@@ -51,7 +51,7 @@
   import { dispatchExtensionShortcut } from '$lib/stores/extensionShortcuts.svelte'
   import { initLayout, getLayoutMode, getResponsiveView, showViewer, hideViewer, showSidebar, hideSidebar, isResponsive } from '$lib/stores/layout.svelte'
   // @ts-ignore - wailsjs path
-  import { PrepareReply, GetPendingMailto, GetDraft, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, GetTermsAccepted, SetTermsAccepted, RefreshWindowConstraints, AcceptCertificate, GetStartHiddenActive, CloseWindow, QuitApp, OpenComposerWindow, OpenViewerWindow, GetSystemTheme, NotifyStartupComplete, GetOAuthBuildStatus, GetOAuthWarningDisabled, SetOAuthWarningDisabled, GetLastSeenVersion, SetLastSeenVersion, GetAppInfo, SetShowMessagePreviewPane, GetConversation, GetSpecialFolder, UndoSend, CheckNotificationDeniedNotice, OpenNotificationSettings } from '../wailsjs/go/app/App.js'
+  import { PrepareReply, GetPendingMailto, GetDraft, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, GetTermsAccepted, SetTermsAccepted, RefreshWindowConstraints, AcceptCertificate, GetStartHiddenActive, CloseWindow, QuitApp, OpenComposerWindow, OpenViewerWindow, GetSystemTheme, NotifyStartupComplete, GetOAuthBuildStatus, GetOAuthWarningDisabled, SetOAuthWarningDisabled, GetLastSeenVersion, SetLastSeenVersion, GetAppInfo, SetShowMessagePreviewPane, GetConversation, GetSpecialFolder, UndoSend, CheckNotificationDeniedNotice, MarkNotificationDeniedNoticeShown, OpenNotificationSettings } from '../wailsjs/go/app/App.js'
   // @ts-ignore - wailsjs path
   import { smtp, folder, certificate } from '../wailsjs/go/models'
   // @ts-ignore - wailsjs runtime
@@ -390,9 +390,10 @@
   let whatsNewVersion = $state('')
   let pendingWhatsNew = $state(false)
 
-  // One-time notification-denied notice state (R28). The backend claims
-  // the notice once via CheckNotificationDeniedNotice; this dialog is
-  // the only surface for it.
+  // One-time notification-denied notice state (R28, finding 54).
+  // CheckNotificationDeniedNotice only peeks — it stays true until
+  // the dialog actually opens, when MarkNotificationDeniedNoticeShown
+  // records it. This dialog is the only surface for it.
   let showNotificationDeniedDialog = $state(false)
   let pendingNotificationDenied = $state(false)
 
@@ -472,6 +473,12 @@
     if (!showTermsDialog && !showOAuthMissingDialog && !showWhatsNewDialog && pendingNotificationDenied && !showNotificationDeniedDialog) {
       showNotificationDeniedDialog = true
       pendingNotificationDenied = false
+      // The dialog is open now — only now is the one-time notice
+      // claimed (finding 54): marking it on the check used to lose
+      // the notice when the app closed before it appeared.
+      MarkNotificationDeniedNoticeShown().catch((err) => {
+        console.error('Failed to mark notification denied notice shown:', err)
+      })
     }
   })
 
@@ -591,9 +598,9 @@
 
     // Notification permission denied (R28): the backend emits this when
     // the user answers the macOS authorization prompt with "Don't
-    // Allow". Claim the one-time notice — the claim returns true
-    // exactly once, so a denial observed before mount (caught by the
-    // startup check) can never double-fire here.
+    // Allow". Peek at the one-time notice — the peek stays true until
+    // the dialog opens and marks it, so a denial observed before
+    // mount (caught by the startup check) can never double-fire here.
     EventsOn('notification:permission-denied', async () => {
       try {
         if (await CheckNotificationDeniedNotice()) {
@@ -697,6 +704,17 @@
       })
     })
 
+    // Fourth-audit finding 54: a new-mail notification the desktop
+    // could not show is not silent any more — the backend logs it at
+    // warning level and emits this event, and the toast is the
+    // in-app fallback so the user still sees the mail arrived.
+    EventsOn('notification:failed', (data: { title: string, body: string, accountId: string }) => {
+      addToast({
+        type: 'warning',
+        message: $_('toast.notificationFailed', { values: { title: data.title ?? '' } }),
+      })
+    })
+
     // A viewer popup's switcher asks the main window to open its thread
     // in another mode; the popup closes itself after sending.
     EventsOn('viewer:switch', (data: { mode: string; accountId: string; folderId: string; threadId: string }) => {
@@ -787,9 +805,10 @@
 
     // Notification-denied notice (R28): if the OS notification
     // permission is denied and the one-time notice has never been
-    // shown, claim it now so the dialog opens (deferred via $effect
-    // so Terms / OAuth / What's New resolve first). The backend
-    // returns true exactly once, so this never re-fires.
+    // shown, queue the dialog (deferred via $effect so Terms /
+    // OAuth / What's New resolve first). The check only peeks — the
+    // notice is marked shown when the dialog opens (finding 54) —
+    // so a queued notice that never appears still fires next launch.
     try {
       if (await CheckNotificationDeniedNotice()) {
         pendingNotificationDenied = true

@@ -3,10 +3,11 @@
   // (re-audit finding R28). Without it, a denied macOS permission fails
   // silently forever: new-mail notifications are dropped and the user
   // has no way to know why. Shown exactly once per install — the
-  // backend claims the notice via CheckNotificationDeniedNotice before
-  // the frontend opens this dialog. "Open System Settings" deep-links
-  // to the Notifications pane; "Not now" just dismisses it (the
-  // Settings row keeps showing the blocked state).
+  // frontend marks the notice shown when this dialog opens
+  // (fourth-audit finding 54), never on the check, so a notice that
+  // never reaches the screen is not consumed. "Open System Settings"
+  // deep-links to the Notifications pane; "Not now" just dismisses it
+  // (the Settings row keeps showing the blocked state).
   import * as AlertDialog from '$lib/components/ui/alert-dialog'
   import { Button } from '$lib/components/ui/button'
   import Icon from '@iconify/svelte'
