@@ -321,11 +321,22 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// SendMail sends an email message
-func (c *Client) SendMail(from string, to []string, msg []byte) error {
+// SendMail sends an email message. On any error the SMTP session is
+// reset (RSET) before returning, so one bad recipient cannot poison
+// the shared connection for the next row of a Mail Merge run: without
+// the reset the server stays mid-transaction (e.g. after a rejected
+// RCPT) and the following MAIL FROM fails with a stale-state error.
+// A failed reset is best-effort — the original error is what the
+// caller sees.
+func (c *Client) SendMail(from string, to []string, msg []byte) (err error) {
 	if c.client == nil {
 		return fmt.Errorf("not connected")
 	}
+	defer func() {
+		if err != nil {
+			_ = c.client.Reset()
+		}
+	}()
 
 	c.log.Info().
 		Str("from", from).

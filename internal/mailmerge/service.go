@@ -297,7 +297,12 @@ func (s *Service) Execute(ctx context.Context, req RunRequest, onProgress func(R
 	}
 
 	seenTo := map[string]bool{} // lowercased first-To addresses already sent/saved/attempted
-	sentAttempted := 0          // successful sends, for the cap
+	for _, addr := range req.AlreadySent {
+		if norm := strings.ToLower(strings.TrimSpace(addr)); norm != "" {
+			seenTo[norm] = true
+		}
+	}
+	sentAttempted := 0 // successful sends, for the cap
 	capLimit := req.CapLimit
 	if capLimit <= 0 {
 		capLimit = 100
@@ -414,6 +419,11 @@ func (s *Service) RenderForQueue(ctx context.Context, req RunRequest, onQueued f
 	}
 	rows, indices := SliceRows(req.Rows, req.StartRow, req.StopRow)
 	seenTo := map[string]bool{}
+	for _, addr := range req.AlreadySent {
+		if norm := strings.ToLower(strings.TrimSpace(addr)); norm != "" {
+			seenTo[norm] = true
+		}
+	}
 	for pos, row := range rows {
 		origIndex := indices[pos]
 		if ctx.Err() != nil {

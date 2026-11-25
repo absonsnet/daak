@@ -940,3 +940,82 @@ func TestQueueRowDeletedBeforeSentSave(t *testing.T) {
 		t.Fatalf("run after dispatch %+v, want 1 sent", run)
 	}
 }
+
+// TestReconcileQueuedRows (fourth-audit finding 14): a run-log row
+// stuck at "queued" is corrected from its queue item's fate — no item
+// at all (deleted after SMTP acceptance, log write lost) → sent; a
+// 'failed' item → failed with its last error; a still-queued item is
+// genuinely outstanding and left alone. GetRun reconciles on load, so
+// the run never reads as stuck "queued" again.
+func TestReconcileQueuedRows(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &hostmm.Run{
+		ID: "run-reconcile", AccountID: "acc1", DeliverMode: "later",
+		Status: hostmm.RunQueued, TotalRows: 3, CreatedAt: time.Now(),
+	}
+	if err := store.SaveRun(run, hostmm.RunRequest{SourceKind: "csv"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	// Row 0: queued, no queue item — the dispatcher deleted it after
+	// SMTP acceptance and the log write was lost.
+	if err := store.SaveRowResult(run.ID, hostmm.RowResult{Index: 0, Email: "a@example.com", Status: hostmm.RowQueued, Timestamp: now}); err != nil {
+		t.Fatal(err)
+	}
+	// Row 1: queued, its item failed.
+	if err := store.SaveRowResult(run.ID, hostmm.RowResult{Index: 1, Email: "b@example.com", Status: hostmm.RowQueued, Timestamp: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnqueueItem(QueuedItem{
+		ID: "q-b", RunID: run.ID, RowIndex: 1, AccountID: "acc1",
+		Recipient: "b@example.com", Status: QueueStatusFailed,
+		Attempts: 3, MaxAttempts: 3, LastError: "550 no such user",
+		RawMessage: []byte("Subject: Hi\r\n\r\nbody\r\n"),
+		CreatedAt:  now, NextAttemptAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Row 2: queued, its item is still queued — leave it alone.
+	if err := store.SaveRowResult(run.ID, hostmm.RowResult{Index: 2, Email: "c@example.com", Status: hostmm.RowQueued, Timestamp: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnqueueItem(QueuedItem{
+		ID: "q-c", RunID: run.ID, RowIndex: 2, AccountID: "acc1",
+		Recipient: "c@example.com", Status: QueueStatusQueued,
+		RawMessage:  []byte("Subject: Hi\r\n\r\nbody\r\n"),
+		MaxAttempts: 3, CreatedAt: now, NextAttemptAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := store.ReconcileQueuedRows(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("reconciled %d rows, want 2", n)
+	}
+	got, err := store.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Rows) != 3 {
+		t.Fatalf("rows %+v", got.Rows)
+	}
+	if got.Rows[0].Status != hostmm.RowSent {
+		t.Fatalf("row 0 status %q, want sent (queue item gone after send)", got.Rows[0].Status)
+	}
+	if got.Rows[1].Status != hostmm.RowFailed || got.Rows[1].Error != "550 no such user" {
+		t.Fatalf("row 1 %+v, want failed with the item's last error", got.Rows[1])
+	}
+	if got.Rows[2].Status != hostmm.RowQueued {
+		t.Fatalf("row 2 status %q, want queued (still outstanding)", got.Rows[2].Status)
+	}
+	// Reconciling again is a no-op.
+	if n, err := store.ReconcileQueuedRows(run.ID); err != nil || n != 0 {
+		t.Fatalf("second reconcile n=%d err=%v, want 0", n, err)
+	}
+}

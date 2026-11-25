@@ -65,6 +65,15 @@ type RunRequest struct {
 	CapLimit      int                 `json:"capLimit"`
 	AccountID     string              `json:"accountId"`
 	AttachmentDir string              `json:"attachmentDir"`
+	// AlreadySent seeds duplicate suppression when a run is resumed
+	// (or a held batch is sent): the lowercased first-To addresses
+	// the original run already sent / draft-saved — and, for "later"
+	// runs, the addresses still queued. Without the seed, a resumed
+	// run re-sends an address the original run already delivered to
+	// via a different row (the duplicate check only covers the
+	// current run). Not persisted with the stored request; the bridge
+	// fills it in when it builds the resume/batch sub-request.
+	AlreadySent []string `json:"alreadySent,omitempty"`
 }
 
 // RowStatus values for one row's outcome.

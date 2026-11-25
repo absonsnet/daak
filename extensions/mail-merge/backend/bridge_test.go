@@ -36,6 +36,9 @@ type fakeSender struct {
 	// treats as failed — the lost-acknowledgement case.
 	sentRaw []string
 	fail    map[string]error
+	// failOnce fails the next send to this address only, then
+	// succeeds: a transient mid-send failure for one row.
+	failOnce map[string]error
 	// failAfterSend, when set for a recipient, records the bytes and
 	// then returns the error: the server accepted DATA but the ack
 	// was lost, so the worker must retry with identical bytes.
@@ -45,6 +48,10 @@ type fakeSender struct {
 func (f *fakeSender) SendMail(_ string, to []string, raw []byte) error {
 	for _, rcpt := range to {
 		if err, ok := f.fail[rcpt]; ok {
+			return err
+		}
+		if err, ok := f.failOnce[rcpt]; ok {
+			delete(f.failOnce, rcpt)
 			return err
 		}
 	}
@@ -804,4 +811,154 @@ func TestExtensionRegister(t *testing.T) {
 	if !found {
 		t.Fatalf("capabilities %v", m.Capabilities)
 	}
+}
+
+// TestResumeRun_DoesNotResendAlreadySentAddress (fourth-audit finding
+// 8): a failed row does not mark its address as seen, so a later row
+// to the same address is delivered — and resuming the failed row must
+// NOT send that address a second time. The resume seeds its duplicate
+// list with the addresses the original run already sent, so the
+// failed row is skipped as a duplicate instead of re-sent.
+func TestResumeRun_DoesNotResendAlreadySentAddress(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	env.sender.failOnce = map[string]error{"alice@example.com": errors.New("transient SMTP failure")}
+	rows := []map[string]string{
+		{"FirstName": "Alice", "LastName": "One", "Email": "alice@example.com"},
+		{"FirstName": "Alice", "LastName": "Two", "Email": "alice@example.com"},
+	}
+	runID, err := env.bridge.MailMerge_StartRun(hostmm.RunRequest{
+		Template: testBridgeTemplate(), Rows: rows,
+		DeliverMode: "send", AccountID: "acc1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRun(t, env.bridge, runID)
+	if len(run.Rows) != 2 {
+		t.Fatalf("run rows %+v", run.Rows)
+	}
+	if run.Rows[0].Status != hostmm.RowFailed {
+		t.Fatalf("row 0 status %q, want failed (transient)", run.Rows[0].Status)
+	}
+	if run.Rows[1].Status != hostmm.RowSent {
+		t.Fatalf("row 1 status %q, want sent", run.Rows[1].Status)
+	}
+	if len(env.sender.sent) != 1 || env.sender.sent[0] != "alice@example.com" {
+		t.Fatalf("sent %v, want exactly one send to alice", env.sender.sent)
+	}
+
+	resumedID, err := env.bridge.MailMerge_ResumeRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed := waitForRun(t, env.bridge, resumedID)
+	var resumedRow *hostmm.RowResult
+	for i := range resumed.Rows {
+		if resumed.Rows[i].Index == 0 {
+			resumedRow = &resumed.Rows[i]
+		}
+	}
+	if resumedRow == nil {
+		t.Fatalf("resumed run rows %+v, want a row for original index 0", resumed.Rows)
+	}
+	if resumedRow.Status != hostmm.RowSkipped {
+		t.Fatalf("resumed row 0 status %q, want skipped (duplicate of already-sent alice)", resumedRow.Status)
+	}
+	if len(env.sender.sent) != 1 {
+		t.Fatalf("sent %v after resume, want still exactly one send — alice was sent twice", env.sender.sent)
+	}
+}
+
+// TestResumeLaterRun_DeletesOldFailedQueueItem (fourth-audit finding
+// 9): resuming a "Send later" run re-renders the failed rows and
+// enqueues fresh items carrying the same Message-IDs — the old failed
+// queue items must be gone, or the address gets the mail twice (once
+// from the resumed copy, once from a later retry of the failed copy).
+func TestResumeLaterRun_DeletesOldFailedQueueItem(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	fakeNow := time.Now().UTC().Truncate(time.Second)
+	env.bridge.nowFunc = func() time.Time { return fakeNow }
+	env.sender.fail["jane@example.com"] = errors.New("452 too many emails")
+
+	rows := testBridgeRows()[:2] // john (ok), jane (fails)
+	runID := startLaterRun(t, env, rows)
+	oldJane := findQueueItem(t, env.bridge, runID, "jane@example.com")
+	oldFull, err := env.bridge.store.GetQueueItemForSend(oldJane.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldMessageID := messageIDHeader(oldFull.RawMessage)
+
+	// Drive jane's item to 'failed' (3 attempts, advancing past the
+	// backoff each time), exactly like TestQueueRetryFailedAndMaxAttempts.
+	for attempt := 1; attempt <= 3; attempt++ {
+		if _, err := env.bridge.MailMerge_SendUnsent(); err != nil {
+			t.Fatal(err)
+		}
+		if attempt < 3 {
+			fakeNow = fakeNow.Add(time.Duration(attempt+1) * time.Minute)
+		}
+	}
+	jane := findQueueItem(t, env.bridge, runID, "jane@example.com")
+	if jane.Status != QueueStatusFailed {
+		t.Fatalf("jane after 3 attempts %+v, want failed", jane)
+	}
+
+	delete(env.sender.fail, "jane@example.com")
+	resumedID, err := env.bridge.MailMerge_ResumeRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRun(t, env.bridge, resumedID)
+
+	// Exactly one queue item for jane may exist, under the resumed
+	// run, carrying the same Message-ID as the failed original.
+	items, err := env.bridge.MailMerge_ListQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var janes []QueuedItem
+	for _, it := range items {
+		if it.Recipient == "jane@example.com" {
+			janes = append(janes, it)
+		}
+	}
+	if len(janes) != 1 {
+		t.Fatalf("queue items for jane: %d %+v, want exactly 1", len(janes), janes)
+	}
+	if janes[0].RunID != resumedID {
+		t.Fatalf("jane item run %q, want resumed run %q", janes[0].RunID, resumedID)
+	}
+	newFull, err := env.bridge.store.GetQueueItemForSend(janes[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messageIDHeader(newFull.RawMessage); got != oldMessageID {
+		t.Fatalf("resumed Message-ID %q, want the original %q", got, oldMessageID)
+	}
+
+	// Dispatching sends jane exactly once.
+	if _, err := env.bridge.MailMerge_SendUnsent(); err != nil {
+		t.Fatal(err)
+	}
+	janeSends := 0
+	for _, rcpt := range env.sender.sent {
+		if rcpt == "jane@example.com" {
+			janeSends++
+		}
+	}
+	if janeSends != 1 {
+		t.Fatalf("jane sent %d times, want 1", janeSends)
+	}
+}
+
+// messageIDHeader extracts the Message-ID header value from rendered
+// RFC822 bytes ("" when absent).
+func messageIDHeader(raw []byte) string {
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "message-id:") {
+			return strings.TrimSpace(line[len("Message-ID:"):])
+		}
+	}
+	return ""
 }
