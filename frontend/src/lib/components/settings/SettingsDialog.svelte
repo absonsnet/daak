@@ -98,6 +98,13 @@
   let showRestartDialog = $state(false)
   let loading = $state(true)
   let saving = $state(false)
+  // Names of the settings whose load failed in the last loadSettings
+  // run. While non-empty, Save is disabled: a failed load must never
+  // be answered by writing the dialog's hardcoded initial values
+  // back over the user's stored settings (fourth-audit finding 11).
+  // NOTE: the banner below is plain English until i18n keys exist.
+  let loadErrors = $state<string[]>([])
+  let loadFailed = $derived(loadErrors.length > 0)
   let activeTab = $state('general')
 
   // Live theme preview: apply the picker's current value to the document
@@ -133,110 +140,91 @@
   async function loadSettings() {
     loading = true
     hasSaved = false
-    try {
-      const [policy, delayMs, density, theme, titleBar, runBg, startHid, showBadge, autoSt, lang, comp, mail, compFmt, undoDelay, nativeTB, alwaysImages, darkMail, darkComposer, accentBar, accentStyle, listCircles, listProfilePics, alwaysCheckbox, viewerCircles, scEnabled, scLangs, wcSide, previewPane, openMode, chipMode, otpClearSecs, attnEnabled, attnCode, attnFlight, attnPayment, attnDelivery, inboxTab, trSettings, notifPerm] = await Promise.all([
-        GetReadReceiptResponsePolicy(),
-        GetMarkAsReadDelay(),
-        GetMessageListDensity(),
-        GetThemeMode(),
-        GetShowTitleBar(),
-        GetRunBackground(),
-        GetStartHidden(),
-        GetShowUnreadBadge(),
-        GetAutostart(),
-        GetLanguage(),
-        GetComposerMode(),
-        GetMailtoMode(),
-        GetComposerFormat(),
-        GetUndoSendDelay(),
-        GetNativeTitleBar(),
-        GetAlwaysLoadImages(),
-        GetDarkMailContent(),
-        GetDarkComposerBody(),
-        GetAccentBarUnread(),
-        GetAccentUnreadStyle(),
-        GetShowMessageListCircles(),
-        GetShowMessageListProfilePics(),
-        GetAlwaysShowMessageCheckbox(),
-        GetShowViewerCircles(),
-        GetSpellcheckEnabled(),
-        GetSpellcheckLanguages(),
-        GetWindowControlsSide(),
-        GetShowMessagePreviewPane(),
-        GetMessageOpenMode(),
-        GetCodeChipClickMode(),
-        GetOtpClipboardClearSeconds(),
-        GetAttentionEnabled(),
-        GetAttentionTypeEnabled('verification_code'),
-        GetAttentionTypeEnabled('flight_changed'),
-        GetAttentionTypeEnabled('payment_failed'),
-        GetAttentionTypeEnabled('delivery_problem'),
-        GetInboxTabDefault(),
-        GetTranslationSettings(''),
-        GetNotificationPermissionStatus(),
-      ])
-      readReceiptResponsePolicy = policy
-      // Convert ms to seconds for display
-      markAsReadDelaySeconds = delayMs < 0 ? -1 : delayMs / 1000
-      messageListDensity = density
-      themeMode = theme
-      originalThemeMode = theme
-      showTitleBar = titleBar
-      runBackground = runBg
-      startHidden = startHid
-      showUnreadBadge = showBadge ?? true
-      autostart = autoSt
-      language = lang
-      composerMode = comp || 'inline'
-      mailtoMode = mail || 'inline'
-      composerFormat = compFmt || 'rich'
-      undoSendDelay = undoDelay ?? 5
-      spellcheckEnabled = scEnabled ?? true
-      // Empty stored list = "use defaults" — show the same set the engine uses.
-      spellcheckLanguages = (scLangs && scLangs.length) ? scLangs : defaultSpellcheckLanguages()
-      nativeTitleBar = nativeTB ?? false
-      windowControlsSide = wcSide || 'auto'
-      alwaysLoadImages = alwaysImages ?? false
-      darkMailContent = darkMail ?? false
-      darkComposerBody = darkComposer ?? false
-      accentBarUnread = accentBar ?? false
-      accentUnreadStyle = accentStyle || 'dot'
-      showMessageListCircles = listCircles ?? true
-      showMessageListProfilePics = listProfilePics ?? false
-      alwaysShowMessageCheckbox = alwaysCheckbox ?? false
-      showViewerCircles = viewerCircles ?? true
-      showMessagePreviewPane = previewPane ?? true
-      messageOpenMode = openMode || 'tab'
-      hideUnifiedSingleAccount = getHideUnifiedSingleAccount()
-      codeChipClickMode = chipMode || 'copy_mark_read_delete'
-      otpClipboardClearSeconds = otpClearSecs ?? 60
-      attentionEnabled = attnEnabled ?? true
-      attentionTypeVerificationCode = attnCode ?? true
-      attentionTypeFlightChanged = attnFlight ?? true
-      attentionTypePaymentFailed = attnPayment ?? true
-      attentionTypeDeliveryProblem = attnDelivery ?? true
-      inboxTabDefault = inboxTab || 'all'
-      notificationPermission = notifPerm ?? null
-      if (trSettings) {
-        translateEnabled = trSettings.enabled ?? true
-        translateMode = trSettings.mode || 'prefer_offline'
-        translateTargetLanguage = trSettings.targetLanguage || 'system'
-        translateOnlineProvider = trSettings.onlineProvider || 'google'
-        translateConsentGoogle = trSettings.consents?.google ?? false
-        translateConsentDeepL = trSettings.consents?.deepl ?? false
-        deeplKeySet = trSettings.deeplKeySet ?? false
-        deeplKeyInput = ''
-        deeplKeyCleared = false
+    loadErrors = []
+    // Each setting loads independently (allSettled, not Promise.all):
+    // one failed getter used to abort the whole load, leaving the
+    // dialog showing its hardcoded initial values — and Save then
+    // wrote every one of those defaults back over the user's stored
+    // settings. Now a failed getter is recorded in loadErrors and
+    // its variable is left untouched (it keeps the store-initialised
+    // stored value), and Save stays disabled until every load
+    // succeeds. The `??` / `||` fallbacks below are only for getters
+    // that SUCCEED with a null/empty stored value, never for a
+    // failed load.
+    const loads: Array<[string, Promise<unknown>, (v: never) => void]> = [
+      ['read receipt policy', GetReadReceiptResponsePolicy(), (v) => { readReceiptResponsePolicy = v as string }],
+      ['mark-as-read delay', GetMarkAsReadDelay(), (v) => { markAsReadDelaySeconds = (v as number) < 0 ? -1 : (v as number) / 1000 }],
+      ['message list density', GetMessageListDensity(), (v) => { messageListDensity = v as string }],
+      ['theme', GetThemeMode(), (v) => { themeMode = v as string; originalThemeMode = v as string }],
+      ['title bar', GetShowTitleBar(), (v) => { showTitleBar = v as boolean }],
+      ['run in background', GetRunBackground(), (v) => { runBackground = v as boolean }],
+      ['start hidden', GetStartHidden(), (v) => { startHidden = v as boolean }],
+      ['unread badge', GetShowUnreadBadge(), (v) => { showUnreadBadge = (v as boolean) ?? true }],
+      ['autostart', GetAutostart(), (v) => { autostart = v as boolean }],
+      ['language', GetLanguage(), (v) => { language = v as string }],
+      ['composer mode', GetComposerMode(), (v) => { composerMode = (v as string) || 'inline' }],
+      ['mailto mode', GetMailtoMode(), (v) => { mailtoMode = (v as string) || 'inline' }],
+      ['composer format', GetComposerFormat(), (v) => { composerFormat = (v as string) || 'rich' }],
+      ['undo send delay', GetUndoSendDelay(), (v) => { undoSendDelay = (v as number) ?? 5 }],
+      ['native title bar', GetNativeTitleBar(), (v) => { nativeTitleBar = (v as boolean) ?? false }],
+      ['always load images', GetAlwaysLoadImages(), (v) => { alwaysLoadImages = (v as boolean) ?? false }],
+      ['dark mail content', GetDarkMailContent(), (v) => { darkMailContent = (v as boolean) ?? false }],
+      ['dark composer body', GetDarkComposerBody(), (v) => { darkComposerBody = (v as boolean) ?? false }],
+      ['accent bar for unread', GetAccentBarUnread(), (v) => { accentBarUnread = (v as boolean) ?? false }],
+      ['accent unread style', GetAccentUnreadStyle(), (v) => { accentUnreadStyle = (v as string) || 'dot' }],
+      ['message list circles', GetShowMessageListCircles(), (v) => { showMessageListCircles = (v as boolean) ?? true }],
+      ['message list profile pictures', GetShowMessageListProfilePics(), (v) => { showMessageListProfilePics = (v as boolean) ?? false }],
+      ['always show message checkbox', GetAlwaysShowMessageCheckbox(), (v) => { alwaysShowMessageCheckbox = (v as boolean) ?? false }],
+      ['viewer circles', GetShowViewerCircles(), (v) => { showViewerCircles = (v as boolean) ?? true }],
+      ['spellcheck', GetSpellcheckEnabled(), (v) => { spellcheckEnabled = (v as boolean) ?? true }],
+      ['spellcheck languages', GetSpellcheckLanguages(), (v) => { const langs = v as string[]; spellcheckLanguages = (langs && langs.length) ? langs : defaultSpellcheckLanguages() }],
+      ['window controls side', GetWindowControlsSide(), (v) => { windowControlsSide = (v as string) || 'auto' }],
+      ['message preview pane', GetShowMessagePreviewPane(), (v) => { showMessagePreviewPane = (v as boolean) ?? true }],
+      ['message open mode', GetMessageOpenMode(), (v) => { messageOpenMode = (v as string) || 'tab' }],
+      ['code chip click mode', GetCodeChipClickMode(), (v) => { codeChipClickMode = (v as string) || 'copy_mark_read_delete' }],
+      ['OTP clipboard clear delay', GetOtpClipboardClearSeconds(), (v) => { otpClipboardClearSeconds = (v as number) ?? 60 }],
+      ['attention', GetAttentionEnabled(), (v) => { attentionEnabled = (v as boolean) ?? true }],
+      ['attention: verification codes', GetAttentionTypeEnabled('verification_code'), (v) => { attentionTypeVerificationCode = (v as boolean) ?? true }],
+      ['attention: flight changes', GetAttentionTypeEnabled('flight_changed'), (v) => { attentionTypeFlightChanged = (v as boolean) ?? true }],
+      ['attention: payment failures', GetAttentionTypeEnabled('payment_failed'), (v) => { attentionTypePaymentFailed = (v as boolean) ?? true }],
+      ['attention: delivery problems', GetAttentionTypeEnabled('delivery_problem'), (v) => { attentionTypeDeliveryProblem = (v as boolean) ?? true }],
+      ['inbox tab default', GetInboxTabDefault(), (v) => { inboxTabDefault = (v as string) || 'all' }],
+      ['translation settings', GetTranslationSettings(''), (v) => {
+        const tr = v as { enabled?: boolean; mode?: string; targetLanguage?: string; onlineProvider?: string; consents?: { google?: boolean; deepl?: boolean }; deeplKeySet?: boolean } | null
+        if (tr) {
+          translateEnabled = tr.enabled ?? true
+          translateMode = tr.mode || 'prefer_offline'
+          translateTargetLanguage = tr.targetLanguage || 'system'
+          translateOnlineProvider = tr.onlineProvider || 'google'
+          translateConsentGoogle = tr.consents?.google ?? false
+          translateConsentDeepL = tr.consents?.deepl ?? false
+          deeplKeySet = tr.deeplKeySet ?? false
+          deeplKeyInput = ''
+          deeplKeyCleared = false
+        }
+      }],
+      ['notification permission', GetNotificationPermissionStatus(), (v) => { notificationPermission = (v as { status: string; platform: string; canOpenSystemSettings: boolean }) ?? null }],
+      ['hide unified when single account', Promise.resolve(getHideUnifiedSingleAccount()), (v) => { hideUnifiedSingleAccount = v as boolean }],
+    ]
+    const results = await Promise.allSettled(loads.map(([, p]) => p))
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i]
+      if (r.status === 'fulfilled') {
+        loads[i][2](r.value as never)
+      } else {
+        loadErrors.push(loads[i][0])
+        console.error(`Failed to load setting "${loads[i][0]}":`, r.reason)
       }
-      originalNativeTitleBar = nativeTitleBar
-    } catch (err) {
-      console.error('Failed to load settings:', err)
-    } finally {
-      loading = false
     }
+    originalNativeTitleBar = nativeTitleBar
+    loading = false
   }
 
   async function handleSave() {
+    // Defence in depth: the Save button is disabled while any load
+    // failed, but a programmatic call must not write defaults over
+    // stored settings either.
+    if (loadFailed) return
     saving = true
     // The display name of the setting whose save failed, if any —
     // named in the error toast so a partial save is not a generic
@@ -419,6 +407,14 @@
         <Icon icon="mdi:loading" class="w-6 h-6 animate-spin text-muted-foreground" />
       </div>
     {:else}
+      {#if loadFailed}
+        <div class="mb-4 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm" role="alert">
+          <p class="font-medium">Some settings could not be loaded ({loadErrors.join(', ')}). Saving is disabled until they load, so your current settings are not overwritten with defaults.</p>
+          <Button variant="outline" size="sm" class="mt-2" onclick={loadSettings}>
+            Retry loading settings
+          </Button>
+        </div>
+      {/if}
       <Tabs.Root bind:value={activeTab} class="w-full">
         <!-- Two rows of six: eleven icon+text tabs no longer fit one row
              without the labels running into each other. h-auto overrides
@@ -632,7 +628,7 @@
           <Button variant="ghost" onclick={handleCancel} disabled={saving}>
             {$_('common.cancel')}
           </Button>
-          <Button onclick={handleSave} disabled={saving}>
+          <Button onclick={handleSave} disabled={saving || loading || loadFailed}>
             {#if saving}
               <Icon icon="mdi:loading" class="w-4 h-4 mr-2 animate-spin" />
             {/if}
