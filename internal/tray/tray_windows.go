@@ -35,11 +35,23 @@ import (
 // the tap handler and all five menu items are registered; a timeout
 // only means this call does not wait for the tray — a late start
 // still brings it up afterwards.
-func startTrayWindows(onReady, onExit func(), ready <-chan struct{}) bool {
+//
+// onRunReturn is called when systray.Run returns — i.e. the tray's
+// message loop has ended and the icon is gone. The library calls
+// onExit on the normal exit paths (Quit, window destroyed, session
+// ending), but a message-loop failure (GetMessage returning -1) ends
+// the loop without ever calling onExit, so the return is the only
+// signal for that death. Calling it is safe on every path: it is
+// guarded to run once per start attempt, and onExit already called
+// it on the paths where both fire.
+func startTrayWindows(onReady, onExit func(), ready <-chan struct{}, onRunReturn func()) bool {
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		systray.Run(onReady, onExit)
+		if onRunReturn != nil {
+			onRunReturn()
+		}
 	}()
 	return waitForReady(ready, 5*time.Second)
 }

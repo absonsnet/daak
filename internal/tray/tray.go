@@ -24,6 +24,16 @@
 // window with no way back). The icon disappears when the app really
 // quits (Stop, called from App.Shutdown; process exit removes it
 // regardless).
+//
+// Death: the tray can also die mid-session without a Quit — the run
+// loop exits (window destroyed, session ending, message-loop failure)
+// and the library calls onExit. That closes Done() and flips Alive()
+// to false, so the app can tell a dead tray from a live one instead
+// of trusting the once-only started flag. A dead tray is NOT
+// restarted in-process: the library's Quit is once-only (quitOnce)
+// and re-registering the tray is untested native state on all three
+// platforms, so the only safe response is to stop hiding the window
+// on close and fall back to a real quit.
 package tray
 
 import (
@@ -76,6 +86,14 @@ type Tray struct {
 	started bool
 	end     func()
 
+	// done is closed when the tray's run loop exits (see Start). It is
+	// created fresh by each Start attempt, so a failed start that is
+	// retried gets a new channel. The closer is a per-attempt closure
+	// in Start that captures its own channel — a method on the struct
+	// could not tell a late exit of an earlier attempt from the exit
+	// of the current one, and would close the wrong channel.
+	done chan struct{}
+
 	// Unread badge state. The badge is the unified-inbox unread count
 	// shown on the OS chrome: the macOS Dock icon (badgeLabel), the
 	// Windows taskbar button (overlay icon) and the tray icon itself
@@ -102,6 +120,42 @@ func New() *Tray {
 	return &Tray{badgeLastCount: -1, badgeEnabled: true}
 }
 
+// Done returns a channel that is closed when the tray's run loop exits.
+// It is nil before the first Start — a nil channel blocks forever in a
+// select, which is the correct "never exits" reading for a tray that
+// never started. Callers that only need the current state want Alive().
+func (t *Tray) Done() <-chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.done
+}
+
+// Alive reports whether the tray icon is currently up: Start succeeded
+// AND the run loop has not exited since. This is the check the close
+// paths must use — the started flag alone is set once at startup and
+// never cleared, so it still claims the tray is up after the tray has
+// died mid-session. No polling: this is a single non-blocking channel
+// read, taken only when the caller is deciding whether hiding the
+// window is safe.
+func (t *Tray) Alive() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.aliveLocked()
+}
+
+// aliveLocked is Alive without the lock; the caller holds mu.
+func (t *Tray) aliveLocked() bool {
+	if !t.started || t.done == nil {
+		return false
+	}
+	select {
+	case <-t.done:
+		return false
+	default:
+		return true
+	}
+}
+
 // Start shows the tray icon. It is idempotent: later calls are no-ops.
 // iconICO is the Windows .ico bytes, iconPNG the PNG bytes used on
 // macOS/Linux; either may be empty, in which case the library's default
@@ -119,20 +173,42 @@ func New() *Tray {
 // must never crash startup. Note this only catches Go panics, not a
 // native crash — the real crash guard is invokeTrayStart, which runs the
 // library's native start on the macOS main thread.
+//
+// A later call after the tray has died mid-session also returns false
+// (Alive is re-checked, not just the started flag): a dead tray cannot
+// be restarted in-process — the library's Quit is once-only and its
+// Windows window class cannot be re-registered — so the caller must
+// fall back to a real quit instead of believing the tray is back.
 func (t *Tray) Start(iconICO, iconPNG []byte, onShow, onQuit, onCompose, onCheckMail, onSettings func()) (ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.started {
-		return true
+		// Already up — or already dead. A live tray is a no-op true;
+		// a dead one reports false so the caller never hides the
+		// window on the strength of a stale start.
+		return t.aliveLocked()
 	}
 
 	log := logging.WithComponent("tray")
+
+	// markExited closes this attempt's done channel, recording that
+	// the tray's run loop has exited. Assigned once done is created
+	// below; nil until then. It is a per-attempt closure (see the done
+	// field comment) and is invoked from onExit, from the Windows
+	// start path when systray.Run returns, and from the panic recovery
+	// below. It never takes mu, so onExit cannot deadlock against a
+	// caller that holds mu while invoking the library (Stop calls the
+	// library's Quit under mu, and Quit runs onExit synchronously).
+	var markExited func()
 
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error().Interface("panic", r).Msg("System tray failed to start; continuing without it")
 			t.started = false
 			t.end = nil
+			if markExited != nil {
+				markExited()
+			}
 			ok = false
 		}
 	}()
@@ -151,6 +227,18 @@ func (t *Tray) Start(iconICO, iconPNG []byte, onShow, onQuit, onCompose, onCheck
 	}
 
 	t.started = true
+	// A fresh exit channel for this start attempt. A retry after a
+	// failed start gets a new one; the old channel is simply abandoned
+	// (nobody waits on it — liveness is only ever read via Alive()).
+	// The closer captures this channel and a once guard of its own, so
+	// a late exit from an earlier attempt can never close a later
+	// attempt's channel.
+	done := make(chan struct{})
+	var exitOnce sync.Once
+	markExited = func() {
+		exitOnce.Do(func() { close(done) })
+	}
+	t.done = done
 	t.baseIconICO = iconICO
 	t.baseIconPNG = iconPNG
 	icon := iconPNG
@@ -232,6 +320,13 @@ func (t *Tray) Start(iconICO, iconPNG []byte, onShow, onQuit, onCompose, onCheck
 	}
 	onExit := func() {
 		log.Info().Msg("System tray icon hidden")
+		// The run loop has exited — from here on the icon is gone,
+		// whether this was a real Quit or a mid-session death (the
+		// window destroyed, the session ending). Record it so Alive()
+		// stops claiming the tray is up; the close paths then fall
+		// back to a real quit instead of hiding the window with no
+		// way back. Never takes mu (see markExited above).
+		markExited()
 	}
 	// Windows: the tray window and its message pump must run on the
 	// same OS thread (Win32 delivers a window's messages to the
@@ -242,7 +337,7 @@ func (t *Tray) Start(iconICO, iconPNG []byte, onShow, onQuit, onCompose, onCheck
 	// startTrayWindows runs systray.Run from a dedicated locked
 	// thread instead, so window creation and pumping share the thread.
 	if runtime.GOOS == "windows" {
-		if !startTrayWindows(onReady, onExit, readyCh) {
+		if !startTrayWindows(onReady, onExit, readyCh, markExited) {
 			log.Warn().Msg("System tray did not start on its thread in time; continuing without it")
 			t.started = false
 			return false
