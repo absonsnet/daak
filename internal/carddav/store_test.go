@@ -2,10 +2,13 @@ package carddav
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/absonsnet/daak/internal/contact"
 	"github.com/absonsnet/daak/internal/database"
 )
 
@@ -234,7 +237,7 @@ func TestListContactsPaged_DefaultsLimit(t *testing.T) {
 		contacts[i] = &Contact{
 			ID:          string(rune('A'+i/26)) + string(rune('a'+i%26)),
 			Email:       string(rune('a'+i%26)) + "@x",
-			DisplayName: string(rune('A'+i%26)),
+			DisplayName: string(rune('A' + i%26)),
 		}
 	}
 	seedSource(t, s, "src1", "ab1", true, true, contacts)
@@ -453,5 +456,57 @@ func assertCount(t *testing.T, db *database.DB, query string, want int, args ...
 	}
 	if got != want {
 		t.Errorf("count: query=%q want=%d got=%d args=%v", query, want, got, args)
+	}
+}
+
+// Audit4 finding 26: when the server accepts the PUT but the local
+// mirror write fails, CreateRecord must return a distinct
+// ErrLocalMirrorFailed — the contact exists on the server exactly once,
+// and the caller must not retry in another address book (that would
+// create a second server copy).
+func TestCreateRecord_LocalMirrorFailureIsTyped(t *testing.T) {
+	db := openCardDAVTestDB(t)
+	s := NewStore(db.DB)
+	seedSource(t, s, "src1", "ab1", true, true, nil)
+
+	puts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PUT" {
+			puts++
+		}
+		w.Header().Set("ETag", `"etag-1"`)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	client, err := NewClient(srv.URL, "user", "pass")
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Break the local mirror only: drop the state table so the
+	// post-PUT insert fails while the server PUT still succeeds.
+	if _, err := db.Exec("DROP TABLE carddav_record_state"); err != nil {
+		t.Fatalf("drop state table: %v", err)
+	}
+
+	rec := &contact.Record{
+		Fn:     "Ada Lovelace",
+		Emails: []contact.RecordEmail{{Email: "ada@example.com", IsPrimary: true}},
+	}
+	if _, err := s.CreateRecord("ab1", rec, client); !IsLocalMirrorFailed(err) {
+		t.Fatalf("CreateRecord with broken local mirror = %v, want ErrLocalMirrorFailed", err)
+	}
+	if puts != 1 {
+		t.Fatalf("server PUTs = %d, want exactly 1", puts)
+	}
+	// The failed local tx rolled back: no local record either.
+	// (Query the contacts table directly: the email lookup joins the
+	// state table this test dropped to force the failure.)
+	var localCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM contact_records WHERE fn = ?", "Ada Lovelace").Scan(&localCount); err != nil {
+		t.Fatalf("count local records: %v", err)
+	}
+	if localCount != 0 {
+		t.Fatalf("local records for Ada = %d, want 0 (rolled back)", localCount)
 	}
 }

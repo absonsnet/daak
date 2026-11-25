@@ -426,6 +426,16 @@ func (ops *composeOps) saveRecipientsToCardDAVContacts(ctx context.Context, acc 
 			attempt.ID = ""
 			if _, err := ops.carddavStore.CreateRecord(ab.ID, &attempt, client); err != nil {
 				lastErr = err
+				if carddav.IsLocalMirrorFailed(err) {
+					// Fourth-audit finding 26: the server accepted
+					// the PUT but the local mirror write failed.
+					// The contact exists on the server exactly once
+					// — trying the next book would create a second
+					// server copy. Stop here, report the single
+					// failure; the next sync picks the contact up.
+					log.Warn().Err(err).Str("email", r.email).Str("addressbook", ab.Name).Msg("CardDAV contact saved on server but local mirror failed — not retrying in another book")
+					break
+				}
 				if carddav.IsWriteForbidden(err) {
 					// The server has positively shown this
 					// book read-only: remember it, skip it

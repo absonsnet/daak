@@ -1086,12 +1086,12 @@ func (s *Store) CreateRecord(addressbookID string, rec *contact.Record, client *
 
 	tx, err := s.db.Begin()
 	if err != nil {
-		return "", fmt.Errorf("CreateRecord: begin tx: %w", err)
+		return "", &ErrLocalMirrorFailed{Err: fmt.Errorf("CreateRecord: begin tx: %w", err)}
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	if err := contact.UpsertRecordTx(tx, rec); err != nil {
-		return "", fmt.Errorf("CreateRecord: upsert local record: %w", err)
+		return "", &ErrLocalMirrorFailed{Err: fmt.Errorf("CreateRecord: upsert local record: %w", err)}
 	}
 
 	now := time.Now()
@@ -1099,11 +1099,11 @@ func (s *Store) CreateRecord(addressbookID string, rec *contact.Record, client *
 		INSERT INTO carddav_record_state (record_id, addressbook_id, href, etag, synced_at)
 		VALUES (?, ?, ?, ?, ?)
 	`, rec.ID, addressbookID, href, newETag, now); err != nil {
-		return "", fmt.Errorf("CreateRecord: insert state: %w", err)
+		return "", &ErrLocalMirrorFailed{Err: fmt.Errorf("CreateRecord: insert state: %w", err)}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return "", fmt.Errorf("CreateRecord: commit: %w", err)
+		return "", &ErrLocalMirrorFailed{Err: fmt.Errorf("CreateRecord: commit: %w", err)}
 	}
 	s.log.Info().Str("id", rec.ID).Str("href", href).Str("addressbook", addressbookID).Msg("CardDAV record created")
 	return rec.ID, nil

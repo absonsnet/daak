@@ -13,11 +13,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/absonsnet/daak/internal/kit/davutil"
+	"github.com/absonsnet/daak/internal/logging"
 	"github.com/emersion/go-vcard"
 	"github.com/emersion/go-webdav"
 	"github.com/emersion/go-webdav/carddav"
-	"github.com/absonsnet/daak/internal/kit/davutil"
-	"github.com/absonsnet/daak/internal/logging"
 	"github.com/rs/zerolog"
 )
 
@@ -430,9 +430,9 @@ type ParsedRecord struct {
 	ETag     string
 	VCardRaw string
 
-	FN       string
-	NGiven   string
-	NFamily  string
+	FN      string
+	NGiven  string
+	NFamily string
 
 	Emails    []ParsedEmail
 	Phones    []ParsedPhone
@@ -687,6 +687,29 @@ func (e *ErrPreconditionFailed) Error() string {
 type ErrForbidden struct {
 	Href   string
 	Status int // the HTTP status received (403, or 405 for the same refusal shape)
+}
+
+// ErrLocalMirrorFailed signals that the server ACCEPTED a PUT but the
+// local mirror write afterwards failed (fourth-audit finding 26).
+// The contact exists on the server exactly once — the caller must NOT
+// retry the create in another address book, or a second server copy
+// appears. Report the single failure; the next sync picks the contact
+// up from the server.
+type ErrLocalMirrorFailed struct {
+	Err error // the local write error
+}
+
+func (e *ErrLocalMirrorFailed) Error() string {
+	return fmt.Sprintf("carddav: contact saved on server but local mirror failed: %v (it will appear after the next sync; do not retry the create)", e.Err)
+}
+
+func (e *ErrLocalMirrorFailed) Unwrap() error { return e.Err }
+
+// IsLocalMirrorFailed reports whether err is (or wraps) an
+// ErrLocalMirrorFailed.
+func IsLocalMirrorFailed(err error) bool {
+	var mirror *ErrLocalMirrorFailed
+	return errors.As(err, &mirror)
 }
 
 func (e *ErrForbidden) Error() string {
