@@ -21,6 +21,42 @@ import (
 
 // initBackgroundSync initializes and starts the background sync scheduler
 // and IMAP IDLE manager for real-time email notifications
+// onSchedulerSyncCompleted runs when the background scheduler (or an
+// IDLE-triggered blocking sync) finishes a folder sync: it clears the
+// frontend's syncing state, mirrors the unread count, and — for inbox
+// completions — runs the auto-trash sender rule. The manual SyncFolder
+// path runs applySenderRules itself; without this, scheduled and
+// IDLE syncs never ran the rule (fourth-audit finding 38) and mail
+// from auto-delete senders sat in the inbox until the next manual
+// sync. The rule is inbox-scoped: other folders keep their mail.
+func (a *App) onSchedulerSyncCompleted(accountID, folderID string, err error) {
+	if err != nil {
+		wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
+			"accountId": accountID,
+			"folderId":  folderID,
+			"error":     err.Error(),
+		})
+		return
+	}
+	wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+		"accountId": accountID,
+		"folderId":  folderID,
+	})
+	// Mirror the unread count to the sidebar so badges refresh after a
+	// scheduled sync (the manual SyncFolder path emits this at
+	// app/sync.go:110; the scheduler path was missing it).
+	folderObj, ferr := a.folderStore.Get(folderID)
+	if ferr != nil || folderObj == nil {
+		return
+	}
+	a.emitFolderCountsChanged(map[string]int{
+		folderID: folderObj.UnreadCount,
+	})
+	if folderObj.Type == folder.TypeInbox {
+		a.applySenderRules(accountID, folderID)
+	}
+}
+
 func (a *App) initBackgroundSync(ctx context.Context) {
 	log := logging.WithComponent("app")
 
@@ -33,28 +69,7 @@ func (a *App) initBackgroundSync(ctx context.Context) {
 	})
 
 	// Set callback for sync completion (so frontend clears progress)
-	a.syncScheduler.SetSyncCompletedCallback(func(accountID, folderID string, err error) {
-		if err != nil {
-			wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
-				"accountId": accountID,
-				"folderId":  folderID,
-				"error":     err.Error(),
-			})
-			return
-		}
-		wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
-			"accountId": accountID,
-			"folderId":  folderID,
-		})
-		// Mirror the unread count to the sidebar so badges refresh after a
-		// scheduled sync (the manual SyncFolder path emits this at
-		// app/sync.go:110; the scheduler path was missing it).
-		if folderObj, ferr := a.folderStore.Get(folderID); ferr == nil && folderObj != nil {
-			a.emitFolderCountsChanged(map[string]int{
-				folderID: folderObj.UnreadCount,
-			})
-		}
-	})
+	a.syncScheduler.SetSyncCompletedCallback(a.onSchedulerSyncCompleted)
 
 	// Wire up network connectivity check so scheduler skips ticks when offline
 	if a.networkMonitor != nil {
