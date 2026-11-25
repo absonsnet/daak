@@ -95,14 +95,19 @@ class OAuthStore {
       this.flowResult = null
     })
 
-    // Listen for reauth required events (token refresh failed)
-    EventsOn('oauth:reauth-required', async (data: { accountId: string; provider: string; error: string }) => {
+    // Listen for reauth required events (token refresh failed).
+    // Mail accounts carry accountId; standalone contact sources carry
+    // sourceId instead (fourth-audit finding 34) — either way the
+    // toast names the provider when no account can be resolved.
+    EventsOn('oauth:reauth-required', async (data: { accountId?: string; sourceId?: string; provider: string; error: string }) => {
       // Get account name for better UX
       let accountName = data.provider
       try {
-        const account = await GetAccount(data.accountId)
-        if (account?.name) {
-          accountName = account.name
+        if (data.accountId) {
+          const account = await GetAccount(data.accountId)
+          if (account?.name) {
+            accountName = account.name
+          }
         }
       } catch {
         // Ignore error, use provider name as fallback

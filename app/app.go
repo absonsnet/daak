@@ -239,6 +239,15 @@ type App struct {
 	// (audit finding R12).
 	saveContactSourceTokensOverride func(sourceID string, tokens *credentials.OAuthTokens) error
 
+	// contactSourceRefreshLocksMu guards contactSourceRefreshLocks.
+	// contactSourceRefreshLocks serialises token refreshes per
+	// standalone contact source (fourth-audit finding 34): the same
+	// per-source lock + re-read pattern as the mail path in
+	// composeOps.getValidOAuthToken, so two concurrent contacts
+	// operations cannot both refresh the same rotating token.
+	contactSourceRefreshLocksMu goSync.Mutex
+	contactSourceRefreshLocks   map[string]*goSync.Mutex
+
 	// Certificate trust store (TOFU)
 	certStore *certificate.Store
 
@@ -1506,6 +1515,23 @@ func (a *App) GetContext() context.Context {
 	return a.ctx
 }
 
+// contactSourceRefreshLock returns the refresh mutex for a standalone
+// contact source, creating it on first use. Mirrors
+// composeOps.oauthRefreshLock for mail accounts.
+func (a *App) contactSourceRefreshLock(sourceID string) *goSync.Mutex {
+	a.contactSourceRefreshLocksMu.Lock()
+	defer a.contactSourceRefreshLocksMu.Unlock()
+	if a.contactSourceRefreshLocks == nil {
+		a.contactSourceRefreshLocks = make(map[string]*goSync.Mutex)
+	}
+	mu, ok := a.contactSourceRefreshLocks[sourceID]
+	if !ok {
+		mu = &goSync.Mutex{}
+		a.contactSourceRefreshLocks[sourceID] = mu
+	}
+	return mu
+}
+
 // getValidContactSourceOAuthToken returns a valid OAuth token for a standalone contact source
 func (a *App) getValidContactSourceOAuthToken(sourceID string) (string, error) {
 	log := logging.WithComponent("app")
@@ -1516,66 +1542,131 @@ func (a *App) getValidContactSourceOAuthToken(sourceID string) (string, error) {
 	}
 
 	// Check if token expires within 5 minutes
-	if tokens.IsExpiringSoon(5 * time.Minute) {
-		log.Info().
-			Str("source_id", sourceID).
-			Time("expires_at", tokens.ExpiresAt).
-			Msg("Contact source OAuth token expiring soon, refreshing")
-
-		// Refresh the token
-		newTokenResp, err := a.oauth2Manager.RefreshToken(tokens.Provider, tokens.RefreshToken)
-		if err != nil {
-			log.Error().Err(err).
-				Str("source_id", sourceID).
-				Msg("Contact source OAuth token refresh failed")
-
-			// Error is persisted to the contact_sources table by the sync caller;
-			// sidebar red dot picks it up on next contactSourcesStore.load() (app start
-			// or Contacts settings open). Real-time notification deferred — not worth
-			// the listener wiring for a non-time-sensitive failure mode.
-			return "", fmt.Errorf("contact source OAuth token refresh failed: %w", err)
-		}
-
-		// Calculate new expiry time
-		expiresAt := time.Now().Add(time.Duration(newTokenResp.ExpiresIn) * time.Second)
-
-		// Update tokens in store
-		tokens.AccessToken = newTokenResp.AccessToken
-		tokens.ExpiresAt = expiresAt
-		if newTokenResp.RefreshToken != "" {
-			tokens.RefreshToken = newTokenResp.RefreshToken
-		}
-
-		// Persist the refreshed tokens (audit finding R12): same poison
-		// as the mail path in composeOps.getValidOAuthToken — the provider
-		// has already rotated the refresh token, so a swallowed save
-		// failure leaves the revoked token in storage and the next
-		// refresh fails invalid_grant. Retry, then fail loudly with the
-		// distinct tokens-save-failed event (not a re-auth prompt: the
-		// grant is fine).
-		saveTokens := func() error { return a.credStore.SetContactSourceOAuthTokens(sourceID, tokens) }
-		if a.saveContactSourceTokensOverride != nil {
-			saveTokens = func() error { return a.saveContactSourceTokensOverride(sourceID, tokens) }
-		}
-		if err := saveRefreshedTokensWithRetry(saveTokens); err != nil {
-			log.Error().Err(err).
-				Str("source_id", sourceID).
-				Msg("Failed to save refreshed contact source OAuth tokens after retries")
-			emitOAuthEvent(a.ctx, "oauth:tokens-save-failed", map[string]interface{}{
-				"sourceId": sourceID,
-				"provider": tokens.Provider,
-				"error":    err.Error(),
-			})
-			return "", fmt.Errorf("contact source OAuth tokens refreshed but could not be saved: %w (sign-in is still valid — retry, and re-authorize only if asked)", err)
-		}
-
-		log.Info().
-			Str("source_id", sourceID).
-			Time("new_expires_at", expiresAt).
-			Msg("Contact source OAuth token refreshed successfully")
+	if !tokens.IsExpiringSoon(5 * time.Minute) {
+		return tokens.AccessToken, nil
 	}
 
-	return tokens.AccessToken, nil
+	// Serialize refreshes for this source: without the lock, two
+	// concurrent contacts operations both read the same expiring
+	// tokens and both refresh, and with rotating refresh tokens the
+	// second refresh fails invalid_grant on the already-rotated
+	// token. Other sources refresh independently — the lock is per
+	// source, not global. (Fourth-audit finding 34.)
+	mu := a.contactSourceRefreshLock(sourceID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Re-read after acquiring the lock: a caller that held the lock
+	// before us may have just refreshed and stored fresh tokens, in
+	// which case there is nothing left to refresh.
+	tokens, err = a.credStore.GetContactSourceOAuthTokens(sourceID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get contact source OAuth tokens: %w", err)
+	}
+	if !tokens.IsExpiringSoon(5 * time.Minute) {
+		return tokens.AccessToken, nil
+	}
+
+	log.Info().
+		Str("source_id", sourceID).
+		Time("expires_at", tokens.ExpiresAt).
+		Msg("Contact source OAuth token expiring soon, refreshing")
+
+	refreshed, err := a.refreshContactSourceTokens(sourceID, tokens)
+	if err != nil {
+		return "", err
+	}
+	return refreshed.AccessToken, nil
+}
+
+// refreshContactSourceOAuthToken forces a refresh of a standalone contact
+// source's token regardless of its expiry — the 401-retry path (fourth-
+// audit finding 35) for when the stored token was revoked. Serialised
+// per source under the same lock as the proactive path, so a concurrent
+// proactive refresh cannot race it on the rotating refresh token.
+func (a *App) refreshContactSourceOAuthToken(sourceID string) (string, error) {
+	mu := a.contactSourceRefreshLock(sourceID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	tokens, err := a.credStore.GetContactSourceOAuthTokens(sourceID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get contact source OAuth tokens: %w", err)
+	}
+
+	refreshed, err := a.refreshContactSourceTokens(sourceID, tokens)
+	if err != nil {
+		return "", err
+	}
+	return refreshed.AccessToken, nil
+}
+
+// refreshContactSourceTokens refreshes tokens with the provider and
+// persists the result. Caller must hold the per-source refresh lock.
+// On refresh failure it emits oauth:reauth-required (fourth-audit
+// finding 34) so the user is told to re-sign in at once, instead of
+// only discovering it on opening Contacts settings. On save failure
+// it emits the distinct oauth:tokens-save-failed event — the grant
+// is fine, only the write failed.
+func (a *App) refreshContactSourceTokens(sourceID string, tokens *credentials.OAuthTokens) (*credentials.OAuthTokens, error) {
+	log := logging.WithComponent("app")
+
+	// Refresh the token
+	newTokenResp, err := a.oauth2Manager.RefreshToken(tokens.Provider, tokens.RefreshToken)
+	if err != nil {
+		log.Error().Err(err).
+			Str("source_id", sourceID).
+			Msg("Contact source OAuth token refresh failed")
+
+		// The error is still persisted to the contact_sources table by
+		// the sync caller (sidebar red dot), but the user is now also
+		// told immediately via the re-auth toast.
+		emitOAuthEvent(a.ctx, "oauth:reauth-required", map[string]interface{}{
+			"sourceId": sourceID,
+			"provider": tokens.Provider,
+			"error":    err.Error(),
+		})
+		return nil, fmt.Errorf("contact source OAuth token refresh failed: %w", err)
+	}
+
+	// Calculate new expiry time
+	expiresAt := oauth2.ExpiryFromNow(newTokenResp.ExpiresIn)
+
+	// Update tokens in store
+	tokens.AccessToken = newTokenResp.AccessToken
+	tokens.ExpiresAt = expiresAt
+	if newTokenResp.RefreshToken != "" {
+		tokens.RefreshToken = newTokenResp.RefreshToken
+	}
+
+	// Persist the refreshed tokens (audit finding R12): same poison
+	// as the mail path in composeOps.getValidOAuthToken — the provider
+	// has already rotated the refresh token, so a swallowed save
+	// failure leaves the revoked token in storage and the next
+	// refresh fails invalid_grant. Retry, then fail loudly with the
+	// distinct tokens-save-failed event (not a re-auth prompt: the
+	// grant is fine).
+	saveTokens := func() error { return a.credStore.SetContactSourceOAuthTokens(sourceID, tokens) }
+	if a.saveContactSourceTokensOverride != nil {
+		saveTokens = func() error { return a.saveContactSourceTokensOverride(sourceID, tokens) }
+	}
+	if err := saveRefreshedTokensWithRetry(saveTokens); err != nil {
+		log.Error().Err(err).
+			Str("source_id", sourceID).
+			Msg("Failed to save refreshed contact source OAuth tokens after retries")
+		emitOAuthEvent(a.ctx, "oauth:tokens-save-failed", map[string]interface{}{
+			"sourceId": sourceID,
+			"provider": tokens.Provider,
+			"error":    err.Error(),
+		})
+		return nil, fmt.Errorf("contact source OAuth tokens refreshed but could not be saved: %w (sign-in is still valid — retry, and re-authorize only if asked)", err)
+	}
+
+	log.Info().
+		Str("source_id", sourceID).
+		Time("new_expires_at", expiresAt).
+		Msg("Contact source OAuth token refreshed successfully")
+	return tokens, nil
 }
 
 // OpenURL opens a URL in the system browser with proper shell escaping

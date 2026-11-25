@@ -2,6 +2,7 @@ package backend
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/absonsnet/daak/internal/carddav"
@@ -33,9 +34,9 @@ var cardDAVWriteScope = coreapi.AuthScope{
 //
 // Standalone path: fetches a token via the host's getValidContactSourceOAuth
 // token (proactively refreshed on expiry by the host), then wraps it in a
-// minimal bearer transport. No 401-driven refresh here; if the token gets
-// revoked mid-request the call surfaces the 401 to the caller — same
-// behaviour as the sync layer.
+// bearer transport that refreshes once under a lock and retries on 401
+// (fourth-audit finding 35) — a revoked token no longer fails every write
+// until expiry.
 func (a *API) httpClientForSource(source *carddav.Source, scope coreapi.AuthScope) (*http.Client, error) {
 	if source == nil {
 		return nil, fmt.Errorf("contacts: httpClientForSource: nil source")
@@ -56,26 +57,75 @@ func (a *API) httpClientForSource(source *carddav.Source, scope coreapi.AuthScop
 		return nil, fmt.Errorf("contacts: httpClientForSource: get standalone token for %s: %w", source.ID, err)
 	}
 	return &http.Client{
-		Transport: &bearerTransport{token: token},
+		Transport: &refreshingBearerTransport{
+			api:      a,
+			sourceID: source.ID,
+			token:    token,
+		},
 	}, nil
 }
 
-// bearerTransport stamps a static bearer token on every request. Used for
-// standalone contact source HTTP clients where token refresh is handled
-// proactively by the host before the client is built (see
-// app.getValidContactSourceOAuthToken). No 401 retry — a stale token after
-// build surfaces as a 401 to the caller, who returns the error up to the UI.
-type bearerTransport struct {
-	base  http.RoundTripper
-	token string
+// refreshingBearerTransport stamps a bearer token on every request and,
+// on a 401, refreshes once under the per-source lock and retries —
+// mirroring internal/extensions/auth.bearerRefreshTransport. A revoked
+// token used to fail every write until its expiry; now the first 401
+// triggers one force-refresh and a single retry with the fresh token.
+//
+//   - The token is re-read under the lock first: another goroutine may
+//     have refreshed already, in which case the stored token differs
+//     from the one that got the 401 and the retry uses it without
+//     refreshing again (avoiding invalid_grant on the rotated token).
+//   - With no refresher wired (tests, partial construction) the 401
+//     response is returned unchanged — the pre-fix behaviour.
+type refreshingBearerTransport struct {
+	base     http.RoundTripper
+	api      *API
+	sourceID string
+	token    string
 }
 
-func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t *refreshingBearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.do(req, t.token)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return resp, nil
+	}
+
+	// No refresher wired (tests, partial construction): return the 401
+	// unchanged — the pre-fix behaviour.
+	if t.api == nil || t.api.refreshStandaloneSourceToken == nil {
+		return resp, nil
+	}
+
+	// 401 with a refresher: drain + close body before retrying.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	failedToken := t.token
+	mu := t.api.standaloneRefreshLock(t.sourceID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Re-read: another goroutine may have refreshed already.
+	if current, err := t.api.getStandaloneSourceToken(t.sourceID); err == nil && current != "" && current != failedToken {
+		return t.do(req, current)
+	}
+
+	fresh, err := t.api.refreshStandaloneSourceToken(t.sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("contacts: refresh standalone token after 401 for %s: %w", t.sourceID, err)
+	}
+	return t.do(req, fresh)
+}
+
+func (t *refreshingBearerTransport) do(req *http.Request, token string) (*http.Response, error) {
 	cloned := req.Clone(req.Context())
 	if cloned.Header == nil {
 		cloned.Header = make(http.Header)
 	}
-	cloned.Header.Set("Authorization", "Bearer "+t.token)
+	cloned.Header.Set("Authorization", "Bearer "+token)
 	base := t.base
 	if base == nil {
 		base = http.DefaultTransport
