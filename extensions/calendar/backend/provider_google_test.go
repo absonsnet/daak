@@ -7,6 +7,7 @@ package backend
 // production code's googleAPIBase const stays untouched.
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -407,7 +408,11 @@ func TestGoogleProvider_DeleteRemote_404Idempotent(t *testing.T) {
 	p := newTestGoogleProvider(srv.URL)
 	src := Source{ID: "src-g1", Type: SourceTypeGoogle, AccountID: "acct-1"}
 	cal := Calendar{ID: "cal-g1", URL: "primary"}
-	ev := Event{ProviderEventID: "missing"}
+	// ETag set so the empty-ETag re-fetch gate does not run: this test
+	// verifies only that a 404 on the DELETE itself is idempotent. The
+	// empty-ETag + already-gone path is covered by
+	// TestGoogleProvider_DeleteRemote_EmptyETag_GoneServerCopyProceeds.
+	ev := Event{ProviderEventID: "missing", ETag: `"current"`}
 	if err := p.DeleteRemote(t.Context(), src, cal, ev); err != nil {
 		t.Errorf("DeleteRemote on 404 should be idempotent, got %v", err)
 	}
@@ -554,5 +559,298 @@ func TestConferenceBlockHTML(t *testing.T) {
 	want := "Google Meet<br><a href=\"https://meet.google.com/abc-defg-hij\">https://meet.google.com/abc-defg-hij</a><br><br>Join by phone: +1 650-555-0100 (PIN: 123456789#)"
 	if got != want {
 		t.Errorf("conferenceBlockHTML =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// --- R7: empty local ETag ---------------------------------------------------
+//
+// A Google update/delete with no known local ETag must re-fetch the server
+// copy (single-event GET) and compare it with the locally stored blob
+// before writing unconditionally — and refuse with ErrConflict when the
+// server copy moved, was cancelled, or cannot be verified.
+
+// seedGoogleStoredEvent stores a Google event as of the last sync (empty
+// local ETag — the R7 scenario) and returns the source + calendar to call
+// the provider with, the server-side event JSON, and the stored ICS blob.
+func seedGoogleStoredEvent(t *testing.T, store *Store) (Source, Calendar, googleEvent, string) {
+	t.Helper()
+	base := googleEvent{
+		ID:          "evt-g1",
+		ICalUID:     "evt-uid-1@daak-google",
+		Status:      "confirmed",
+		Summary:     "Project sync",
+		Description: "Weekly project status",
+		Location:    "Room 4B",
+		Start: &googleTimePoint{
+			DateTime: "2026-06-10T14:00:00-07:00",
+			TimeZone: "America/Los_Angeles",
+		},
+		End: &googleTimePoint{
+			DateTime: "2026-06-10T15:00:00-07:00",
+			TimeZone: "America/Los_Angeles",
+		},
+	}
+	blob, err := translateGoogleEventToICS(base)
+	if err != nil {
+		t.Fatalf("translateGoogleEventToICS: %v", err)
+	}
+	srcID, calID := "src-g-r7", "cal-g-r7"
+	now := time.Now().Unix()
+	if err := store.WithTx(func(tx *sql.Tx) error {
+		if err := store.CreateSourceTx(tx, Source{
+			ID: srcID, Type: SourceTypeGoogle, Name: "Test",
+			Enabled: true, Writable: true, CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+		return store.CreateCalendarTx(tx, Calendar{
+			ID: calID, SourceID: srcID, URL: "primary",
+			DisplayName: "Primary", Visible: true, CreatedAt: now,
+		})
+	}); err != nil {
+		t.Fatalf("seed source/calendar: %v", err)
+	}
+	parsed, err := ParseCalendarObject(blob)
+	if err != nil {
+		t.Fatalf("parse seed ICS: %v", err)
+	}
+	stored := parsed.Master
+	stored.ID = "ev-g1"
+	stored.CalendarID = calID
+	stored.ETag = ""
+	stored.ProviderEventID = "evt-g1"
+	stored.ICSBlob = blob
+	if err := store.WithTx(func(tx *sql.Tx) error {
+		return store.UpsertEventTx(tx, stored)
+	}); err != nil {
+		t.Fatalf("seed stored event: %v", err)
+	}
+	src := Source{ID: srcID, Type: SourceTypeGoogle, AccountID: "acct-1"}
+	cal := Calendar{ID: calID, URL: "primary"}
+	return src, cal, base, blob
+}
+
+// googleR7Server serves a configurable server copy on GET and records every
+// request so tests can prove whether a PATCH/DELETE happened.
+type googleR7Server struct {
+	srv       *httptest.Server
+	requests  []capturedReq
+	getEvent  googleEvent
+	getStatus int // 0 = 200
+}
+
+func newGoogleR7Server(t *testing.T, getEvent googleEvent, getStatus int) *googleR7Server {
+	t.Helper()
+	gs := &googleR7Server{getEvent: getEvent, getStatus: getStatus}
+	gs.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		var parsed googleEvent
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &parsed)
+		}
+		gs.requests = append(gs.requests, capturedReq{
+			method:  r.Method,
+			path:    r.URL.Path,
+			ifMatch: r.Header.Get("If-Match"),
+			body:    parsed,
+			bodyRaw: string(bodyBytes),
+		})
+		switch r.Method {
+		case http.MethodGet:
+			if gs.getStatus != 0 {
+				w.WriteHeader(gs.getStatus)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(gs.getEvent)
+		case http.MethodPatch:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(googleEvent{
+				ID: "evt-g1", ICalUID: "evt-uid-1@daak-google", ETag: `"new-etag"`,
+			})
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	return gs
+}
+
+func (gs *googleR7Server) countMethod(method string) int {
+	n := 0
+	for _, req := range gs.requests {
+		if req.method == method {
+			n++
+		}
+	}
+	return n
+}
+
+func TestGoogleProvider_PushEvent_EmptyETag_UnchangedServerCopyProceeds(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, blob := seedGoogleStoredEvent(t, store)
+	gs := newGoogleR7Server(t, base, 0)
+	defer gs.srv.Close()
+	p := googleProvider{store: store, auth: fakeAuth{target: gs.srv.URL}}
+
+	ev := Event{
+		UID:             base.ICalUID,
+		ProviderEventID: "evt-g1",
+		ETag:            "",
+		ICSBlob:         strings.Replace(blob, "SUMMARY:Project sync", "SUMMARY:Project sync (my edit)", 1),
+	}
+	result, err := p.PushEvent(t.Context(), src, cal, ev)
+	if err != nil {
+		t.Fatalf("PushEvent: %v", err)
+	}
+	if result.ETag != `"new-etag"` {
+		t.Errorf("ETag = %q, want %q", result.ETag, `"new-etag"`)
+	}
+	if got := gs.countMethod(http.MethodGet); got != 1 {
+		t.Fatalf("server saw %d GETs, want 1 (re-fetch before unconditional PATCH); requests=%+v", got, gs.requests)
+	}
+	if got := gs.countMethod(http.MethodPatch); got != 1 {
+		t.Fatalf("server saw %d PATCHes, want 1; requests=%+v", got, gs.requests)
+	}
+	for _, req := range gs.requests {
+		if req.method == http.MethodPatch && req.ifMatch != "" {
+			t.Errorf("PATCH carried If-Match %q, want none (no local ETag)", req.ifMatch)
+		}
+	}
+}
+
+func TestGoogleProvider_PushEvent_EmptyETag_ChangedServerCopyIsConflict(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, blob := seedGoogleStoredEvent(t, store)
+	changed := base
+	changed.Summary = "Project sync (moved by someone else)"
+	gs := newGoogleR7Server(t, changed, 0)
+	defer gs.srv.Close()
+	p := googleProvider{store: store, auth: fakeAuth{target: gs.srv.URL}}
+
+	ev := Event{
+		UID:             base.ICalUID,
+		ProviderEventID: "evt-g1",
+		ETag:            "",
+		ICSBlob:         strings.Replace(blob, "SUMMARY:Project sync", "SUMMARY:Project sync (my edit)", 1),
+	}
+	_, err := p.PushEvent(t.Context(), src, cal, ev)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("PushEvent err = %v, want ErrConflict", err)
+	}
+	if got := gs.countMethod(http.MethodPatch); got != 0 {
+		t.Fatalf("server saw %d PATCHes, want 0 (changed copy must not be overwritten blindly); requests=%+v", got, gs.requests)
+	}
+}
+
+func TestGoogleProvider_PushEvent_EmptyETag_CancelledServerCopyIsConflict(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, blob := seedGoogleStoredEvent(t, store)
+	cancelled := base
+	cancelled.Status = "cancelled"
+	gs := newGoogleR7Server(t, cancelled, 0)
+	defer gs.srv.Close()
+	p := googleProvider{store: store, auth: fakeAuth{target: gs.srv.URL}}
+
+	ev := Event{
+		UID:             base.ICalUID,
+		ProviderEventID: "evt-g1",
+		ETag:            "",
+		ICSBlob:         strings.Replace(blob, "SUMMARY:Project sync", "SUMMARY:Project sync (my edit)", 1),
+	}
+	_, err := p.PushEvent(t.Context(), src, cal, ev)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("PushEvent err = %v, want ErrConflict (must not resurrect a cancelled event)", err)
+	}
+	if got := gs.countMethod(http.MethodPatch); got != 0 {
+		t.Fatalf("server saw %d PATCHes, want 0; requests=%+v", got, gs.requests)
+	}
+}
+
+func TestGoogleProvider_PushEvent_EmptyETag_GetFailsIsConflict(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, blob := seedGoogleStoredEvent(t, store)
+	gs := newGoogleR7Server(t, base, http.StatusInternalServerError)
+	defer gs.srv.Close()
+	p := googleProvider{store: store, auth: fakeAuth{target: gs.srv.URL}}
+
+	ev := Event{
+		UID:             base.ICalUID,
+		ProviderEventID: "evt-g1",
+		ETag:            "",
+		ICSBlob:         strings.Replace(blob, "SUMMARY:Project sync", "SUMMARY:Project sync (my edit)", 1),
+	}
+	_, err := p.PushEvent(t.Context(), src, cal, ev)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("PushEvent err = %v, want ErrConflict", err)
+	}
+	if got := gs.countMethod(http.MethodPatch); got != 0 {
+		t.Fatalf("server saw %d PATCHes, want 0 (unverifiable copy must not be overwritten); requests=%+v", got, gs.requests)
+	}
+}
+
+func TestGoogleProvider_DeleteRemote_EmptyETag_UnchangedProceeds(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, _ := seedGoogleStoredEvent(t, store)
+	gs := newGoogleR7Server(t, base, 0)
+	defer gs.srv.Close()
+	p := googleProvider{store: store, auth: fakeAuth{target: gs.srv.URL}}
+
+	ev := Event{UID: base.ICalUID, ProviderEventID: "evt-g1", ETag: ""}
+	if err := p.DeleteRemote(t.Context(), src, cal, ev); err != nil {
+		t.Fatalf("DeleteRemote: %v", err)
+	}
+	if got := gs.countMethod(http.MethodGet); got != 1 {
+		t.Fatalf("server saw %d GETs, want 1; requests=%+v", got, gs.requests)
+	}
+	if got := gs.countMethod(http.MethodDelete); got != 1 {
+		t.Fatalf("server saw %d DELETEs, want 1; requests=%+v", got, gs.requests)
+	}
+}
+
+func TestGoogleProvider_DeleteRemote_EmptyETag_GoneServerCopyProceeds(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		getEvent  googleEvent
+		getStatus int
+	}{
+		{"cancelled tombstone", googleEvent{ID: "evt-g1", ICalUID: "evt-uid-1@daak-google", Status: "cancelled"}, 0},
+		{"GET 404", googleEvent{}, http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore(t)
+			src, cal, base, _ := seedGoogleStoredEvent(t, store)
+			gs := newGoogleR7Server(t, tc.getEvent, tc.getStatus)
+			defer gs.srv.Close()
+			p := googleProvider{store: store, auth: fakeAuth{target: gs.srv.URL}}
+
+			ev := Event{UID: base.ICalUID, ProviderEventID: "evt-g1", ETag: ""}
+			if err := p.DeleteRemote(t.Context(), src, cal, ev); err != nil {
+				t.Fatalf("DeleteRemote: %v", err)
+			}
+			if got := gs.countMethod(http.MethodDelete); got != 1 {
+				t.Fatalf("server saw %d DELETEs, want 1 (already-gone copy is a no-op delete); requests=%+v", got, gs.requests)
+			}
+		})
+	}
+}
+
+func TestGoogleProvider_DeleteRemote_EmptyETag_ChangedIsConflict(t *testing.T) {
+	store := newTestStore(t)
+	src, cal, base, _ := seedGoogleStoredEvent(t, store)
+	changed := base
+	changed.Summary = "Project sync (moved by someone else)"
+	gs := newGoogleR7Server(t, changed, 0)
+	defer gs.srv.Close()
+	p := googleProvider{store: store, auth: fakeAuth{target: gs.srv.URL}}
+
+	ev := Event{UID: base.ICalUID, ProviderEventID: "evt-g1", ETag: ""}
+	if err := p.DeleteRemote(t.Context(), src, cal, ev); !errors.Is(err, ErrConflict) {
+		t.Fatalf("DeleteRemote err = %v, want ErrConflict", err)
+	}
+	if got := gs.countMethod(http.MethodDelete); got != 0 {
+		t.Fatalf("server saw %d DELETEs, want 0; requests=%+v", got, gs.requests)
 	}
 }

@@ -265,6 +265,19 @@ func (p caldavProvider) PushEvent(ctx context.Context, src Source, cal Calendar,
 		return PushResult{}, fmt.Errorf("resolve href: %w", err)
 	}
 
+	// Update with no known local ETag (the server omitted the ETag on an
+	// earlier PUT response and the follow-up HEAD also failed, so the
+	// local copy never learned one): a bare PUT would overwrite any
+	// concurrent edit with no 412 ever possible. Re-fetch the server copy
+	// first and write unconditionally ONLY when it is proven identical to
+	// the locally stored version; otherwise refuse with ErrConflict so
+	// the UI shows the conflict instead of silently overwriting.
+	if !isCreate && ev.ETag == "" {
+		if v := p.serverCopyVerdict(ctx, httpClient, cal, ev, href); v != serverCopyUnchanged {
+			return PushResult{}, ErrConflict
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, href, strings.NewReader(ev.ICSBlob))
 	if err != nil {
 		return PushResult{}, fmt.Errorf("build PUT request: %w", err)
@@ -273,7 +286,9 @@ func (p caldavProvider) PushEvent(ctx context.Context, src Source, cal Calendar,
 	// Conditional headers — three cases:
 	//   - create (Href empty)                 → If-None-Match: * (reject if exists)
 	//   - update with known ETag              → If-Match: ETag    (optimistic concurrency)
-	//   - update with no known local ETag     → no conditional    (unconditional PUT)
+	//   - update with no known local ETag     → re-fetch + compare first
+	//     (see the gate above); unconditional ONLY when the server copy is
+	//     proven unchanged, else ErrConflict — never a bare PUT.
 	if isCreate {
 		req.Header.Set("If-None-Match", "*")
 	}
@@ -313,7 +328,7 @@ func (p caldavProvider) PushEvent(ctx context.Context, src Source, cal Calendar,
 		//   - Create with If-None-Match: * (resource already exists):
 		//     genuine conflict, surface ErrConflict so the queue / UI can
 		//     handle it.
-		if !isCreate && ev.ETag != "" && p.serverCopyUnchanged(ctx, httpClient, cal, ev, href) {
+		if !isCreate && ev.ETag != "" && p.serverCopyVerdict(ctx, httpClient, cal, ev, href) == serverCopyUnchanged {
 			return p.retryPutUnconditional(ctx, httpClient, href, ev.ICSBlob)
 		}
 		return PushResult{}, ErrConflict
@@ -325,11 +340,11 @@ func (p caldavProvider) PushEvent(ctx context.Context, src Source, cal Calendar,
 }
 
 // retryPutUnconditional re-sends a PUT without any If-Match / If-None-Match
-// header. Called only from the update path after serverCopyUnchanged proved
-// the server copy is substantively identical to the locally stored version
-// — i.e. the 412 came from our own stale ETag, not from someone else's edit.
-// It must never be called on a bare 412: that would silently overwrite a
-// concurrent edit.
+// header. Called only from the update path after the server-copy verdict
+// proved the server copy is substantively identical to the locally stored
+// version — i.e. the 412 came from our own stale ETag, not from someone
+// else's edit. It must never be called on a bare 412: that would silently
+// overwrite a concurrent edit.
 func (p caldavProvider) retryPutUnconditional(ctx context.Context, httpClient webdav.HTTPClient, href, blob string) (PushResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, href, strings.NewReader(blob))
 	if err != nil {
@@ -361,64 +376,98 @@ func (p caldavProvider) retryPutUnconditional(ctx context.Context, httpClient we
 }
 
 // fetchServerICS GETs the server's current copy of href and returns its raw
-// ICS body. Any failure (non-200, unreadable body) is an error — a copy we
-// cannot read cannot prove anything about the server state, so callers must
-// treat it as "not proven unchanged".
-func fetchServerICS(ctx context.Context, httpClient webdav.HTTPClient, href string) (string, error) {
+// ICS body plus the HTTP status. Any failure (non-200, unreadable body) is
+// an error — a copy we cannot read cannot prove anything about the server
+// state, so callers must treat it as "not proven unchanged". The status is
+// returned alongside so callers can tell "gone" (404/410) apart from a
+// transient failure.
+func fetchServerICS(ctx context.Context, httpClient webdav.HTTPClient, href string) (string, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, href, nil)
 	if err != nil {
-		return "", fmt.Errorf("build GET request: %w", err)
+		return "", 0, fmt.Errorf("build GET request: %w", err)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("caldav GET: %w: %v", ErrTransport, err)
+		return "", 0, fmt.Errorf("caldav GET: %w: %v", ErrTransport, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("caldav GET %d %s", resp.StatusCode, resp.Status)
+		return "", resp.StatusCode, fmt.Errorf("caldav GET %d %s", resp.StatusCode, resp.Status)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return "", fmt.Errorf("read GET body: %w", err)
+		return "", resp.StatusCode, fmt.Errorf("read GET body: %w", err)
 	}
-	return string(body), nil
+	return string(body), resp.StatusCode, nil
 }
 
-// serverCopyUnchanged re-fetches the server's current copy of the event and
-// reports whether it is substantively identical to the locally stored
-// version (the stored ICS blob parsed the same way). It answers the one
-// question a 412 leaves open: did the server move because of our own stale
-// ETag, or because someone else edited the event?
+// serverCopyVerdict re-fetches the server's current copy of the event and
+// compares it with the locally stored version (the stored ICS blob parsed
+// the same way). It answers the one question a 412 — or a missing local
+// ETag — leaves open: did the server move because of our own stale ETag,
+// or because someone else edited the event?
 //
-// False is the safe answer and covers every case where the comparison cannot
-// be made: no store wired (tests), no local row, no stored ICS blob, a GET
-// that fails or 404s (the server copy is gone — someone deleted it), or an
-// unparseable body. Callers treat false as a genuine conflict.
-func (p caldavProvider) serverCopyUnchanged(ctx context.Context, httpClient webdav.HTTPClient, cal Calendar, ev Event, href string) bool {
+// serverCopyUnknown covers every case where the comparison cannot be made:
+// no store wired (tests), no local row, no stored ICS blob, a GET that
+// fails or an unparseable body. Callers treat unknown as a genuine
+// conflict, never as unchanged. A GET that 404s/410s means the server copy
+// is gone: serverCopyGone.
+func (p caldavProvider) serverCopyVerdict(ctx context.Context, httpClient webdav.HTTPClient, cal Calendar, ev Event, href string) serverCopyVerdict {
 	if p.store == nil {
-		return false
+		return serverCopyUnknown
 	}
 	id, err := p.lookupEventIDByUID(cal.ID, ev.UID)
 	if err != nil || id == "" {
-		return false
+		return serverCopyUnknown
 	}
 	stored, err := p.store.GetEvent(id)
 	if err != nil || stored == nil || stored.ICSBlob == "" {
-		return false
+		return serverCopyUnknown
 	}
-	serverICS, err := fetchServerICS(ctx, httpClient, href)
+	serverICS, status, err := fetchServerICS(ctx, httpClient, href)
 	if err != nil {
-		return false
+		if status == http.StatusNotFound || status == http.StatusGone {
+			return serverCopyGone
+		}
+		return serverCopyUnknown
 	}
+	server, err := ParseCalendarObject(serverICS)
+	if err != nil {
+		return serverCopyUnknown
+	}
+	local, err := ParseCalendarObject(stored.ICSBlob)
+	if err != nil {
+		return serverCopyUnknown
+	}
+	if sameCalendarSubstance(server, local) {
+		return serverCopyUnchanged
+	}
+	return serverCopyChanged
+}
+
+// compareServerICS parses two ICS blobs and reports whether they hold the
+// same calendar substance. Shared by the Google/Microsoft verdict helpers,
+// whose server copies arrive as translated ICS. False on any parse failure:
+// an unreadable copy cannot prove the server is unchanged.
+//
+// Note it uses the field-wise comparison only, NOT the canonical
+// fingerprint backstop: the JSON→ICS translation is lossy by design
+// (an HTML body rides as X-ALT-DESC in a Daak-authored blob but comes back
+// as plaintext DESCRIPTION from Google/Graph), so representation artefacts
+// that are not concurrent edits would trip the fingerprint. The field
+// comparison still covers every item the re-audit names (STATUS via the
+// cancelled/gone mapping in the callers, organiser, alarms, exception
+// dates, SEQUENCE/categories where the provider models them).
+func compareServerICS(serverICS, storedICS string) bool {
 	server, err := ParseCalendarObject(serverICS)
 	if err != nil {
 		return false
 	}
-	local, err := ParseCalendarObject(stored.ICSBlob)
+	local, err := ParseCalendarObject(storedICS)
 	if err != nil {
 		return false
 	}
-	return sameCalendarSubstance(server, local)
+	return sameCalendarSubstanceFields(server, local)
 }
 
 // sameCalendarSubstance compares two parsed calendar objects on the fields a
@@ -426,7 +475,34 @@ func (p caldavProvider) serverCopyUnchanged(ctx context.Context, httpClient webd
 // formatting differences (line folding, property order) do not count as
 // changes. Anything the comparison does not cover is treated as a change by
 // the caller: when in doubt, the write is a conflict, never an overwrite.
+//
+// Compared, field by field: summary, description, HTML description,
+// location, times, all-day flag, timezone, recurrence rule, transparency,
+// visibility, STATUS, SEQUENCE, categories, exception dates, alarms,
+// organiser, and attendees. The canonical fingerprint backstop additionally
+// covers every other master-VEVENT property (RDATE, DURATION, X-ALT-DESC,
+// vendor X-* props, ...) that the parser does not model, and the override
+// blobs are compared whole — a formatting-only change to an override reads
+// as a conflict, which errs the safe way.
 func sameCalendarSubstance(a, b *ParsedObject) bool {
+	if !sameCalendarSubstanceFields(a, b) {
+		return false
+	}
+	// Backstop: any unmodelled master-VEVENT property that differs counts
+	// as a change. A fingerprint that cannot be computed proves nothing,
+	// so it counts as a change too.
+	fa, fb := canonicalMasterFingerprint(a), canonicalMasterFingerprint(b)
+	if fa == "" || fb == "" || fa != fb {
+		return false
+	}
+	return true
+}
+
+// sameCalendarSubstanceFields is the field-wise half of
+// sameCalendarSubstance (everything except the canonical fingerprint
+// backstop). The Google/Microsoft verdict helpers use it directly — see
+// compareServerICS for why the backstop is skipped there.
+func sameCalendarSubstanceFields(a, b *ParsedObject) bool {
 	if a == nil || b == nil {
 		return false
 	}
@@ -441,17 +517,87 @@ func sameCalendarSubstance(a, b *ParsedObject) bool {
 		am.TZName != bm.TZName ||
 		am.RRuleText != bm.RRuleText ||
 		am.Transparency != bm.Transparency ||
-		am.Visibility != bm.Visibility {
+		am.Visibility != bm.Visibility ||
+		am.Status != bm.Status ||
+		am.Sequence != bm.Sequence {
+		return false
+	}
+	if !sameOrganizer(am.Organizer, bm.Organizer) {
+		return false
+	}
+	if !sameStringSet(am.Categories, bm.Categories) {
+		return false
+	}
+	if !sameInt64Set(am.ExceptionDates, bm.ExceptionDates) {
+		return false
+	}
+	if !sameStringSet(am.AlarmFingerprints, bm.AlarmFingerprints) {
 		return false
 	}
 	if !sameAttendees(am.Attendees, bm.Attendees) {
 		return false
 	}
-	if len(a.Overrides) != len(b.Overrides) {
+	if !sameOverrides(a.Overrides, b.Overrides) {
 		return false
 	}
-	ao := append([]EventOverride(nil), a.Overrides...)
-	bo := append([]EventOverride(nil), b.Overrides...)
+	return true
+}
+
+// sameOrganizer compares organisers by email (case-insensitive) + display
+// name. Both absent is equal; one absent is a change — an organiser added
+// or removed server-side is a concurrent edit.
+func sameOrganizer(a, b *Organizer) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return strings.EqualFold(strings.TrimSpace(a.Email), strings.TrimSpace(b.Email)) &&
+		a.CommonName == b.CommonName
+}
+
+// sameStringSet compares two string slices as sets (order-insensitive).
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	as := append([]string(nil), a...)
+	bs := append([]string(nil), b...)
+	sort.Strings(as)
+	sort.Strings(bs)
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameInt64Set compares two int64 slices as sets (order-insensitive).
+func sameInt64Set(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	as := append([]int64(nil), a...)
+	bs := append([]int64(nil), b...)
+	sort.Slice(as, func(i, j int) bool { return as[i] < as[j] })
+	sort.Slice(bs, func(i, j int) bool { return bs[i] < bs[j] })
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameOverrides compares RECURRENCE-ID override lists by instance time +
+// whole blob. The blobs are re-encoded by the parser on both sides, so
+// formatting differences do not count — but any content change inside an
+// override (STATUS, summary, alarm, ...) does.
+func sameOverrides(a, b []EventOverride) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ao := append([]EventOverride(nil), a...)
+	bo := append([]EventOverride(nil), b...)
 	sort.Slice(ao, func(i, j int) bool { return ao[i].RecurrenceIDUnix < ao[j].RecurrenceIDUnix })
 	sort.Slice(bo, func(i, j int) bool { return bo[i].RecurrenceIDUnix < bo[j].RecurrenceIDUnix })
 	for i := range ao {
@@ -514,7 +660,9 @@ func fetchETagViaHEAD(ctx context.Context, httpClient webdav.HTTPClient, href st
 // --- Delete ---------------------------------------------------------------
 
 // DeleteRemote deletes ev's resource from the server. Honors If-Match
-// for optimistic concurrency. Treats 404 as success (idempotent — if it's
+// for optimistic concurrency. With no known local ETag it re-fetches and
+// compares the server copy first (same gate as PushEvent) instead of
+// sending a bare DELETE. Treats 404 as success (idempotent — if it's
 // already gone, the local delete still needs to proceed).
 func (p caldavProvider) DeleteRemote(ctx context.Context, src Source, cal Calendar, ev Event) error {
 	if ev.Href == "" {
@@ -532,6 +680,19 @@ func (p caldavProvider) DeleteRemote(ctx context.Context, src Source, cal Calend
 	href, err := absoluteHref(src.URL, ev.Href)
 	if err != nil {
 		return fmt.Errorf("resolve href: %w", err)
+	}
+
+	// Delete with no known local ETag: a bare DELETE would remove any
+	// concurrent edit with no 412 ever possible. Re-fetch first and
+	// delete unconditionally ONLY when the server copy is proven identical
+	// to the locally stored version — or already gone, in which case the
+	// delete is a no-op success. Otherwise refuse with ErrConflict.
+	if ev.ETag == "" {
+		switch v := p.serverCopyVerdict(ctx, httpClient, cal, ev, href); v {
+		case serverCopyUnchanged, serverCopyGone:
+		default:
+			return ErrConflict
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, href, nil)
@@ -559,7 +720,7 @@ func (p caldavProvider) DeleteRemote(ctx context.Context, src Source, cal Calend
 		// the locally stored version; otherwise surface ErrConflict so the
 		// UI shows the conflict instead of silently deleting the other
 		// person's version.
-		if ev.ETag != "" && p.serverCopyUnchanged(ctx, httpClient, cal, ev, href) {
+		if ev.ETag != "" && p.serverCopyVerdict(ctx, httpClient, cal, ev, href) == serverCopyUnchanged {
 			return p.retryDeleteUnconditional(ctx, httpClient, href)
 		}
 		return ErrConflict
@@ -571,9 +732,9 @@ func (p caldavProvider) DeleteRemote(ctx context.Context, src Source, cal Calend
 }
 
 // retryDeleteUnconditional re-sends a DELETE without If-Match. Mirror of
-// retryPutUnconditional: called only after serverCopyUnchanged proved the
-// server copy is substantively identical to the locally stored version, so
-// the 412 came from our own stale ETag rather than a concurrent edit.
+// retryPutUnconditional: called only after the server-copy verdict proved
+// the server copy is substantively identical to the locally stored version,
+// so the 412 came from our own stale ETag rather than a concurrent edit.
 func (p caldavProvider) retryDeleteUnconditional(ctx context.Context, httpClient webdav.HTTPClient, href string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, href, nil)
 	if err != nil {

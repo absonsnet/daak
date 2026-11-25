@@ -762,7 +762,26 @@ type Event struct {
 	RRuleText       string `json:"rruleText,omitempty"`
 	Transparency    string `json:"transparency,omitempty"` // "busy" (default) | "free"; iCal TRANSP
 	Visibility      string `json:"visibility,omitempty"`   // "public" (default) | "private" | "confidential"; iCal CLASS
-	ICSBlob         string `json:"-"` // not exposed to frontend; used by rrule_expand
+	// Status is the iCal STATUS (CONFIRMED | TENTATIVE | CANCELLED, upper
+	// case, "" when the VEVENT carries none). Parsed from the ICS blob by
+	// buildEvent / fillDenormalizedFieldsFromICS; NOT a DB column — the
+	// blob stays the source of truth. Compared by sameCalendarSubstance so
+	// a server-side cancellation is not mistaken for "unchanged".
+	Status string `json:"status,omitempty"`
+	// Sequence is the iCal SEQUENCE (revision counter, 0 when absent).
+	// Same parse-only status as Status.
+	Sequence int `json:"sequence,omitempty"`
+	// Categories is the iCal CATEGORIES list, sorted + deduped at parse
+	// time so order on the wire does not count as a change.
+	Categories []string `json:"categories,omitempty"`
+	// ExceptionDates holds the iCal EXDATE instants (deleted occurrences
+	// of a recurring series) as sorted, deduped unix seconds.
+	ExceptionDates []int64 `json:"exceptionDates,omitempty"`
+	// AlarmFingerprints is one canonical string per VALARM on the master
+	// VEVENT (ACTION + trigger + description, sorted). Compared by
+	// sameCalendarSubstance so a server-side reminder change counts.
+	AlarmFingerprints []string `json:"alarmFingerprints,omitempty"`
+	ICSBlob           string   `json:"-"` // not exposed to frontend; used by rrule_expand
 
 	// Attendees + Organizer. Populated by the ICS parser on read; written
 	// back into the JSON columns by UpsertEventTx. Types defined in
