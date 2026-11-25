@@ -59,14 +59,27 @@ type QueuedItem struct {
 // dispatch budget plus the global pause switch. Stored as one JSON
 // blob in the extension KV (key "queue:config"); it is global, not
 // per-account, because the queue spans accounts.
+//
+// CountNormalSends (re-audit R27) is OFF by default: the hourly
+// budget then counts Mail Merge mail only, exactly as before. When
+// ON, normal sends dispatched through the host send queue also count
+// toward the same hourly budget (one durable row per send in
+// mailmerge_external_sends, recorded at SMTP-accept time). Reactions
+// are never counted — they are tiny user-initiated messages, not
+// bulk mail, and counting them could block a Mail Merge run because
+// the user reacted to emails.
 type QueueConfig struct {
 	PerHour int  `json:"perHour"`
 	Paused  bool `json:"paused"`
+	// CountNormalSends counts normal composer sends (via the host
+	// send queue) toward the hourly budget. Default false.
+	CountNormalSends bool `json:"countNormalSends"`
 }
 
-// DefaultQueueConfig returns the defaults: 100/hour, not paused.
+// DefaultQueueConfig returns the defaults: 100/hour, not paused,
+// normal sends NOT counted toward the budget.
 func DefaultQueueConfig() QueueConfig {
-	return QueueConfig{PerHour: DefaultQueuePerHour, Paused: false}
+	return QueueConfig{PerHour: DefaultQueuePerHour, Paused: false, CountNormalSends: false}
 }
 
 // QueueRunStats is one run's queue breakdown, for the queue view.
@@ -260,19 +273,22 @@ func (b *MailMergeBridge) dispatchDue(now time.Time, runID string, manual bool) 
 	}
 	// Hourly budget: sent in the last rolling hour, across all runs.
 	// The budget is global because the provider's rate limit is per
-	// account/sender, not per merge run.
+	// account/sender, not per merge run. With the R27 opt-in on, the
+	// count also includes normal sends dispatched through the host
+	// send queue (recorded in mailmerge_external_sends); with it
+	// off (the default) the count is Mail Merge mail only.
 	windowStart := now.Add(-time.Hour)
-	sentLastHour, err := b.store.CountSentSince(windowStart)
+	sentLastHour, oldestSent, hasOldest, err := b.countBudgetSent(windowStart, cfg)
 	if err != nil {
 		return result, err
 	}
 	remaining := cfg.PerHour - sentLastHour
 	if remaining <= 0 {
 		// Budget exhausted: push the due items' next attempt to when
-		// the budget frees (oldest sent + 1h), so the persisted
-		// schedule shows it and survives a restart.
-		if oldest, ok, _ := b.store.OldestSentSince(windowStart); ok {
-			_ = b.store.PushDueItemsNextAttempt(now, oldest.Add(time.Hour), runID)
+		// the budget frees (oldest counted send + 1h), so the
+		// persisted schedule shows it and survives a restart.
+		if hasOldest {
+			_ = b.store.PushDueItemsNextAttempt(now, oldestSent.Add(time.Hour), runID)
 		}
 		result.Remaining, _ = b.store.CountQueued(runID)
 		return result, nil
@@ -324,7 +340,7 @@ func (b *MailMergeBridge) dispatchDue(now time.Time, runID string, manual bool) 
 	// If the budget is now exhausted and due items remain, push their
 	// next attempt to when the budget frees.
 	if sentLastHour+result.Sent >= cfg.PerHour {
-		if oldest, ok, _ := b.store.OldestSentSince(now.Add(-time.Hour)); ok {
+		if _, oldest, hasOldest, _ := b.countBudgetSent(now.Add(-time.Hour), cfg); hasOldest {
 			_ = b.store.PushDueItemsNextAttempt(now, oldest.Add(time.Hour), runID)
 		}
 	}
@@ -466,6 +482,71 @@ func (b *MailMergeBridge) MailMerge_GetQueueStats() (QueueStats, error) {
 		return QueueStats{}, err
 	}
 	return b.store.QueueStats()
+}
+
+// countBudgetSent returns how many sends count toward the hourly
+// budget in the window starting at `since`, plus the earliest
+// counted send (the moment the budget frees, +1h). The count is
+// always the Mail Merge run log; when cfg.CountNormalSends is on
+// (re-audit R27) it also includes normal sends recorded in
+// mailmerge_external_sends, and the earliest send is the earlier of
+// the two sources. A read error is returned (not silently treated
+// as zero): dispatchDue then fails the dispatch instead of sending
+// on an under-counted budget.
+func (b *MailMergeBridge) countBudgetSent(since time.Time, cfg QueueConfig) (int, time.Time, bool, error) {
+	sent, err := b.store.CountSentSince(since)
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	oldest, ok, err := b.store.OldestSentSince(since)
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	if !cfg.CountNormalSends {
+		return sent, oldest, ok, nil
+	}
+	external, err := b.store.CountExternalSentSince(since)
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	sent += external
+	if extOldest, extOk, err := b.store.OldestExternalSentSince(since); err != nil {
+		return 0, time.Time{}, false, err
+	} else if extOk && (!ok || extOldest.Before(oldest)) {
+		oldest, ok = extOldest, true
+	}
+	return sent, oldest, ok, nil
+}
+
+// MailMerge_RecordNormalSend records one normal (non-Mail-Merge)
+// send dispatched through the host send queue, for the hourly
+// budget — but only when the QueueConfig.CountNormalSends opt-in is
+// on. With the opt-in off (the default) this is a no-op: nothing is
+// written, and the budget counts Mail Merge mail only. Best-effort
+// by contract: the host calls this from the send queue's
+// after-SMTP-accept hook and ignores any error, so a count write
+// can never fail a send. Reactions never reach this method — the
+// host hook fires for KindMessage dispatches only.
+// A nil bridge (a partially-constructed host App) is a no-op, not a
+// panic.
+func (b *MailMergeBridge) MailMerge_RecordNormalSend(sentAt time.Time) error {
+	if b == nil || !b.gateEnabled() {
+		return nil
+	}
+	if err := b.ensureInit(); err != nil {
+		return err
+	}
+	cfg, err := b.store.GetQueueConfig()
+	if err != nil {
+		return err
+	}
+	if !cfg.CountNormalSends {
+		return nil
+	}
+	if sentAt.IsZero() {
+		sentAt = time.Now().UTC()
+	}
+	return b.store.RecordExternalSend(sentAt)
 }
 
 // MailMerge_GetQueueConfig returns the global queue config.

@@ -21,6 +21,7 @@ import {platform} from '../models';
 import {sync} from '../models';
 import {draft} from '../models';
 import {mailmerge} from '../models';
+import {time} from '../models';
 
 export function AIWriting_GetActionPrompts():Promise<Array<backend.ActionPromptInfo>>;
 
@@ -601,6 +602,8 @@ export function MailMerge_PickAttachmentDir():Promise<string>;
 export function MailMerge_PickFile(arg1:string):Promise<string>;
 
 export function MailMerge_Preview(arg1:mailmerge.Template,arg2:Array<Record<string, string>>,arg3:Array<number>):Promise<Array<mailmerge.RenderedMessage>>;
+
+export function MailMerge_RecordNormalSend(arg1:time.Time):Promise<void>;
 
 export function MailMerge_ResumeQueue():Promise<void>;
 
