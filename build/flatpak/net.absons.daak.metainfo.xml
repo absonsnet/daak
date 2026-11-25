@@ -375,6 +375,13 @@
   </provides>
 
   <releases>
+    <release version="0.7.39" date="2026-11-25">
+      <description>
+        <ul>
+          <li>Ten re-audit fixes: daily contact sync retries failed changes instead of losing them, period sync no longer deletes old mail still on the server, Mail Merge Send now reuses one Message-ID and queue sends clear before the Sent save, moved messages no longer marked permanently failed, calendar conflicts catch cancellations, organiser, alarms and missing stamps, reactions replace instead of doubling, failed sends block re-send with a database rule, and attachment-only mails with failed text are flagged with a viewer Retry</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.38" date="2026-11-24">
       <description>
         <ul>

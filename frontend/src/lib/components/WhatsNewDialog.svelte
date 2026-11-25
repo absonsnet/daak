@@ -60,15 +60,15 @@
       </div>
 
       <div class="space-y-4 max-h-[60vh] overflow-y-auto text-sm">
-        <p>🚀 Welcome to {APP_NAME} v0.7.38!</p>
+        <p>🚀 Welcome to {APP_NAME} v0.7.39!</p>
 
-        <p>v0.7.38 fixes the remaining nineteen issues found in the whole-app audit:</p>
+        <p>v0.7.39 fixes the first ten issues found in the re-audit:</p>
 
         <ul class="list-disc pl-6 space-y-1">
-          <li>🔁 Failed body downloads now retry on Force Resync, and Unsubscribe is fixed: no more injected headers, and one-click Unsubscribe only reports success when the request truly arrives</li>
-          <li>📬 Mail Merge is safer: failed rows no longer block later rows to the same person, cancelling never deletes a send already in flight, failed runs are recorded as failed with Resume working, and run-log failures are no longer hidden</li>
-          <li>⏪ The Undo toast now reliably appears, and closing the window can no longer strand Daak invisible with no tray icon</li>
-          <li>🔍 Message-ID lookups now match regardless of brackets, attachments save byte-identical, server-search attachments list properly, new-mail counts are real arrivals, large messages are flagged as truncated, contacts are checked across all of the sending account's address books, and sign-in refreshes no longer clash</li>
+          <li>🔁 Contact sync and mail sync are safer: failed contact changes are retried instead of lost, and old mail still on the server is no longer deleted by a period sync</li>
+          <li>📬 Mail Merge is safer: Send now reuses one Message-ID on retry and Resume, queue sends clear before the Sent save, and moved messages are no longer wrongly marked as failed</li>
+          <li>📅 Calendar conflicts now catch cancellations, organiser, alarm and exception changes, and writes with no known server stamp re-check before saving</li>
+          <li>⏪ Reactions now replace instead of doubling inside the undo window, failed sends block re-sending the same draft, and a failed message body can be retried from the viewer</li>
         </ul>
 
         <p>🏷 See the full change log here:</p>

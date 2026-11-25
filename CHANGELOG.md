@@ -1,5 +1,19 @@
 # CHANGELOG
 
+**v0.7.39 - 25-11-2026**
+---
+
+- Daily contact sync no longer silently loses deletions and updates: a failed delete or save now holds the sync marker so the next sync retries the change instead of reporting success
+- Syncing with a date limit no longer deletes old mail that is still on the server: the reconcile now skips mail older than the sync window, leaving that to the age-based purge
+- Mail Merge "Send now" now gives each row one Message-ID at render time and reuses it on retry and Resume, so a lost acknowledgement can no longer deliver the same mail twice
+- Mail Merge queue sends now clear the queue row the moment the server accepts the mail, before the Sent save, so a crash during the save can no longer re-send the mail
+- The batch body lookup now skips placeholder UIDs from just-moved messages, so a moved message is no longer wrongly marked as permanently failed
+- The calendar conflict check now also compares organiser, cancelled status, sequence, categories, exception dates and reminders, with a whole-event fingerprint as a backstop, so a concurrent cancellation or reminder change is no longer silently overwritten
+- Calendar writes with no known server stamp now re-fetch and compare the server copy before writing, instead of saving blindly, in CalDAV, Google and Microsoft calendars
+- Changing a reaction inside the undo window now replaces the waiting reaction instead of queueing a second one, so the other person no longer receives both
+- A failed send now blocks re-sending the same draft (use Retry instead), Retry is blocked while a live send exists, and a database rule now enforces one live send per draft
+- An email whose text failed to download but whose attachment succeeded is no longer treated as complete: the failure is flagged or the fetch deferred, the failed flag is now visible to the viewer, and opening a failed message retries the download with a Retry button
+
 **v0.7.38 - 24-11-2026**
 ---
 
