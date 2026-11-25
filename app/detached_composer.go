@@ -882,6 +882,13 @@ func (c *ComposerApp) notifyMessageQueued(accountID string, msg smtp.ComposeMess
 }
 
 // SendMessage sends the composed email.
+//
+// Direct send (fourth-audit finding 39): unlike QueueSend, this
+// transmits immediately — there is NO Undo window and NO Outbox row.
+// The composer UI uses QueueSend; this binding stays for programmatic
+// callers that need a synchronous send. It DOES count toward the Mail
+// Merge hourly budget when the count-normal-sends opt-in is on (the
+// afterSMTP hook records it, mirroring the queue worker).
 func (c *ComposerApp) SendMessage(accountID string, msg smtp.ComposeMessage) error {
 	// Cancel in-flight draft sync before send+delete
 	if c.currentDraft != nil {
@@ -894,7 +901,9 @@ func (c *ComposerApp) SendMessage(accountID string, msg smtp.ComposeMessage) err
 	// finding R24) in the shared queue DB, so the main window can
 	// show it — a swallowed error would leave a delivered mail
 	// with no record anywhere in Daak.
-	_, err, sentSaveErr := c.composeOps.sendMessage(c.ctx, accountID, msg, c.currentDraft)
+	_, err, sentSaveErr := c.composeOps.sendMessageWithHook(c.ctx, accountID, msg, c.currentDraft, func(_ []byte) {
+		recordNormalSendBudget(c.MailMergeBridge, time.Now())
+	})
 	if err != nil {
 		return err
 	}

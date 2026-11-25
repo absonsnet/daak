@@ -634,28 +634,38 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 
 	fromEmail := msg.From.Address
 
-	// S/MIME signing (if configured for this account/message)
+	// S/MIME signing (if configured for this account/message). The
+	// booleans below record what ACTUALLY happened — the PGP gates
+	// read them, not the per-message toggles (fourth-audit finding
+	// 44): shouldSignMessage can return false even with SignMessage
+	// set (no S/MIME certificate), and true with it unset (policy
+	// "always"). Gating PGP on the toggle double-signed in the
+	// second case and signed with neither in the first.
+	smimeSigned := false
 	if ops.shouldSignMessage(accountID, msg.SignMessage) {
 		signedMsg, signErr := ops.smimeSigner.SignMessage(accountID, fromEmail, rawMsg)
 		if signErr != nil {
 			return nil, fmt.Errorf("failed to sign message: %w", signErr), nil
 		}
 		rawMsg = signedMsg
+		smimeSigned = true
 		log.Info().Str("accountID", accountID).Msg("Message signed with S/MIME")
 	}
 
 	// S/MIME encryption (if configured) — sign-then-encrypt per RFC 5751
+	smimeEncrypted := false
 	if ops.shouldEncryptMessage(accountID, msg.EncryptMessage) {
 		encryptedMsg, encErr := ops.smimeEncryptor.EncryptMessage(accountID, fromEmail, msg.AllRecipients(), rawMsg)
 		if encErr != nil {
 			return nil, fmt.Errorf("failed to encrypt message: %w", encErr), nil
 		}
 		rawMsg = encryptedMsg
+		smimeEncrypted = true
 		log.Info().Str("accountID", accountID).Msg("Message encrypted with S/MIME")
 	}
 
-	// PGP signing (mutually exclusive with S/MIME — only if S/MIME sign was not applied)
-	if !msg.SignMessage && ops.shouldPGPSignMessage(accountID, msg.PGPSignMessage) {
+	// PGP signing (mutually exclusive with S/MIME — only if S/MIME sign was not actually applied)
+	if !smimeSigned && ops.shouldPGPSignMessage(accountID, msg.PGPSignMessage) {
 		signedMsg, signErr := ops.pgpSigner.SignMessage(accountID, fromEmail, rawMsg)
 		if signErr != nil {
 			return nil, fmt.Errorf("failed to PGP sign message: %w", signErr), nil
@@ -664,8 +674,8 @@ func (ops *composeOps) sendMessageWithHook(ctx context.Context, accountID string
 		log.Info().Str("accountID", accountID).Msg("Message signed with PGP")
 	}
 
-	// PGP encryption (mutually exclusive with S/MIME — only if S/MIME encrypt was not applied)
-	if !msg.EncryptMessage && ops.shouldPGPEncryptMessage(accountID, msg.PGPEncryptMessage) {
+	// PGP encryption (mutually exclusive with S/MIME — only if S/MIME encrypt was not actually applied)
+	if !smimeEncrypted && ops.shouldPGPEncryptMessage(accountID, msg.PGPEncryptMessage) {
 		encryptedMsg, encErr := ops.pgpEncryptor.EncryptMessage(accountID, fromEmail, msg.AllRecipients(), rawMsg)
 		if encErr != nil {
 			return nil, fmt.Errorf("failed to PGP encrypt message: %w", encErr), nil
@@ -802,8 +812,17 @@ func pickAttachmentFiles(ctx context.Context) ([]ComposerAttachment, error) {
 // already accepted by SMTP), but it is recorded as a persistent
 // "Sent save failed" Outbox warning (re-audit finding R24) instead
 // of vanishing with only a log line.
+//
+// Direct send (fourth-audit finding 39): unlike QueueSend, this
+// transmits immediately — there is NO Undo window and NO Outbox row.
+// The composer UI uses QueueSend; this binding stays for programmatic
+// callers that need a synchronous send. It DOES count toward the Mail
+// Merge hourly budget when the count-normal-sends opt-in is on (the
+// afterSMTP hook records it, mirroring the queue worker).
 func (a *App) SendMessage(accountID string, msg smtp.ComposeMessage) error {
-	_, err, sentSaveErr := a.composeOps.sendMessage(a.ctx, accountID, msg, nil)
+	_, err, sentSaveErr := a.composeOps.sendMessageWithHook(a.ctx, accountID, msg, nil, func(_ []byte) {
+		recordNormalSendBudget(a.MailMergeBridge, time.Now())
+	})
 	if err != nil {
 		return err
 	}

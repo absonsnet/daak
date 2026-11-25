@@ -44,7 +44,13 @@ export interface ComposerToolbarItem {
  * Both App and ComposerApp implement these methods with the same signatures.
  */
 export interface ComposerApi {
-  /** Send a composed email */
+  /**
+   * Send a composed email directly: transmits immediately, with NO Undo
+   * window and NO Outbox row (fourth-audit finding 39). The composer UI
+   * uses queueSend; this stays for callers that need a synchronous send.
+   * Direct sends still count toward the Mail Merge hourly budget when
+   * the count-normal-sends opt-in is on.
+   */
   sendMessage: (accountId: string, message: smtp.ComposeMessage) => Promise<void>
 
   /** Queue a composed email for background send after the undo

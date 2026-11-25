@@ -159,6 +159,29 @@ type sendQueueService struct {
 	onNormalSendAccepted func(sentAt time.Time)
 }
 
+// normalSendRecorder is the narrow interface MailMerge_RecordNormalSend
+// satisfies. recordNormalSendBudget takes it so direct-send paths in
+// both App and ComposerApp can share one call site.
+type normalSendRecorder interface {
+	MailMerge_RecordNormalSend(sentAt time.Time) error
+}
+
+// recordNormalSendBudget counts one SMTP-accepted normal send toward the
+// Mail Merge hourly budget when the R27 opt-in is on (fourth-audit
+// finding 39). The bridge method no-ops when the opt-in is off or the
+// extension is disabled, and its error is dropped on purpose: the mail
+// is already accepted by SMTP, so a count write can never fail a send.
+// A panic inside the recorder is recovered for the same reason. Use it
+// from every path that sends a normal mail outside the queue worker —
+// the queue worker has its own identical call in markAccepted.
+func recordNormalSendBudget(recorder normalSendRecorder, sentAt time.Time) {
+	if recorder == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	_ = recorder.MailMerge_RecordNormalSend(sentAt)
+}
+
 func (s *sendQueueService) clock() time.Time {
 	if s.now != nil {
 		return s.now()
