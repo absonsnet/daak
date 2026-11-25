@@ -66,6 +66,19 @@ type ParsedBody struct {
 	// (with body_fetched=1 — a re-fetch would hit the same cap), but the
 	// flag is persisted as body_truncated so the viewer can disclose it.
 	Truncated bool
+	// TextPartsFailed records, at parse time, that at least one text
+	// (text/plain or text/html) part existed but could not be read — a
+	// part Body read error, or the multipart walk aborting on repeated
+	// part errors — so no body text came out of it. This is the
+	// distinction re-audit finding R10 needs: a message with attachments
+	// and no text because no text parts exist is genuinely complete, but
+	// one whose text parts failed is not — without this signal the fetch
+	// looks "resolved" (attachments count as usable content) and the
+	// lost body is never retried or flagged. Only meaningful when no
+	// body text/HTML was produced at all; a message that recovered text
+	// from another part is resolved regardless (see
+	// BodyUpdate.HasUsableContent).
+	TextPartsFailed bool
 	// Reaction is set when the message is an email reaction (Gmail's
 	// text/vnd.google.email-reaction+json part or an RFC 9078
 	// Content-Disposition: reaction part). Nil for regular messages.

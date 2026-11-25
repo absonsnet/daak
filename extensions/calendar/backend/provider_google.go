@@ -26,6 +26,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -302,8 +303,90 @@ func fillDenormalizedFieldsFromICS(ev *Event, blob string) {
 	ev.TZName = parsed.Master.TZName
 	ev.Transparency = parsed.Master.Transparency
 	ev.Visibility = parsed.Master.Visibility
+	ev.Status = parsed.Master.Status
+	ev.Sequence = parsed.Master.Sequence
+	ev.Categories = parsed.Master.Categories
+	ev.ExceptionDates = parsed.Master.ExceptionDates
+	ev.AlarmFingerprints = parsed.Master.AlarmFingerprints
 	ev.Attendees = parsed.Master.Attendees
 	ev.Organizer = parsed.Master.Organizer
+}
+
+// errGoogleEventNotFound marks a 404/410 from a single-event GET: the
+// server copy is gone.
+var errGoogleEventNotFound = errors.New("google event not found")
+
+// fetchGoogleEvent GETs one Google event resource. Non-200 (other than
+// 404/410) is an error — a copy we cannot read cannot prove anything
+// about the server state.
+func (p googleProvider) fetchGoogleEvent(ctx context.Context, client *http.Client, cal Calendar, eventID string) (*googleEvent, error) {
+	u := googleAPIBase + "/calendars/" + url.PathEscape(cal.URL) +
+		"/events/" + url.PathEscape(eventID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build get request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("google get event: %w: %v", ErrTransport, err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound, http.StatusGone:
+		return nil, errGoogleEventNotFound
+	default:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("google get event %d %s: %s",
+			resp.StatusCode, resp.Status, strings.TrimSpace(string(body)))
+	}
+	var out googleEvent
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode google event: %w", err)
+	}
+	return &out, nil
+}
+
+// googleServerCopyVerdict re-fetches the server's current copy of the event
+// (single-event GET → ICS translation → field-wise comparison against the
+// locally stored blob) and reports whether an unconditional write is safe.
+// Mirrors caldavProvider.serverCopyVerdict; see there for the verdict
+// meanings. A cancelled server copy is a tombstone, so it counts as gone:
+// an update must not resurrect it, a delete is already done.
+//
+// Override-level differences are not compared: Google models per-instance
+// exceptions as separate event resources, so PATCH/DELETE on the master
+// resource cannot clobber them, and sync does not persist them.
+func (p googleProvider) googleServerCopyVerdict(ctx context.Context, client *http.Client, cal Calendar, ev Event) serverCopyVerdict {
+	if p.store == nil {
+		return serverCopyUnknown
+	}
+	id, err := p.lookupEventIDByUID(cal.ID, ev.UID)
+	if err != nil || id == "" {
+		return serverCopyUnknown
+	}
+	stored, err := p.store.GetEvent(id)
+	if err != nil || stored == nil || stored.ICSBlob == "" {
+		return serverCopyUnknown
+	}
+	fetched, err := p.fetchGoogleEvent(ctx, client, cal, ev.ProviderEventID)
+	if err != nil {
+		if errors.Is(err, errGoogleEventNotFound) {
+			return serverCopyGone
+		}
+		return serverCopyUnknown
+	}
+	if fetched.Status == "cancelled" {
+		return serverCopyGone
+	}
+	blob, err := translateGoogleEventToICS(*fetched)
+	if err != nil {
+		return serverCopyUnknown
+	}
+	if compareServerICS(blob, stored.ICSBlob) {
+		return serverCopyUnchanged
+	}
+	return serverCopyChanged
 }
 
 // --- Write (PUT) -----------------------------------------------------------
@@ -346,6 +429,15 @@ func (p googleProvider) PushEvent(ctx context.Context, src Source, cal Calendar,
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	if ev.ProviderEventID != "" && ev.ETag != "" {
 		req.Header.Set("If-Match", ev.ETag)
+	}
+	// Update with no known local ETag: a bare PATCH would overwrite any
+	// concurrent edit with no 412 ever possible. Re-fetch the server copy
+	// first and write unconditionally ONLY when it is proven identical to
+	// the locally stored version; otherwise refuse with ErrConflict.
+	if ev.ProviderEventID != "" && ev.ETag == "" {
+		if v := p.googleServerCopyVerdict(ctx, client, cal, ev); v != serverCopyUnchanged {
+			return PushResult{}, ErrConflict
+		}
 	}
 
 	resp, err := client.Do(req)
@@ -419,6 +511,18 @@ func (p googleProvider) DeleteRemote(ctx context.Context, src Source, cal Calend
 
 	endpoint := googleAPIBase + "/calendars/" + url.PathEscape(cal.URL) +
 		"/events/" + url.PathEscape(ev.ProviderEventID)
+
+	// Delete with no known local ETag: re-fetch and compare first (same
+	// gate as PushEvent) instead of sending a bare DELETE. A server copy
+	// that is already gone (cancelled/404) means the delete is a no-op
+	// success, so it may proceed.
+	if ev.ETag == "" {
+		switch v := p.googleServerCopyVerdict(ctx, client, cal, ev); v {
+		case serverCopyUnchanged, serverCopyGone:
+		default:
+			return ErrConflict
+		}
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {

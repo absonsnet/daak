@@ -202,7 +202,12 @@ func (e *Engine) parseMultipartBody(mr gomessage.MultipartReader, result *Parsed
 			}
 			// A single malformed part must not sacrifice the siblings after it: skip
 			// it and keep walking (mirrors email/attachment.go). Bounded so a reader
-			// that errors forever can't spin.
+			// that errors forever can't spin. The skipped part's type is
+			// unknowable here — it may have been a text part — so record
+			// the failure (re-audit finding R10): if no body text comes
+			// out of the walk at all, the message must not be treated as
+			// a genuinely attachment-only complete fetch.
+			result.TextPartsFailed = true
 			consecutiveErrors++
 			e.log.Debug().Err(err).Int("partIndex", partIndex).Int("consecutiveErrors", consecutiveErrors).Msg("Error reading multipart part, skipping")
 			if consecutiveErrors > maxConsecutiveNextPartErrors {
@@ -348,6 +353,13 @@ func (e *Engine) parseMultipartBody(mr gomessage.MultipartReader, result *Parsed
 		lr := io.LimitReader(part.Body, maxPartSize+1)
 		partBody, err := io.ReadAll(lr)
 		if err != nil {
+			// A text part that cannot be read (e.g. corrupt base64)
+			// produces no body text — record it (re-audit finding
+			// R10) so an attachments-only result is not mistaken for
+			// a genuinely attachment-only message. Partial bytes are
+			// still kept below; the flag only matters when no text
+			// comes out of the message at all.
+			result.TextPartsFailed = true
 			if len(partBody) > 0 {
 				e.log.Warn().Err(err).Int("partIndex", partIndex).Int("partialLen", len(partBody)).Msg("Read partial part body")
 			} else {
@@ -418,6 +430,10 @@ func (e *Engine) parseSinglePartBody(entity *gomessage.Entity, result *ParsedBod
 	lr := io.LimitReader(entity.Body, maxPartSize+1)
 	body, err := io.ReadAll(lr)
 	if err != nil {
+		// Single-part text body unreadable: same R10 signal as the
+		// multipart text-part read error above — the attachment
+		// branch already returned, so this part was the body text.
+		result.TextPartsFailed = true
 		e.log.Debug().Err(err).Msg("Failed to read single-part message body")
 		return
 	}

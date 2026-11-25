@@ -616,6 +616,8 @@ func (v *ViewerApp) GetMessageSource(messageID string) (string, error) {
 }
 
 // FetchMessageBody fetches the body for a message on-demand.
+// Mirrors App.FetchMessageBody: a previously failed fetch (BodyFailed)
+// is retried on open instead of returned early (re-audit finding R10).
 func (v *ViewerApp) FetchMessageBody(messageID string) (*message.Message, error) {
 	msg, err := v.messageStore.Get(messageID)
 	if err != nil {
@@ -624,7 +626,7 @@ func (v *ViewerApp) FetchMessageBody(messageID string) (*message.Message, error)
 	if msg == nil {
 		return nil, fmt.Errorf("message not found: %s", messageID)
 	}
-	if msg.BodyFetched {
+	if msg.BodyFetched && !msg.BodyFailed {
 		return msg, nil
 	}
 	return v.syncEngine.FetchMessageBody(v.ctx, msg.AccountID, messageID)

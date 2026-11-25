@@ -354,11 +354,14 @@ func (s *Syncer) storeOAuthContactsDelta(ab *Addressbook, result *contact.SyncRe
 
 	if len(result.DeletedIDs) > 0 {
 		// Incremental sync: delete the records the provider reported removed.
+		// A failed delete fails the sync: advancing the token past it would
+		// leave the deleted contact in Daak for ever, since the next sync
+		// never re-asks for that change.
 		s.log.Debug().Int("count", len(result.DeletedIDs)).Msg("Deleting removed OAuth contacts")
 		if err := retryDBOperation(func() error {
 			return s.store.DeleteContactsByHrefs(ab.ID, result.DeletedIDs)
 		}, 5, 100*time.Millisecond, s.log); err != nil {
-			s.log.Warn().Err(err).Msg("Failed to delete removed records after retries")
+			return fmt.Errorf("failed to delete removed records: %w", err)
 		}
 	}
 
@@ -382,8 +385,13 @@ func (s *Syncer) storeOAuthContactsDelta(ab *Addressbook, result *contact.SyncRe
 		}
 	}
 
-	// Store the sync token for future incremental syncs
-	s.store.UpdateAddressbookSyncToken(ab.ID, result.NextSyncToken)
+	// Store the sync token for future incremental syncs — only after the
+	// deletes and upserts above both succeeded. Any failure returns early,
+	// so the old token survives and the next sync re-asks for the same
+	// delta instead of skipping past it.
+	if err := s.store.UpdateAddressbookSyncToken(ab.ID, result.NextSyncToken); err != nil {
+		return fmt.Errorf("failed to update sync token: %w", err)
+	}
 
 	return nil
 }
@@ -417,14 +425,18 @@ func (s *Syncer) syncAddressbookIncremental(client *Client, ab *Addressbook) err
 		return err
 	}
 
-	// Process deleted contacts
+	// Process deleted contacts. A failed delete fails the incremental
+	// sync instead of being logged and carried past: advancing the token
+	// would leave the deleted contact in Daak for ever, since the next
+	// sync never re-asks for that change. (syncAddressbook then falls
+	// back to a full sync, which only advances the token on success.)
 	if len(result.Deleted) > 0 {
 		s.log.Debug().Int("count", len(result.Deleted)).Msg("Processing deleted contacts")
 		deleteErr := retryDBOperation(func() error {
 			return s.store.DeleteContactsByHrefs(ab.ID, result.Deleted)
 		}, 5, 100*time.Millisecond, s.log)
 		if deleteErr != nil {
-			s.log.Warn().Err(deleteErr).Msg("Failed to delete contacts after retries")
+			return fmt.Errorf("failed to delete contacts: %w", deleteErr)
 		}
 	}
 
@@ -440,8 +452,12 @@ func (s *Syncer) syncAddressbookIncremental(client *Client, ab *Addressbook) err
 		}
 	}
 
-	// Update sync token
-	s.store.UpdateAddressbookSyncToken(ab.ID, result.SyncToken)
+	// Update sync token — only after the deletes and upserts above both
+	// succeeded, so a failure leaves the old token in place and the next
+	// sync retries this delta.
+	if err := s.store.UpdateAddressbookSyncToken(ab.ID, result.SyncToken); err != nil {
+		return fmt.Errorf("failed to update sync token: %w", err)
+	}
 
 	s.log.Info().
 		Str("addressbook", ab.Name).

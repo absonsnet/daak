@@ -507,9 +507,14 @@ func (b *MailMergeBridge) MailMerge_ResumeRun(runID string) (string, error) {
 		return "", err
 	}
 	var rows []map[string]string
+	var messageIDs []string
 	for _, r := range run.Rows {
 		if r.Status == hostmm.RowFailed && r.Index >= 0 && r.Index < len(req.Rows) {
 			rows = append(rows, req.Rows[r.Index])
+			// The Message-ID assigned when this row was first
+			// rendered rides along, parallel to rows, so the retry
+			// rebuilds the same mail with the same identity.
+			messageIDs = append(messageIDs, r.MessageID)
 		}
 	}
 	// A run that failed as a whole (RunFailed) with no failed rows
@@ -523,6 +528,7 @@ func (b *MailMergeBridge) MailMerge_ResumeRun(runID string) (string, error) {
 		return "", fmt.Errorf("mail-merge: run %q has no failed rows to resume", runID)
 	}
 	req.Rows = rows
+	req.MessageIDs = messageIDs
 	req.StartRow = 0
 	req.StopRow = 0
 	req.AttachmentDir = b.effectiveAttachmentDir(req)
@@ -897,15 +903,27 @@ func (b *MailMergeBridge) sendBatch(runID string, capped bool) error {
 		take = take[:limit]
 	}
 	rows := make([]map[string]string, 0, len(take))
+	messageIDs := make([]string, 0, len(take))
+	heldIDs := map[int]string{}
+	for _, r := range run.Rows {
+		if r.Status == hostmm.RowHeld {
+			heldIDs[r.Index] = r.MessageID
+		}
+	}
 	for _, idx := range take {
 		if idx < 0 || idx >= len(req.Rows) {
 			return fmt.Errorf("mail-merge: run %q has a held row %d out of range", runID, idx)
 		}
 		rows = append(rows, req.Rows[idx])
+		// The Message-ID assigned when this row was first rendered
+		// rides along, parallel to rows, so the batch rebuilds the
+		// same mail with the same identity.
+		messageIDs = append(messageIDs, heldIDs[idx])
 	}
 	sub := hostmm.RunRequest{
 		Template:      req.Template,
 		Rows:          rows,
+		MessageIDs:    messageIDs,
 		SourceKind:    req.SourceKind,
 		DeliverMode:   "send",
 		PauseSeconds:  req.PauseSeconds,

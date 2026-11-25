@@ -424,6 +424,18 @@ func (e *Engine) FetchServerMessage(ctx context.Context, accountID, folderID str
 				(parsed.PGPEncrypted && len(parsed.PGPRawBody) == 0)) {
 			m.BodyFetched = false
 		}
+		// R10, same shape as the batch path: a server-search hit whose
+		// text parts failed to read (attachments extracted, no body
+		// text) must not be stored as body_fetched=1 — the background
+		// body pass would never re-select it. Leave it unfetched so
+		// the next body pass re-fetches it through the modern parser,
+		// which flags (full-size fetch) or defers (truncated fetch)
+		// the failure. A genuinely attachment-only hit keeps
+		// BodyFetched=true: its parse reports no text failure.
+		if parsed != nil && parsed.TextPartsFailed && m.BodyText == "" && m.BodyHTML == "" &&
+			!parsed.SMIMEEncrypted && !parsed.PGPEncrypted {
+			m.BodyFetched = false
+		}
 	}
 
 	if err := e.messageStore.Create(m); err != nil {

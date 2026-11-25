@@ -45,10 +45,16 @@ type GlobalAttachment struct {
 // RunRequest is everything a run needs. Rows are the recipient table;
 // StartRow/StopRow (1-based inclusive, 0 = first/last) select a slice
 // of them — the Thunderbird Start/Stop batch controls and the resume
-// mechanism.
+// mechanism. MessageIDs, when present, is parallel to Rows: the
+// Message-ID assigned when that row was first rendered (persisted in
+// the run log's RowResult). A resumed run or a held-row batch reuses
+// it, so a retry after a lost SMTP acknowledgement rebuilds the same
+// mail with the same identity instead of minting a fresh one. Entries
+// are "" for rows that were never rendered.
 type RunRequest struct {
 	Template      Template            `json:"template"`
 	Rows          []map[string]string `json:"rows"`
+	MessageIDs    []string            `json:"messageIds,omitempty"`
 	SourceKind    string              `json:"sourceKind"`  // "csv" | "json" | "xlsx" | "contacts"
 	DeliverMode   string              `json:"deliverMode"` // "drafts" | "send" | "later"
 	PauseSeconds  int                 `json:"pauseSeconds"`
@@ -77,10 +83,15 @@ const (
 // RowResult is one row's outcome in a run.
 type RowResult struct {
 	// Index is the row's position in the request's Rows slice (0-based).
-	Index     int       `json:"index"`
-	Email     string    `json:"email"`  // first To address, "" when unknown
-	Status    string    `json:"status"` // sent | draft-saved | failed | skipped | held
-	Error     string    `json:"error,omitempty"`
+	Index  int    `json:"index"`
+	Email  string `json:"email"`  // first To address, "" when unknown
+	Status string `json:"status"` // sent | draft-saved | failed | skipped | held
+	Error  string `json:"error,omitempty"`
+	// MessageID is the Message-ID assigned when the row was rendered
+	// ("" when the row never got that far). It is persisted in the
+	// run log so a resumed run rebuilds the same mail with the same
+	// identity instead of minting a fresh one.
+	MessageID string    `json:"messageId,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
 

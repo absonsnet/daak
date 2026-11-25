@@ -627,7 +627,7 @@ func (s *Store) ReplaceRecordsForAddressbook(addressbookID string, entries []Rec
 		e.Record.Source = "carddav"
 		e.Record.SourceRef = addressbookID
 
-		// Strict: unlike UpsertRecordsBatch, a failed record fails the
+		// Strict, like UpsertRecordsBatch: a failed record fails the
 		// whole replace — swallowing it here would silently drop that
 		// contact while still advancing the token.
 		if err := contact.UpsertRecordTx(tx, e.Record); err != nil {
@@ -795,8 +795,14 @@ type RecordSyncEntry struct {
 //     send_count/last_used/name_overridden).
 //  3. Upserts the carddav_record_state row with the new href/etag/synced_at.
 //
-// All entries in one transaction. Used by the sync engine to land batches of
-// vCards from sync-collection/multiget.
+// All entries in one transaction, and STRICT: any per-record failure — a
+// nil record, a missing addressbook_id/href, a lookup failure, a failed
+// upsert, or a failed state row — fails the whole batch and rolls it back,
+// instead of logging the failure, skipping the record, and returning nil.
+// The old skip-and-return-nil shape let the sync engine advance the sync
+// token past a change that never landed, so the next sync never re-asked
+// for it. Callers must treat a returned error as "nothing landed, token
+// not advanced, retry the delta".
 func (s *Store) UpsertRecordsBatch(entries []RecordSyncEntry) error {
 	if len(entries) == 0 {
 		return nil
@@ -812,11 +818,10 @@ func (s *Store) UpsertRecordsBatch(entries []RecordSyncEntry) error {
 	inserted := 0
 	for _, e := range entries {
 		if e.Record == nil {
-			continue
+			return fmt.Errorf("upsert record %s: nil record", e.Href)
 		}
 		if e.AddressbookID == "" || e.Href == "" {
-			s.log.Warn().Msg("Skipping record with missing addressbook_id or href")
-			continue
+			return fmt.Errorf("upsert record: addressbook_id and href are required (href %q)", e.Href)
 		}
 
 		// Reuse existing record_id when (addressbook_id, href) matches; new
@@ -832,8 +837,7 @@ func (s *Store) UpsertRecordsBatch(entries []RecordSyncEntry) error {
 				e.Record.ID = uuid.New().String()
 			}
 		case err != nil:
-			s.log.Warn().Err(err).Str("href", e.Href).Msg("Failed to look up existing record")
-			continue
+			return fmt.Errorf("look up existing record %s: %w", e.Href, err)
 		default:
 			e.Record.ID = existingID
 		}
@@ -842,8 +846,7 @@ func (s *Store) UpsertRecordsBatch(entries []RecordSyncEntry) error {
 		e.Record.SourceRef = e.AddressbookID
 
 		if err := contact.UpsertRecordTx(tx, e.Record); err != nil {
-			s.log.Warn().Err(err).Str("href", e.Href).Msg("Failed to upsert record in batch")
-			continue
+			return fmt.Errorf("upsert record %s: %w", e.Href, err)
 		}
 
 		if _, err := tx.Exec(`
@@ -855,8 +858,7 @@ func (s *Store) UpsertRecordsBatch(entries []RecordSyncEntry) error {
 				etag = excluded.etag,
 				synced_at = excluded.synced_at
 		`, e.Record.ID, e.AddressbookID, e.Href, e.ETag, now); err != nil {
-			s.log.Warn().Err(err).Str("href", e.Href).Msg("Failed to upsert carddav_record_state")
-			continue
+			return fmt.Errorf("upsert record state %s: %w", e.Href, err)
 		}
 		inserted++
 	}

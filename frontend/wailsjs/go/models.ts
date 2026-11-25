@@ -3165,6 +3165,7 @@ export namespace message {
 	    bodyHtml?: string;
 	    bodyFetched: boolean;
 	    bodyTruncated?: boolean;
+	    bodyFailed?: boolean;
 	    listUnsubscribe?: string;
 	    listUnsubscribePost?: boolean;
 	    category?: string;
@@ -3222,6 +3223,7 @@ export namespace message {
 	        this.bodyHtml = source["bodyHtml"];
 	        this.bodyFetched = source["bodyFetched"];
 	        this.bodyTruncated = source["bodyTruncated"];
+	        this.bodyFailed = source["bodyFailed"];
 	        this.listUnsubscribe = source["listUnsubscribe"];
 	        this.listUnsubscribePost = source["listUnsubscribePost"];
 	        this.category = source["category"];

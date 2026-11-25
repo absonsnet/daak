@@ -128,6 +128,102 @@ func TestMarkUnresolvedAsFailed_AttachmentOnlyNotFlagged(t *testing.T) {
 	})
 }
 
+// TestBatchUIDLookup_PlaceholderNeverMarkedBodyFailed (re-audit finding
+// R5): a just-moved message carries a negative placeholder UID, which the
+// batch lookup skips. The split must exclude it from the IDs passed to
+// markUnresolvedAsFailed, so the move is never charged body_failed —
+// charging it would strand the message, since every GetMessagesWithoutBody
+// variant requires body_failed = 0 and only the destination sync can
+// resolve the real UID. The real-UID control next to it proves flagging
+// still works for IDs the server was actually asked for.
+func TestBatchUIDLookup_PlaceholderNeverMarkedBodyFailed(t *testing.T) {
+	engine, db, msgStore, _ := newReactionHandleTestEngine(t)
+
+	if _, err := db.Exec(
+		`INSERT INTO folders (id, account_id, name, path, folder_type)
+		 VALUES ('folder-2', 'acc-1', 'Archive', 'Archive', 'archive')`,
+	); err != nil {
+		t.Fatalf("seed folder 2: %v", err)
+	}
+
+	seed := func(id string, uid uint32) {
+		m := &message.Message{
+			ID:        id,
+			AccountID: "acc-1",
+			FolderID:  "folder-1",
+			UID:       uid,
+			MessageID: "<" + id + "@example.com>",
+			FromEmail: "alice@example.com",
+			FromName:  "Alice",
+			Date:      time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC),
+			Subject:   "test",
+		}
+		if err := msgStore.Create(m); err != nil {
+			t.Fatalf("Create %s: %v", id, err)
+		}
+	}
+	seed("real-1", 101)
+	seed("moved-1", 102)
+
+	// Move it: the row now carries the negative placeholder UID.
+	if err := msgStore.MoveMessages([]string{"moved-1"}, "folder-2"); err != nil {
+		t.Fatalf("MoveMessages: %v", err)
+	}
+
+	// The batch lookup skips the placeholder UID.
+	uidInfos, err := msgStore.GetMessageUIDsAndFolder([]string{"real-1", "moved-1"})
+	if err != nil {
+		t.Fatalf("GetMessageUIDsAndFolder: %v", err)
+	}
+	if len(uidInfos) != 1 {
+		t.Fatalf("GetMessageUIDsAndFolder returned %d rows, want 1 (only real-1)", len(uidInfos))
+	}
+
+	// The split excludes the moved message from the requested set — the
+	// exact set FetchBodiesInBackground passes to markUnresolvedAsFailed.
+	fetchable, skipped := splitFetchableIDs([]string{"real-1", "moved-1"}, uidInfos)
+	if len(fetchable) != 1 || fetchable[0] != "real-1" {
+		t.Fatalf("splitFetchableIDs fetchable = %v, want [real-1]", fetchable)
+	}
+	if len(skipped) != 1 || skipped[0] != "moved-1" {
+		t.Fatalf("splitFetchableIDs skipped = %v, want [moved-1]", skipped)
+	}
+
+	// Simulate the empty-batch outcome: the server returned nothing for
+	// the requested IDs, so they are charged — but only the requested ones.
+	engine.markUnresolvedAsFailed(fetchable, nil, nil, nil)
+
+	var flag int
+	if err := db.QueryRow(`SELECT body_failed FROM messages WHERE id = ?`, "real-1").Scan(&flag); err != nil {
+		t.Fatalf("query body_failed real-1: %v", err)
+	}
+	if flag != 1 {
+		t.Errorf("body_failed = %d for real-1, want 1 (flagging must still work for requested IDs)", flag)
+	}
+	if err := db.QueryRow(`SELECT body_failed FROM messages WHERE id = ?`, "moved-1").Scan(&flag); err != nil {
+		t.Fatalf("query body_failed moved-1: %v", err)
+	}
+	if flag != 0 {
+		t.Errorf("body_failed = %d for moved-1, want 0 (placeholder UID must never be charged)", flag)
+	}
+
+	// And the moved message is still queued for a body fetch in its new
+	// folder, so the body lands once the destination sync resolves the UID.
+	ids, err := msgStore.GetMessagesWithoutBody("folder-2", 100, time.Time{})
+	if err != nil {
+		t.Fatalf("GetMessagesWithoutBody (folder-2): %v", err)
+	}
+	found := false
+	for _, id := range ids {
+		if id == "moved-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("moved-1 not in body-fetch queue after the failed batch, got %v", ids)
+	}
+}
+
 // TestBodyFailedReactionDetectedAfterRetry (audit finding 11, reaction half):
 // an Outlook fallback reaction email that failed its first body fetch was
 // permanently body-less, so its pill never appeared. After a Force Resync

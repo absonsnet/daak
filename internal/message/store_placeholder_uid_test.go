@@ -65,3 +65,73 @@ func TestGetMessageUIDAndFolder_RejectsPlaceholderUID(t *testing.T) {
 		t.Fatalf("moved row subject = %q, want %q", got.Subject, "Moved")
 	}
 }
+
+// TestGetMessageUIDsAndFolder_SkipsPlaceholderUID is the re-audit finding
+// R5 regression test: the plural lookup converted placeholder UIDs
+// unchecked to uint32, exactly as the singular lookup used to before
+// finding 4 fixed it. A just-moved message (uid = -rowid) became a huge
+// bogus UID in the batch fetch, the server returned nothing for it, and
+// markUnresolvedAsFailed charged the ID body_failed — stranding the
+// message, since every GetMessagesWithoutBody variant requires
+// body_failed = 0. The plural lookup must skip uid <= 0 rows, mirroring
+// the singular one.
+func TestGetMessageUIDsAndFolder_SkipsPlaceholderUID(t *testing.T) {
+	store, db, accountID, folderID := newUpsertTestStore(t)
+
+	const destFolderID = "folder-2"
+	if _, err := db.Exec(
+		`INSERT INTO folders (id, account_id, name, path, folder_type)
+		 VALUES (?, ?, ?, ?, ?)`,
+		destFolderID, accountID, "Archive", "Archive", "archive",
+	); err != nil {
+		t.Fatalf("seed folder 2: %v", err)
+	}
+
+	seed := func(id string, uid int64) *Message {
+		m := &Message{
+			AccountID: accountID, FolderID: folderID, UID: uint32(uid),
+			MessageID: "<" + id + "@example.com>", Subject: id,
+			FromName: "Alice", FromEmail: "alice@example.com",
+			Date: time.Now().UTC(),
+		}
+		m.ID = id
+		if err := store.Upsert(m); err != nil {
+			t.Fatalf("seed Upsert %s: %v", id, err)
+		}
+		return m
+	}
+
+	real := seed("real-1", 42)
+	moved := seed("moved-1", 43)
+	zero := seed("zero-1", 44)
+
+	// Move one: its row now carries the negative placeholder UID.
+	if err := store.MoveMessages([]string{moved.ID}, destFolderID); err != nil {
+		t.Fatalf("MoveMessages: %v", err)
+	}
+	// And force a third row to uid 0 (no server UID at all).
+	if _, err := db.Exec(`UPDATE messages SET uid = 0 WHERE id = ?`, zero.ID); err != nil {
+		t.Fatalf("zero UID: %v", err)
+	}
+
+	got, err := store.GetMessageUIDsAndFolder([]string{real.ID, moved.ID, zero.ID})
+	if err != nil {
+		t.Fatalf("GetMessageUIDsAndFolder: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("GetMessageUIDsAndFolder returned %d rows, want 1 (only the real UID)", len(got))
+	}
+	info, ok := got[real.ID]
+	if !ok {
+		t.Fatalf("GetMessageUIDsAndFolder missing real message %q, got %v", real.ID, got)
+	}
+	if info.UID != 42 || info.FolderID != folderID {
+		t.Fatalf("GetMessageUIDsAndFolder[%q] = (%d, %q), want (42, %q)", real.ID, info.UID, info.FolderID, folderID)
+	}
+	if _, ok := got[moved.ID]; ok {
+		t.Fatalf("GetMessageUIDsAndFolder returned placeholder UID for moved message %q, want it skipped", moved.ID)
+	}
+	if _, ok := got[zero.ID]; ok {
+		t.Fatalf("GetMessageUIDsAndFolder returned uid 0 for message %q, want it skipped", zero.ID)
+	}
+}

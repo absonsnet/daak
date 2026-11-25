@@ -527,9 +527,13 @@ func icsPropToGoogleTime(p *ical.Prop) (*googleTimePoint, error) {
 
 // parseICSDateTime parses an ICS DATE-TIME value in either local form
 // (YYYYMMDDTHHMMSS) interpreted in loc, or UTC form (YYYYMMDDTHHMMSSZ).
+// A bare DATE (YYYYMMDD) parses as midnight in loc.
 func parseICSDateTime(s string, loc *time.Location) (time.Time, error) {
 	if strings.HasSuffix(s, "Z") {
 		return time.Parse("20060102T150405Z", s)
+	}
+	if len(s) == len("20060102") {
+		return time.ParseInLocation("20060102", s, loc)
 	}
 	return time.ParseInLocation("20060102T150405", s, loc)
 }

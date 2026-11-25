@@ -900,8 +900,10 @@ func (a *App) PrepareReply(messageID, mode string) (*smtp.ComposeMessage, error)
 		// Leave To empty for user to fill in
 	}
 
-	// If body hasn't been fetched yet, fetch it on-demand
-	if !msg.BodyFetched {
+	// If body hasn't been fetched yet, fetch it on-demand — likewise
+	// when a previous fetch failed (BodyFailed), so a reply to a failed
+	// message still gets a quote instead of an empty one (R10).
+	if !msg.BodyFetched || msg.BodyFailed {
 		log.Debug().Str("messageID", messageID).Msg("Body not yet fetched, fetching on-demand for reply")
 		updatedMsg, fetchErr := a.syncEngine.FetchMessageBody(a.ctx, msg.AccountID, messageID)
 		if fetchErr != nil {

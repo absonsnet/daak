@@ -28,12 +28,18 @@ type ProcessedBody struct {
 	// Truncated mirrors ParsedBody.Truncated, plus the whole-message
 	// 50 MB cap applied while reading the BODY[] literal (audit
 	// finding 26). Persisted via BodyUpdate.Truncated.
-	Truncated      bool
-	SMIMEResult    *smime.SignatureResult // S/MIME verification result
-	SMIMERawBody   []byte                 // Raw S/MIME body for on-view processing
-	SMIMEEncrypted bool                   // Whether the message is encrypted
-	PGPRawBody     []byte                 // Raw PGP body for on-view processing
-	PGPEncrypted   bool                   // Whether the message is PGP encrypted
+	Truncated bool
+	// TextPartsFailed mirrors ParsedBody.TextPartsFailed (re-audit
+	// finding R10): a text part existed but could not be read, so the
+	// message has attachments but no body text for a reason other than
+	// "no text parts exist". Carried into BodyUpdate so
+	// markUnresolvedAsFailed can tell the two apart.
+	TextPartsFailed bool
+	SMIMEResult     *smime.SignatureResult // S/MIME verification result
+	SMIMERawBody    []byte                 // Raw S/MIME body for on-view processing
+	SMIMEEncrypted  bool                   // Whether the message is encrypted
+	PGPRawBody      []byte                 // Raw PGP body for on-view processing
+	PGPEncrypted    bool                   // Whether the message is PGP encrypted
 	// IsReaction is set when the message is a reaction email whose reaction
 	// was linked to its original (recorded + hidden). Such messages get no
 	// body update: their body was consumed as a reaction.
@@ -58,17 +64,46 @@ type ProcessedBody struct {
 // fresh on each view.)
 func bodyUpdateFromProcessedBody(pb *ProcessedBody) message.BodyUpdate {
 	return message.BodyUpdate{
-		MessageID:      pb.MessageID,
-		BodyHTML:       pb.BodyHTML,
-		BodyText:       pb.BodyText,
-		Snippet:        pb.Snippet,
-		HasAttachments: pb.HasAttachments,
-		Truncated:      pb.Truncated,
-		SMIMERawBody:   pb.SMIMERawBody,
-		SMIMEEncrypted: pb.SMIMEEncrypted,
-		PGPRawBody:     pb.PGPRawBody,
-		PGPEncrypted:   pb.PGPEncrypted,
+		MessageID:       pb.MessageID,
+		BodyHTML:        pb.BodyHTML,
+		BodyText:        pb.BodyText,
+		Snippet:         pb.Snippet,
+		HasAttachments:  pb.HasAttachments,
+		Truncated:       pb.Truncated,
+		TextPartsFailed: pb.TextPartsFailed,
+		SMIMERawBody:    pb.SMIMERawBody,
+		SMIMEEncrypted:  pb.SMIMEEncrypted,
+		PGPRawBody:      pb.PGPRawBody,
+		PGPEncrypted:    pb.PGPEncrypted,
 	}
+}
+
+// deferBodyUpdate reports whether a fetched body must NOT be persisted as
+// fetched yet (re-audit finding R10, retry half): the fetch produced
+// attachments but no body text, and the FETCH itself looks server-truncated
+// (received well below the IMAP-reported size — shouldChargeFailure says
+// don't charge). Persisting it would store body_fetched=1 with
+// has_attachments=1, a combination the self-healing body queue never
+// re-selects, so the missing text would be lost silently. Leaving
+// body_fetched=0 keeps the message queued, and the next sync re-fetches
+// it — including re-running reaction detection on the re-parse.
+//
+// Only the truncated case defers here. A full-size fetch whose text parts
+// failed is charged instead: markUnresolvedAsFailed flags it
+// body_failed=1 (via BodyUpdate.HasUsableContent), and the viewer offers
+// a manual retry. A genuinely attachment-only message (full fetch, no
+// text parts, no read failure) is complete and persists normally.
+func deferBodyUpdate(pb *ProcessedBody) bool {
+	if pb == nil || pb.IsReaction {
+		return false
+	}
+	if pb.BodyText != "" || pb.BodyHTML != "" || pb.SMIMEEncrypted || pb.PGPEncrypted {
+		return false
+	}
+	if !pb.HasAttachments {
+		return false
+	}
+	return !shouldChargeFailure(pb.ReceivedBytes, pb.ReportedSize)
 }
 
 // isBodyTruncated reports whether a fetched body was cut short by Daak's
@@ -151,13 +186,35 @@ func (e *Engine) FetchMessageBody(ctx context.Context, accountID, messageID stri
 			(result.PGPEncrypted && len(result.PGPRawBody) == 0) {
 			return nil, fmt.Errorf("encrypted message body could not be stored: raw body missing")
 		}
-		if err := e.messageStore.UpdateBody(bodyUpdateFromProcessedBody(result)); err != nil {
-			return nil, fmt.Errorf("failed to update message body: %w", err)
-		}
-		// Full sync-time enrichment for the on-demand body fetch.
-		if res := e.enrichBody(messageID, result.BodyText, result.Snippet); res != nil {
-			if err := e.messageStore.UpdateEnrichment(messageID, *res); err != nil {
-				e.log.Warn().Err(err).Str("messageID", messageID).Msg("Failed to store enrichment after on-demand body fetch")
+		bu := bodyUpdateFromProcessedBody(result)
+		if deferBodyUpdate(result) {
+			// R10 retry half: an attachment-only result from a
+			// truncated FETCH is not marked fetched on open either —
+			// body_fetched stays 0, so the background pass retries
+			// it. The attachments below are still stored.
+			e.log.Info().Str("messageID", messageID).Msg("On-demand body fetch looked truncated, leaving body unfetched for retry")
+		} else {
+			if err := e.messageStore.UpdateBody(bu); err != nil {
+				return nil, fmt.Errorf("failed to update message body: %w", err)
+			}
+			// R10 flag half: a full-size fetch that produced no usable
+			// content — text parts failed to read, or a genuinely
+			// empty body — is flagged body_failed so the viewer can
+			// offer a retry instead of showing a permanently blank
+			// message as complete. UpdateBody only clears the flag
+			// on usable content, so flagging after the persist
+			// cannot be undone by it; a later successful fetch
+			// clears it.
+			if !bu.HasUsableContent() {
+				if err := e.messageStore.MarkBodyFailed([]string{messageID}); err != nil {
+					e.log.Warn().Err(err).Str("messageID", messageID).Msg("Failed to persist body-parse-failed flag after on-demand fetch")
+				}
+			}
+			// Full sync-time enrichment for the on-demand body fetch.
+			if res := e.enrichBody(messageID, result.BodyText, result.Snippet); res != nil {
+				if err := e.messageStore.UpdateEnrichment(messageID, *res); err != nil {
+					e.log.Warn().Err(err).Str("messageID", messageID).Msg("Failed to store enrichment after on-demand body fetch")
+				}
 			}
 		}
 	}
@@ -367,21 +424,22 @@ func (e *Engine) fetchMessageBodiesBatch(ctx context.Context, client *imapclient
 		}
 
 		results[uid] = &ProcessedBody{
-			MessageID:      messageID,
-			BodyHTML:       bodyHTML,
-			BodyText:       parsed.BodyText,
-			Snippet:        snippet,
-			HasAttachments: parsed.HasAttachments,
-			Attachments:    parsed.Attachments,
-			RawBytes:       rawBytes,
-			Truncated:      messageTruncated || parsed.Truncated,
-			SMIMEResult:    parsed.SMIMEResult,
-			SMIMERawBody:   parsed.SMIMERawBody,
-			SMIMEEncrypted: parsed.SMIMEEncrypted,
-			PGPRawBody:     parsed.PGPRawBody,
-			PGPEncrypted:   parsed.PGPEncrypted,
-			ReportedSize:   reportedSize,
-			ReceivedBytes:  int64(len(rawBytes)),
+			MessageID:       messageID,
+			BodyHTML:        bodyHTML,
+			BodyText:        parsed.BodyText,
+			Snippet:         snippet,
+			HasAttachments:  parsed.HasAttachments,
+			Attachments:     parsed.Attachments,
+			RawBytes:        rawBytes,
+			Truncated:       messageTruncated || parsed.Truncated,
+			TextPartsFailed: parsed.TextPartsFailed,
+			SMIMEResult:     parsed.SMIMEResult,
+			SMIMERawBody:    parsed.SMIMERawBody,
+			SMIMEEncrypted:  parsed.SMIMEEncrypted,
+			PGPRawBody:      parsed.PGPRawBody,
+			PGPEncrypted:    parsed.PGPEncrypted,
+			ReportedSize:    reportedSize,
+			ReceivedBytes:   int64(len(rawBytes)),
 		}
 	}
 
@@ -435,17 +493,47 @@ func shouldChargeFailure(receivedBytes, reportedSize int64) bool {
 	return receivedBytes >= threshold
 }
 
+// splitFetchableIDs partitions a batch of message IDs into the ones the
+// server can actually be asked for (a real UID came back from
+// GetMessageUIDsAndFolder) and the ones with no server UID yet — just-moved
+// messages carrying a negative placeholder UID, which the plural lookup
+// skips exactly as the singular lookup refuses them. Only the fetchable IDs
+// may be passed to markUnresolvedAsFailed: charging a placeholder ID
+// body_failed would strand it for ever, because every
+// GetMessagesWithoutBody variant requires body_failed = 0 while only the
+// destination sync can resolve the real UID. Kept pure so the partition
+// itself is unit-testable without standing up a sync engine.
+func splitFetchableIDs(batchIDs []string, uidInfos map[string]message.UIDInfo) (fetchable, skipped []string) {
+	for _, id := range batchIDs {
+		if _, ok := uidInfos[id]; ok {
+			fetchable = append(fetchable, id)
+		} else {
+			skipped = append(skipped, id)
+		}
+	}
+	return fetchable, skipped
+}
+
 // markUnresolvedAsFailed persists messages.body_failed=1 for any requested ID
 // whose body parsed to nothing usable AND wasn't encrypted, OR whose UID the server
 // didn't return at all. Encrypted messages (which legitimately carry empty
 // plaintext until view-time decryption) are treated as resolved, as are
-// attachment-only messages (the fetch succeeded — the attachments were
-// extracted — so there is nothing to retry; flagging them would leave them
-// permanently body-less for no reason). The flag excludes the message from
-// future body-fetch queries via the body_failed=0 guard in
+// genuinely attachment-only messages (the fetch succeeded — the attachments
+// were extracted and no text parts existed — so there is nothing to retry;
+// flagging them would leave them permanently body-less for no reason).
+// Re-audit finding R10 narrows that last case: an attachment-only result
+// whose text parts failed to read (BodyUpdate.TextPartsFailed, recorded at
+// parse time) is NOT resolved — HasUsableContent says so — so a full-size
+// fetch is flagged here, and a truncated one is deferred by
+// shouldChargeFailure below (and its BodyUpdate was already withheld by
+// deferBodyUpdate, so body_fetched stays 0 and the next sync retries it,
+// re-running reaction detection on the re-parse). The flag excludes the
+// message from future body-fetch queries via the body_failed=0 guard in
 // GetMessagesWithoutBody/AndSize/Count (see migration v39). It is NOT
 // permanent: a Force Resync (ClearBodiesForFolder) resets it for the whole
-// folder, and a later body persist carrying usable content clears it.
+// folder, a later body persist carrying usable content clears it, and the
+// viewer offers a manual retry for flagged messages (BodyFailed is
+// exposed to the frontend).
 //
 // consumedIDs are messages whose bodies were consumed without a body update
 // — linked reaction emails, hidden by handleReaction. They count as
@@ -625,6 +713,15 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 	connectionFailures := 0 // total connection recovery attempts
 	fetched := 0
 	failed := 0
+	noServerUID := make(map[string]bool)
+
+	// noServerUID remembers, for this run only, the message IDs whose UID
+	// lookup came back empty — just-moved messages carrying a placeholder
+	// UID, which have no server UID to fetch under. They are skipped when
+	// building later batches: without this the loop would re-query the
+	// same candidates for ever (they stay body_failed = 0, correctly, so
+	// the candidate query keeps returning them) instead of moving on to
+	// fetchable messages. They resolve via the destination sync, not here.
 
 	// Note: parse-failure tracking is persisted in messages.body_failed (v39).
 	// Once a fetch returns nothing usable for a message, MarkBodyFailed flags
@@ -773,6 +870,12 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 		var batchBytes int64
 
 		for _, msg := range candidates {
+			// Skip messages already found to have no server UID yet in
+			// this run (see noServerUID): re-selecting them would spin
+			// the loop on the same batch for ever.
+			if noServerUID[msg.ID] {
+				continue
+			}
 			msgSize := int64(msg.Size)
 			if msgSize <= 0 {
 				msgSize = 10 * 1024 // Assume 10KB for messages with unknown size
@@ -816,6 +919,20 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 		uidToMessageID := make(map[uint32]string)
 		for msgID, info := range uidInfos {
 			uidToMessageID[info.UID] = msgID
+		}
+
+		// Only the IDs with a real UID were actually requested from the
+		// server: a just-moved message's placeholder UID was skipped by
+		// the lookup, so it must never reach markUnresolvedAsFailed as a
+		// "requested but unreturned" ID (that would charge it
+		// body_failed and strand it). Remember the skipped IDs for this
+		// run so later batches don't re-select them.
+		requestedIDs, skippedIDs := splitFetchableIDs(batchIDs, uidInfos)
+		for _, id := range skippedIDs {
+			noServerUID[id] = true
+		}
+		if len(skippedIDs) > 0 {
+			e.log.Debug().Strs("messageIDs", skippedIDs).Msg("Skipping messages with no server UID yet in this body-fetch run")
 		}
 
 		if len(uidToMessageID) == 0 {
@@ -885,7 +1002,9 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 			// No size signals here — server returned nothing, so every ID
 			// falls through to the "no signal" branch of shouldChargeFailure
 			// and gets charged. Pass nil to keep the call sites uniform.
-			e.markUnresolvedAsFailed(batchIDs, nil, nil, nil)
+			// requestedIDs (not batchIDs): placeholder-UID messages were
+			// never asked of the server, so they must not be charged.
+			e.markUnresolvedAsFailed(requestedIDs, nil, nil, nil)
 			failed += len(uidToMessageID)
 			continue
 		}
@@ -910,6 +1029,21 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 				if pb.IsReaction {
 					consumedIDs = append(consumedIDs, pb.MessageID)
 					sizes[pb.MessageID] = fetchedSize{received: pb.ReceivedBytes, reported: pb.ReportedSize}
+					continue
+				}
+
+				// R10 retry half: an attachment-only result from a
+				// truncated FETCH is not persisted as fetched — the
+				// attachments are still stored below, but body_fetched
+				// stays 0 so the next sync re-fetches the missing text
+				// (and re-runs reaction detection). The size signal is
+				// still recorded so markUnresolvedAsFailed defers
+				// flagging it instead of charging body_failed.
+				if deferBodyUpdate(pb) {
+					sizes[pb.MessageID] = fetchedSize{received: pb.ReceivedBytes, reported: pb.ReportedSize}
+					if len(pb.Attachments) > 0 {
+						allAttachments = append(allAttachments, pb.Attachments...)
+					}
 					continue
 				}
 
@@ -939,7 +1073,7 @@ func (e *Engine) FetchBodiesInBackground(ctx context.Context, accountID, folderI
 				Msg("Built body updates and attachments for batch")
 
 			resultChan <- processingResult{
-				requestedIDs: batchIDs,
+				requestedIDs: requestedIDs,
 				bodyUpdates:  bodyUpdates,
 				attachments:  allAttachments,
 				sizes:        sizes,

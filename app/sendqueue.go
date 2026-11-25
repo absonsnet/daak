@@ -30,7 +30,14 @@ import (
 // reopens with the draft, intact. Reactions ride the same queue
 // (QueueReaction): the picker closes at once, the pill is applied
 // optimistically, and Undo cancels the queued reaction and removes
-// the local record.
+// the local record. A second reaction for the same message inside
+// the undo window replaces the pending row instead of queueing a
+// second mail (the pill is replaced too, so the queued mail must
+// match it); a reaction already being dispatched is rejected.
+// A draft with a failed row in the Outbox cannot be sent again
+// from Drafts — Retry on the failed row is the only path back —
+// and Retry refuses while another live row exists for the draft,
+// so the two paths can never dispatch the same content twice.
 //
 // A dispatched row is deleted, not kept as history — the Outbox
 // holds no sent or cancelled rows; the Sent folder is the record.
@@ -188,15 +195,27 @@ func (s *sendQueueService) QueueSend(accountID string, msg smtp.ComposeMessage, 
 	// will send, and a second row would dispatch a second copy.
 	// The draft stays in Drafts during the window, so this is the
 	// guard that makes re-opening it and hitting Send harmless.
-	// (Best-effort across processes: two processes queueing the same
-	// draft in the same instant could both pass this check — the
-	// atomic Claim is what keeps one row from sending twice, and a
-	// unique index would be needed to close this check-then-insert
-	// race entirely.)
+	// The check above is the user-facing guard; migration 54's
+	// partial unique index on live draft rows makes it atomic
+	// across processes — a concurrent second insert fails the
+	// constraint, and the Enqueue error below is mapped back to
+	// the same "already queued" error instead of a raw database
+	// error.
 	if active, err := s.store.HasActiveForDraft(draftID); err != nil {
 		return QueueSendResult{}, err
 	} else if active {
 		return QueueSendResult{}, fmt.Errorf("draft %q is already queued for send", draftID)
+	}
+
+	// A draft with a failed row in the Outbox cannot be sent again
+	// from Drafts either: the failed row is the one to Retry, and
+	// a second row would carry a new Message-ID, so a Retry of the
+	// old row plus a dispatch of the new one would deliver the
+	// same content twice. Point the user at Retry instead.
+	if failed, err := s.store.HasFailedForDraft(draftID); err != nil {
+		return QueueSendResult{}, err
+	} else if failed {
+		return QueueSendResult{}, fmt.Errorf("draft %q already has a failed send in the Outbox; use Retry on that send instead of sending it again", draftID)
 	}
 
 	raw, err := json.Marshal(msg)
@@ -226,6 +245,13 @@ func (s *sendQueueService) QueueSend(accountID string, msg smtp.ComposeMessage, 
 		CreatedAt:   now,
 	}
 	if err := s.store.Enqueue(item); err != nil {
+		// The partial unique index (migration 54) is the atomic
+		// backstop for the check above: a concurrent queue of the
+		// same draft fails here, and the user gets the same clear
+		// "already queued" message, not a raw database error.
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return QueueSendResult{}, fmt.Errorf("draft %q is already queued for send", draftID)
+		}
 		return QueueSendResult{}, err
 	}
 
@@ -276,6 +302,52 @@ func (s *sendQueueService) QueueReaction(accountID string, from smtp.Address, to
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to read undo-send delay, using default")
 		delay = settings.DefaultUndoSendDelay
+	}
+
+	// A reaction for this message may already be queued: the
+	// frontend's in-memory guard is per-window and resets as soon
+	// as the call returns, so a second pick inside the undo window
+	// — or one from another window — would otherwise queue a second
+	// reaction mail while Record replaces the local pill, and the
+	// recipient would receive both. Replace-if-pending,
+	// reject-if-sending: the queued mail must match the pill the
+	// user sees, and a reaction already being dispatched cannot be
+	// recalled. A pending row in retry backoff is replaced the same
+	// way — it never reached the recipient, so the new emoji
+	// supersedes it. A failed row is left alone: it stays in the
+	// Outbox for Retry and does not block a new reaction.
+	if reactionMessageID != "" {
+		active, err := s.store.ActiveReaction(reactionMessageID)
+		if err != nil {
+			return QueueSendResult{}, err
+		}
+		if active != nil {
+			if active.Status == sendqueue.StatusSending {
+				return QueueSendResult{}, fmt.Errorf("reaction for message %q is already being sent", reactionMessageID)
+			}
+			if n, err := s.store.DeletePendingReaction(reactionMessageID); err != nil {
+				return QueueSendResult{}, err
+			} else if n > 0 {
+				log.Info().
+					Str("reaction_message_id", reactionMessageID).
+					Int("replaced_rows", n).
+					Msg("Replacing pending queued reaction with the new one")
+			} else {
+				// Nothing was deleted even though a live row was
+				// seen a moment ago: re-check before queueing
+				// alongside it. If the row was claimed for dispatch
+				// in between, it is sending now and the new
+				// reaction must be rejected; if it is gone (undone
+				// in another window), queueing is safe.
+				again, err := s.store.ActiveReaction(reactionMessageID)
+				if err != nil {
+					return QueueSendResult{}, err
+				}
+				if again != nil {
+					return QueueSendResult{}, fmt.Errorf("reaction for message %q is already being sent", reactionMessageID)
+				}
+			}
+		}
 	}
 
 	sendAt := now.Add(time.Duration(delay) * time.Second)
@@ -408,7 +480,14 @@ func (s *sendQueueService) GetSendQueueStats() (sendqueue.Stats, error) {
 }
 
 // RetrySendQueueItem returns a failed item to the queue, due
-// immediately, with a fresh attempt budget.
+// immediately, with a fresh attempt budget. It reuses the failed
+// row itself, so the retried mail carries the same Message-ID the
+// first attempt did — no new identity is minted. It refuses when
+// another live row already exists for the same draft (or, for a
+// reaction, the same message): re-sending from Drafts while a
+// failed row exists is blocked the other way round (see QueueSend),
+// and without this check a Retry plus a live row would dispatch
+// the same content twice.
 func (s *sendQueueService) RetrySendQueueItem(queueID string) error {
 	item, err := s.store.Get(queueID)
 	if err != nil {
@@ -416,6 +495,23 @@ func (s *sendQueueService) RetrySendQueueItem(queueID string) error {
 	}
 	if item == nil {
 		return fmt.Errorf("queued send %q not found", queueID)
+	}
+	if item.Kind == sendqueue.KindReaction && item.ReactionMessageID != "" {
+		active, err := s.store.ActiveReaction(item.ReactionMessageID)
+		if err != nil {
+			return err
+		}
+		if active != nil && active.ID != queueID {
+			return fmt.Errorf("message %q already has a live queued reaction", item.ReactionMessageID)
+		}
+	} else if item.DraftID != "" {
+		active, err := s.store.HasActiveForDraft(item.DraftID)
+		if err != nil {
+			return err
+		}
+		if active {
+			return fmt.Errorf("draft %q already has a live queued send", item.DraftID)
+		}
 	}
 	ok, err := s.store.Retry(queueID, s.clock())
 	if err != nil {
