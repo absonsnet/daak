@@ -234,6 +234,10 @@ export function CancelOAuthFlow() {
   return window['go']['app']['App']['CancelOAuthFlow']();
 }
 
+export function CheckNotificationDeniedNotice() {
+  return window['go']['app']['App']['CheckNotificationDeniedNotice']();
+}
+
 export function CheckRecipientCerts(arg1) {
   return window['go']['app']['App']['CheckRecipientCerts'](arg1);
 }
@@ -724,6 +728,10 @@ export function GetMicrosoftSharedMailboxes(arg1) {
 
 export function GetNativeTitleBar() {
   return window['go']['app']['App']['GetNativeTitleBar']();
+}
+
+export function GetNotificationPermissionStatus() {
+  return window['go']['app']['App']['GetNotificationPermissionStatus']();
 }
 
 export function GetOAuthBuildStatus() {
@@ -1280,6 +1288,10 @@ export function OpenFile(arg1) {
 
 export function OpenFolder(arg1) {
   return window['go']['app']['App']['OpenFolder'](arg1);
+}
+
+export function OpenNotificationSettings() {
+  return window['go']['app']['App']['OpenNotificationSettings']();
 }
 
 export function OpenURL(arg1) {

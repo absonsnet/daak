@@ -601,3 +601,29 @@ func TestGenericSetGet(t *testing.T) {
 		t.Errorf("got %q, want empty string", got)
 	}
 }
+
+// Re-audit finding R28: the one-time "notifications are blocked" notice
+// must fire exactly once — the flag defaults to unset and persists
+// once recorded.
+func TestSetGetNotificationDeniedNoticeShown(t *testing.T) {
+	store := NewStore(openTestDB(t))
+
+	shown, err := store.GetNotificationDeniedNoticeShown()
+	if err != nil {
+		t.Fatalf("unexpected error on get: %v", err)
+	}
+	if shown {
+		t.Fatal("notice flag defaults to true, want false (unset)")
+	}
+
+	if err := store.SetNotificationDeniedNoticeShown(true); err != nil {
+		t.Fatalf("unexpected error on set: %v", err)
+	}
+	shown, err = store.GetNotificationDeniedNoticeShown()
+	if err != nil {
+		t.Fatalf("unexpected error on get after set: %v", err)
+	}
+	if !shown {
+		t.Fatal("notice flag is false after SetNotificationDeniedNoticeShown(true), want true")
+	}
+}

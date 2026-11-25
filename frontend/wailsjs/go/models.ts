@@ -777,6 +777,22 @@ export namespace app {
 		    return a;
 		}
 	}
+	export class NotificationPermissionInfo {
+	    status: string;
+	    platform: string;
+	    canOpenSystemSettings: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new NotificationPermissionInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.status = source["status"];
+	        this.platform = source["platform"];
+	        this.canOpenSystemSettings = source["canOpenSystemSettings"];
+	    }
+	}
 	export class OAuthBuildStatus {
 	    google: boolean;
 	    microsoft: boolean;

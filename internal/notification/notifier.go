@@ -27,10 +27,10 @@ type NotificationData struct {
 
 // Notification represents a desktop notification to be shown
 type Notification struct {
-	Title   string
-	Body    string
-	Icon    string
-	Data    NotificationData
+	Title string
+	Body  string
+	Icon  string
+	Data  NotificationData
 }
 
 // Notifier provides cross-platform notification support with click handling
@@ -46,6 +46,18 @@ type Notifier interface {
 
 	// SetClickHandler sets the callback for notification clicks
 	SetClickHandler(handler ClickHandler)
+
+	// PermissionStatus reports whether the OS will deliver notifications
+	// from this app. On platforms that expose no per-app permission query
+	// (Linux, Windows) it returns PermissionUnknown — "unknown" is not
+	// "denied": callers must not treat it as a blocked state.
+	PermissionStatus() PermissionStatus
+
+	// SetPermissionChangeHandler sets a callback invoked when the OS
+	// reports a notification permission change (currently only macOS,
+	// when the user answers the authorization prompt). Platforms with
+	// no such signal store the handler and never invoke it.
+	SetPermissionChangeHandler(handler func(PermissionStatus))
 }
 
 // New creates a platform-specific Notifier

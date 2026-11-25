@@ -140,6 +140,8 @@ export function CancelFolderSync(arg1:string,arg2:string):Promise<void>;
 
 export function CancelOAuthFlow():Promise<void>;
 
+export function CheckNotificationDeniedNotice():Promise<boolean>;
+
 export function CheckRecipientCerts(arg1:Array<string>):Promise<Record<string, boolean>>;
 
 export function CheckRecipientPGPKeys(arg1:Array<string>):Promise<Record<string, boolean>>;
@@ -385,6 +387,8 @@ export function GetMessages(arg1:string,arg2:string,arg3:number,arg4:number):Pro
 export function GetMicrosoftSharedMailboxes(arg1:string):Promise<Array<account.Account>>;
 
 export function GetNativeTitleBar():Promise<boolean>;
+
+export function GetNotificationPermissionStatus():Promise<app.NotificationPermissionInfo>;
 
 export function GetOAuthBuildStatus():Promise<app.OAuthBuildStatus>;
 
@@ -663,6 +667,8 @@ export function OpenEncryptedAttachment(arg1:string,arg2:string):Promise<void>;
 export function OpenFile(arg1:string):Promise<void>;
 
 export function OpenFolder(arg1:string):Promise<void>;
+
+export function OpenNotificationSettings():Promise<void>;
 
 export function OpenURL(arg1:string):Promise<void>;
 

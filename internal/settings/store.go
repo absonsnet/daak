@@ -44,14 +44,15 @@ const (
 	KeyShowMessageListProfilePics      = "show_message_list_profile_pics" // render contact photos in the message-list avatar slot (default off)
 	KeyAlwaysShowMessageCheckbox       = "always_show_message_checkbox"   // reserve a fixed checkbox column instead of the hover/swipe slide-reveal (default off)
 	KeyShowViewerCircles               = "show_viewer_circles"
-	KeyShowMessagePreviewPane          = "show_message_preview_pane" // show the conversation viewer pane beside the message list (default on)
-	KeyMessageOpenMode                 = "message_open_mode"         // how a message opens when the preview pane is off: "tab" | "dialog" | "popup" (default "tab")
-	KeyInboxTabDefault                 = "inbox_tab_default"         // default category tab in Inbox / Unified Inbox: "all" | "personal" | "automated" (default "all")
-	KeyLastSeenVersion                 = "last_seen_version"         // for "What's new in this version" launch dialog
-	KeyOAuthWarningDisabled            = "oauth_warning_disabled"    // user toggled "Don't show again" on the missing-OAuth-creds launch warning
-	KeySpellcheckEnabled               = "spellcheck_enabled"        // composer spellcheck master toggle (defaults on)
-	KeyCodeChipClickMode               = "code_chip_click_mode"      // "copy_mark_read_delete" | "copy_mark_read" | "copy_only"
-	KeyAttentionEnabled                = "attention_enabled"         // Needs attention strip master toggle (default on)
+	KeyShowMessagePreviewPane          = "show_message_preview_pane"        // show the conversation viewer pane beside the message list (default on)
+	KeyMessageOpenMode                 = "message_open_mode"                // how a message opens when the preview pane is off: "tab" | "dialog" | "popup" (default "tab")
+	KeyInboxTabDefault                 = "inbox_tab_default"                // default category tab in Inbox / Unified Inbox: "all" | "personal" | "automated" (default "all")
+	KeyLastSeenVersion                 = "last_seen_version"                // for "What's new in this version" launch dialog
+	KeyOAuthWarningDisabled            = "oauth_warning_disabled"           // user toggled "Don't show again" on the missing-OAuth-creds launch warning
+	KeyNotificationDeniedNoticeShown   = "notification_denied_notice_shown" // one-time "notifications are blocked" notice already shown (R28)
+	KeySpellcheckEnabled               = "spellcheck_enabled"               // composer spellcheck master toggle (defaults on)
+	KeyCodeChipClickMode               = "code_chip_click_mode"             // "copy_mark_read_delete" | "copy_mark_read" | "copy_only"
+	KeyAttentionEnabled                = "attention_enabled"                // Needs attention strip master toggle (default on)
 	KeyAttentionTypeCode               = "attention_type_verification_code"
 	KeyAttentionTypeFlight             = "attention_type_flight_changed"
 	KeyAttentionTypePayment            = "attention_type_payment_failed"
@@ -745,6 +746,27 @@ func (s *Store) SetOAuthWarningDisabled(disabled bool) error {
 		value = "true"
 	}
 	return s.Set(KeyOAuthWarningDisabled, value)
+}
+
+// GetNotificationDeniedNoticeShown returns whether the one-time
+// "notifications are blocked" notice has already been shown. Defaults
+// to false on first launch (key unset).
+func (s *Store) GetNotificationDeniedNoticeShown() (bool, error) {
+	value, err := s.Get(KeyNotificationDeniedNoticeShown)
+	if err != nil {
+		return false, err
+	}
+	return value == "true", nil
+}
+
+// SetNotificationDeniedNoticeShown records that the one-time
+// "notifications are blocked" notice was shown, so it never fires again.
+func (s *Store) SetNotificationDeniedNoticeShown(shown bool) error {
+	value := "false"
+	if shown {
+		value = "true"
+	}
+	return s.Set(KeyNotificationDeniedNoticeShown, value)
 }
 
 // GetRunBackground returns whether Daak should keep running when the window is closed

@@ -27,13 +27,14 @@ const (
 // windowsNotifier uses Windows Toast notifications with COM activation
 // for click handling via the go-toast/v2 library.
 type windowsNotifier struct {
-	appName       string
-	clickHandler  ClickHandler
-	notifications map[string]NotificationData
-	mu            sync.RWMutex
-	log           zerolog.Logger
-	idCounter     uint64
-	initialized   bool
+	appName           string
+	clickHandler      ClickHandler
+	permissionHandler func(PermissionStatus)
+	notifications     map[string]NotificationData
+	mu                sync.RWMutex
+	log               zerolog.Logger
+	idCounter         uint64
+	initialized       bool
 }
 
 func newPlatformNotifier(appName string, useDirectDBus bool) Notifier {
@@ -176,6 +177,22 @@ func (n *windowsNotifier) Show(notif Notification) (uint32, error) {
 func (n *windowsNotifier) SetClickHandler(handler ClickHandler) {
 	n.mu.Lock()
 	n.clickHandler = handler
+	n.mu.Unlock()
+}
+
+// PermissionStatus reports PermissionUnknown: Windows exposes no
+// per-app toast permission query through this notifier, so there is
+// no denied state to report. Unknown must not be treated as denied
+// by callers.
+func (n *windowsNotifier) PermissionStatus() PermissionStatus {
+	return PermissionUnknown
+}
+
+// SetPermissionChangeHandler stores the handler; Windows has no OS
+// permission-change signal to invoke it with.
+func (n *windowsNotifier) SetPermissionChangeHandler(handler func(PermissionStatus)) {
+	n.mu.Lock()
+	n.permissionHandler = handler
 	n.mu.Unlock()
 }
 

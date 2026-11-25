@@ -3,6 +3,7 @@
   import * as Select from '$lib/components/ui/select'
   import { Label } from '$lib/components/ui/label'
   import { Input } from '$lib/components/ui/input'
+  import { Button } from '$lib/components/ui/button'
   import Switch from '$lib/components/ui/switch/Switch.svelte'
   import { _, setLocale } from '$lib/i18n'
   import { supportedLocales } from '$lib/i18n'
@@ -41,6 +42,12 @@
     showMessagePreviewPane: boolean
     messageOpenMode: string
     hideUnifiedSingleAccount: boolean
+    // macOS notification permission state (null until loaded). The row
+    // renders only when the backend says the platform can open the
+    // system notification settings page (macOS) — never a macOS-only
+    // link on Windows/Linux.
+    notificationPermission: { status: string; platform: string; canOpenSystemSettings: boolean } | null
+    onOpenNotificationSettings: () => void
   }
 
   let {
@@ -76,6 +83,8 @@
     showMessagePreviewPane = $bindable(),
     messageOpenMode = $bindable(),
     hideUnifiedSingleAccount = $bindable(),
+    notificationPermission = $bindable(),
+    onOpenNotificationSettings,
   }: Props = $props()
 
   // Message list density options
@@ -245,6 +254,10 @@
     // Apply immediately for live preview
     setLocale(value)
     onLanguageChange?.(value)
+  }
+
+  function handleOpenNotificationSettings() {
+    onOpenNotificationSettings?.()
   }
 
 
@@ -626,6 +639,60 @@
 
   <!-- Divider -->
   <div class="border-t border-border"></div>
+
+  <!-- Notifications Section — macOS only. The OS permission state is
+       queryable (and re-enableable via a System Settings deep link)
+       only there; on other platforms the row stays hidden. -->
+  {#if notificationPermission?.canOpenSystemSettings}
+    <div class="space-y-4">
+      <h3 class="text-sm font-medium flex items-center gap-2">
+        <Icon icon="mdi:bell-outline" class="w-4 h-4" />
+        {$_('settingsGeneral.notifications')}
+      </h3>
+
+      {#if notificationPermission.status === 'denied'}
+        <div class="space-y-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3">
+          <div class="flex items-center gap-2">
+            <Icon icon="lucide:triangle-alert" class="w-4 h-4 text-amber-500" />
+            <span class="text-sm font-medium">{$_('settingsGeneral.notificationPermissionBlocked')}</span>
+          </div>
+          <p class="text-xs text-muted-foreground">
+            {$_('settingsGeneral.notificationPermissionBlockedHelp')}
+          </p>
+          <Button size="sm" onclick={handleOpenNotificationSettings}>
+            {$_('settingsGeneral.openNotificationSettings')}
+          </Button>
+        </div>
+      {:else if notificationPermission.status === 'authorized'}
+        <div class="space-y-2">
+          <div class="flex items-center gap-2">
+            <Icon icon="lucide:check" class="w-4 h-4 text-emerald-500" />
+            <span class="text-sm">{$_('settingsGeneral.notificationPermissionOn')}</span>
+          </div>
+          <p class="text-xs text-muted-foreground">
+            {$_('settingsGeneral.notificationPermissionOnHelp')}
+          </p>
+        </div>
+      {:else if notificationPermission.status === 'not-determined'}
+        <div class="space-y-2">
+          <span class="text-sm">{$_('settingsGeneral.notificationPermissionNotDetermined')}</span>
+          <p class="text-xs text-muted-foreground">
+            {$_('settingsGeneral.notificationPermissionNotDeterminedHelp')}
+          </p>
+        </div>
+      {:else}
+        <div class="space-y-2">
+          <span class="text-sm">{$_('settingsGeneral.notificationPermissionUnknown')}</span>
+          <p class="text-xs text-muted-foreground">
+            {$_('settingsGeneral.notificationPermissionUnknownHelp')}
+          </p>
+        </div>
+      {/if}
+    </div>
+
+    <!-- Divider -->
+    <div class="border-t border-border"></div>
+  {/if}
 
   <!-- Startup Section -->
   <div class="space-y-4">

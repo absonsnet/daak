@@ -5,7 +5,7 @@
   import * as Tabs from '$lib/components/ui/tabs'
   import { Button } from '$lib/components/ui/button'
   // @ts-ignore - wailsjs path
-  import { GetReadReceiptResponsePolicy, SetReadReceiptResponsePolicy, GetMarkAsReadDelay, SetMarkAsReadDelay, GetMessageListDensity, SetMessageListDensity, GetThemeMode, SetThemeMode, GetShowTitleBar, SetShowTitleBar, GetShowUnreadBadge, SetShowUnreadBadge, GetRunBackground, SetRunBackground, GetStartHidden, SetStartHidden, GetAutostart, SetAutostart, GetLanguage, SetLanguage, GetComposerMode, SetComposerMode, GetMailtoMode, SetMailtoMode, GetComposerFormat, SetComposerFormat, GetUndoSendDelay, SetUndoSendDelay, GetNativeTitleBar, SetNativeTitleBar, GetAlwaysLoadImages, SetAlwaysLoadImages, GetDarkMailContent, SetDarkMailContent, GetDarkComposerBody, SetDarkComposerBody, GetAccentBarUnread, SetAccentBarUnread, GetAccentUnreadStyle, SetAccentUnreadStyle, GetShowMessageListCircles, SetShowMessageListCircles, GetShowMessageListProfilePics, SetShowMessageListProfilePics, GetAlwaysShowMessageCheckbox, SetAlwaysShowMessageCheckbox, GetShowViewerCircles, SetShowViewerCircles, GetShowMessagePreviewPane, SetShowMessagePreviewPane, GetMessageOpenMode, SetMessageOpenMode, GetSpellcheckEnabled, SetSpellcheckEnabled, GetSpellcheckLanguages, SetSpellcheckLanguages, GetWindowControlsSide, SetWindowControlsSide, GetCodeChipClickMode, SetCodeChipClickMode, GetAttentionEnabled, SetAttentionEnabled, GetAttentionTypeEnabled, SetAttentionTypeEnabled, GetOtpClipboardClearSeconds, SetOtpClipboardClearSeconds, GetInboxTabDefault, SetInboxTabDefault, GetTranslationSettings, SetTranslationEnabled, SetTranslationMode, SetTranslationTargetLanguage, SetTranslationOnlineProvider, SetTranslationOnlineConsent, SetDeepLAPIKey, QuitApp } from '../../../../wailsjs/go/app/App.js'
+  import { GetReadReceiptResponsePolicy, SetReadReceiptResponsePolicy, GetMarkAsReadDelay, SetMarkAsReadDelay, GetMessageListDensity, SetMessageListDensity, GetThemeMode, SetThemeMode, GetShowTitleBar, SetShowTitleBar, GetShowUnreadBadge, SetShowUnreadBadge, GetRunBackground, SetRunBackground, GetStartHidden, SetStartHidden, GetAutostart, SetAutostart, GetLanguage, SetLanguage, GetComposerMode, SetComposerMode, GetMailtoMode, SetMailtoMode, GetComposerFormat, SetComposerFormat, GetUndoSendDelay, SetUndoSendDelay, GetNativeTitleBar, SetNativeTitleBar, GetAlwaysLoadImages, SetAlwaysLoadImages, GetDarkMailContent, SetDarkMailContent, GetDarkComposerBody, SetDarkComposerBody, GetAccentBarUnread, SetAccentBarUnread, GetAccentUnreadStyle, SetAccentUnreadStyle, GetShowMessageListCircles, SetShowMessageListCircles, GetShowMessageListProfilePics, SetShowMessageListProfilePics, GetAlwaysShowMessageCheckbox, SetAlwaysShowMessageCheckbox, GetShowViewerCircles, SetShowViewerCircles, GetShowMessagePreviewPane, SetShowMessagePreviewPane, GetMessageOpenMode, SetMessageOpenMode, GetSpellcheckEnabled, SetSpellcheckEnabled, GetSpellcheckLanguages, SetSpellcheckLanguages, GetWindowControlsSide, SetWindowControlsSide, GetCodeChipClickMode, SetCodeChipClickMode, GetAttentionEnabled, SetAttentionEnabled, GetAttentionTypeEnabled, SetAttentionTypeEnabled, GetOtpClipboardClearSeconds, SetOtpClipboardClearSeconds, GetInboxTabDefault, SetInboxTabDefault, GetTranslationSettings, SetTranslationEnabled, SetTranslationMode, SetTranslationTargetLanguage, SetTranslationOnlineProvider, SetTranslationOnlineConsent, SetDeepLAPIKey, GetNotificationPermissionStatus, OpenNotificationSettings, QuitApp } from '../../../../wailsjs/go/app/App.js'
   import { addToast } from '$lib/stores/toast'
   import { setMessageListDensity as updateDensityStore, setThemeMode as updateThemeStore, setShowTitleBar as updateShowTitleBarStore, setShowUnreadBadge as updateShowUnreadBadgeStore, setRunBackground as updateRunBackgroundStore, setStartHidden as updateStartHiddenStore, setAutostart as updateAutostartStore, setLanguage as updateLanguageStore, setComposerMode as updateComposerModeStore, setMailtoMode as updateMailtoModeStore, setComposerFormat as updateComposerFormatStore, setNativeTitleBar as updateNativeTitleBarStore, setAlwaysLoadImages as updateAlwaysLoadImagesStore, setDarkMailContent as updateDarkMailContentStore, setDarkComposerBody as updateDarkComposerBodyStore, setAccentBarUnread as updateAccentBarUnreadStore, setAccentUnreadStyle as updateAccentUnreadStyleStore, setShowMessageListCircles as updateShowMessageListCirclesStore, setShowMessageListProfilePics as updateShowMessageListProfilePicsStore, setAlwaysShowMessageCheckbox as updateAlwaysShowMessageCheckboxStore, setShowViewerCircles as updateShowViewerCirclesStore, setShowMessagePreviewPane as updateShowMessagePreviewPaneStore, setMessageOpenMode as updateMessageOpenModeStore, setSpellcheckEnabled as updateSpellcheckEnabledStore, setSpellcheckLanguages as updateSpellcheckLanguagesStore, setWindowControlsSide as updateWindowControlsSideStore, setCodeChipClickMode as updateCodeChipClickModeStore, setAttentionEnabled as updateAttentionEnabledStore, setAttentionTypeEnabled as updateAttentionTypeEnabledStore, setOtpClipboardClearSeconds as updateOtpClipboardClearSecondsStore, type MessageListDensity, type ThemeMode, type ComposerMode, type ComposerFormat, type WindowControlsSide, type MessageOpenMode } from '$lib/stores/settings.svelte'
   import { syncSpellcheckLanguagesIfActive, defaultSpellcheckLanguages } from '$lib/spellcheck/settings'
@@ -78,6 +78,9 @@
   let attentionTypePaymentFailed = $state<boolean>(true)
   let attentionTypeDeliveryProblem = $state<boolean>(true)
   let inboxTabDefault = $state<string>('all')
+  // macOS notification permission state for the General tab row (null
+  // until loaded; the row stays hidden on non-macOS).
+  let notificationPermission = $state<{ status: string; platform: string; canOpenSystemSettings: boolean } | null>(null)
   let translateEnabled = $state<boolean>(true)
   let translateMode = $state<string>('prefer_offline')
   let translateTargetLanguage = $state<string>('system')
@@ -131,7 +134,7 @@
     loading = true
     hasSaved = false
     try {
-      const [policy, delayMs, density, theme, titleBar, runBg, startHid, showBadge, autoSt, lang, comp, mail, compFmt, undoDelay, nativeTB, alwaysImages, darkMail, darkComposer, accentBar, accentStyle, listCircles, listProfilePics, alwaysCheckbox, viewerCircles, scEnabled, scLangs, wcSide, previewPane, openMode, chipMode, otpClearSecs, attnEnabled, attnCode, attnFlight, attnPayment, attnDelivery, inboxTab, trSettings] = await Promise.all([
+      const [policy, delayMs, density, theme, titleBar, runBg, startHid, showBadge, autoSt, lang, comp, mail, compFmt, undoDelay, nativeTB, alwaysImages, darkMail, darkComposer, accentBar, accentStyle, listCircles, listProfilePics, alwaysCheckbox, viewerCircles, scEnabled, scLangs, wcSide, previewPane, openMode, chipMode, otpClearSecs, attnEnabled, attnCode, attnFlight, attnPayment, attnDelivery, inboxTab, trSettings, notifPerm] = await Promise.all([
         GetReadReceiptResponsePolicy(),
         GetMarkAsReadDelay(),
         GetMessageListDensity(),
@@ -170,6 +173,7 @@
         GetAttentionTypeEnabled('delivery_problem'),
         GetInboxTabDefault(),
         GetTranslationSettings(''),
+        GetNotificationPermissionStatus(),
       ])
       readReceiptResponsePolicy = policy
       // Convert ms to seconds for display
@@ -212,6 +216,7 @@
       attentionTypePaymentFailed = attnPayment ?? true
       attentionTypeDeliveryProblem = attnDelivery ?? true
       inboxTabDefault = inboxTab || 'all'
+      notificationPermission = notifPerm ?? null
       if (trSettings) {
         translateEnabled = trSettings.enabled ?? true
         translateMode = trSettings.mode || 'prefer_offline'
@@ -505,6 +510,14 @@
               bind:hideUnifiedSingleAccount
               bind:darkMailContent
               bind:darkComposerBody
+              bind:notificationPermission
+              onOpenNotificationSettings={async () => {
+                try {
+                  await OpenNotificationSettings()
+                } catch (err) {
+                  console.error('Failed to open notification settings:', err)
+                }
+              }}
             />
           </Tabs.Content>
 
