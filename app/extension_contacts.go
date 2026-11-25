@@ -51,6 +51,11 @@ func (a *App) initContactsExtension() {
 		// linked the source to an email account or set it up via the
 		// contacts-only OAuth flow.
 		GetStandaloneSourceToken: a.getValidContactSourceOAuthToken,
+		// Force-refresh hook for the write side's 401 retry (fourth-audit
+		// finding 35): when the stored token was revoked after the
+		// client was built, the transport refreshes once under a lock
+		// and retries instead of failing every write until expiry.
+		RefreshStandaloneSourceToken: a.refreshContactSourceOAuthToken,
 	})
 
 	// Live-refresh the contact list after any source sync (background

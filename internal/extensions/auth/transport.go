@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/absonsnet/daak/internal/credentials"
 	"github.com/absonsnet/daak/internal/oauth2"
@@ -94,7 +93,7 @@ func (t *bearerRefreshTransport) RoundTrip(req *http.Request) (*http.Response, e
 		return nil, fmt.Errorf("auth broker: refresh: %w", err)
 	}
 
-	expiresAt := time.Now().Add(time.Duration(refreshed.ExpiresIn) * time.Second)
+	expiresAt := oauth2.ExpiryFromNow(refreshed.ExpiresIn)
 	// Persist the rotated refresh token too — providers like Microsoft and custom
 	// OIDC return a NEW refresh_token on refresh; dropping it breaks the next one.
 	if err := t.credStore.UpdateOAuthTokensForClientConfig(t.accountID, t.clientConfigID, refreshed.AccessToken, refreshed.RefreshToken, expiresAt); err != nil {

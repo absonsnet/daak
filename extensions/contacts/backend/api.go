@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/absonsnet/daak/extensions/contacts/backend/imaging"
@@ -70,6 +71,19 @@ type API struct {
 	// OAuth writes for standalone sources (they error with a clear message);
 	// account-linked sources still go through core.Auth().HTTPClient.
 	getStandaloneSourceToken func(sourceID string) (string, error)
+	// refreshStandaloneSourceToken forces a refresh of a standalone
+	// source's token regardless of expiry. Used by the 401-retry
+	// transport (fourth-audit finding 35) when the stored token was
+	// revoked after the client was built. Set via
+	// SetStandaloneSourceTokenRefresher; nil means a 401 is returned
+	// to the caller unchanged (the pre-fix behaviour).
+	refreshStandaloneSourceToken func(sourceID string) (string, error)
+	// standaloneRefreshMu guards standaloneRefreshLocks, the
+	// per-source locks that serialise 401-driven refreshes so two
+	// concurrent writes with the same revoked token cause exactly
+	// one refresh — mirroring the broker transport's shared lock.
+	standaloneRefreshMu    sync.Mutex
+	standaloneRefreshLocks map[string]*sync.Mutex
 }
 
 // NewAPI constructs the Contacts API wrapper. Any store may be nil — the
@@ -105,6 +119,30 @@ func NewAPI(localStore *contact.Store, carddavStore *carddav.Store, extStore *St
 // rather than panicking).
 func (a *API) SetStandaloneSourceTokenGetter(fn func(sourceID string) (string, error)) {
 	a.getStandaloneSourceToken = fn
+}
+
+// SetStandaloneSourceTokenRefresher wires the host-provided closure that
+// force-refreshes a standalone source's token. Called once by the bridge
+// during ensureInit; nil-safe (401s are then returned to the caller
+// unchanged instead of retried).
+func (a *API) SetStandaloneSourceTokenRefresher(fn func(sourceID string) (string, error)) {
+	a.refreshStandaloneSourceToken = fn
+}
+
+// standaloneRefreshLock returns the 401-refresh mutex for a source,
+// creating it on first use.
+func (a *API) standaloneRefreshLock(sourceID string) *sync.Mutex {
+	a.standaloneRefreshMu.Lock()
+	defer a.standaloneRefreshMu.Unlock()
+	if a.standaloneRefreshLocks == nil {
+		a.standaloneRefreshLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := a.standaloneRefreshLocks[sourceID]
+	if !ok {
+		mu = &sync.Mutex{}
+		a.standaloneRefreshLocks[sourceID] = mu
+	}
+	return mu
 }
 
 // SearchContacts delegates to the core contact store's merged search across

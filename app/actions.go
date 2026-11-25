@@ -290,6 +290,11 @@ func (a *App) setStarredStatus(messageIDs []string, isStarred bool) error {
 	if len(messageIDs) == 0 {
 		return nil
 	}
+	// Star/unstar covers every same-folder copy sharing a Message-ID,
+	// exactly like read/unread already does (fourth-audit finding 43):
+	// the viewer shows the copies as one merged message, so starring
+	// one copy must star them all.
+	messageIDs = a.expandToFolderCopies(messageIDs)
 
 	messages, err := a.messageStore.GetByIDs(messageIDs)
 	if err != nil {

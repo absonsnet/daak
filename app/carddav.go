@@ -589,7 +589,7 @@ func (a *App) CompleteContactSourceOAuthSetup(name string, syncInterval int) (*c
 	}
 
 	// Calculate token expiry
-	expiresAt := time.Now().Add(time.Duration(a.pendingContactSourceOAuthTokens.ExpiresIn) * time.Second)
+	expiresAt := oauth2.ExpiryFromNow(a.pendingContactSourceOAuthTokens.ExpiresIn)
 
 	// Save OAuth tokens for the source
 	tokens := &credentials.OAuthTokens{

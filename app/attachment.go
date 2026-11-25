@@ -325,8 +325,24 @@ func (a *App) OpenFolder(path string) error {
 	return cmd.Start()
 }
 
+// saveAllResultError builds the partial-failure error for a Save All
+// operation (fourth-audit finding 45). The folder path is still
+// returned alongside it so the caller can log it, but the non-nil
+// error makes the Wails promise reject, so the UI shows the failure
+// toast instead of claiming every file was saved. Returns nil when
+// nothing failed.
+func saveAllResultError(saved, total int, failed []string) error {
+	if len(failed) == 0 {
+		return nil
+	}
+	return fmt.Errorf("saved %d of %d attachments; failed to save: %s", saved, total, strings.Join(failed, ", "))
+}
+
 // SaveAllAttachments shows a folder picker and saves all attachments from a message to that folder
-// Returns the folder path where files were saved, or empty string if cancelled
+// Returns the folder path where files were saved, or empty string if cancelled.
+// If some files fail, the folder is still returned but so is an error
+// naming the failures (fourth-audit finding 45) — a partial save must
+// not report success.
 func (a *App) SaveAllAttachments(messageID string) (string, error) {
 	log := logging.WithComponent("app")
 
@@ -391,12 +407,14 @@ func (a *App) SaveAllAttachments(messageID string) (string, error) {
 	// sharing a name do not overwrite each other in the folder.
 	downloader := email.NewAttachmentDownloader(a.paths.AttachmentsPath())
 	savedCount := 0
+	failed := []string{}
 	usedNames := map[string]bool{}
 
 	for _, att := range attachments {
 		content, err := downloader.ExtractAttachmentContentFor(raw, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 
@@ -404,13 +422,14 @@ func (a *App) SaveAllAttachments(messageID string) (string, error) {
 		_, err = downloader.SaveAttachment(att, content, savePath)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		savedCount++
 	}
 
 	log.Info().Int("count", savedCount).Str("folder", saveDir).Msg("Saved all attachments")
-	return saveDir, nil
+	return saveDir, saveAllResultError(savedCount, len(attachments), failed)
 }
 
 // decryptMessageBody decrypts an encrypted message's raw body and returns the inner plaintext bytes.
@@ -581,6 +600,8 @@ func (a *App) OpenEncryptedAttachment(messageID, filename string) error {
 
 // SaveAllEncryptedAttachments shows a folder picker and saves all attachments from an encrypted message.
 // Returns the folder path where files were saved, or empty string if cancelled.
+// If some files fail, the folder is still returned but so is an error
+// naming the failures (fourth-audit finding 45).
 func (a *App) SaveAllEncryptedAttachments(messageID string) (string, error) {
 	log := logging.WithComponent("app")
 
@@ -638,12 +659,14 @@ func (a *App) SaveAllEncryptedAttachments(messageID string) (string, error) {
 
 	downloader := email.NewAttachmentDownloader(a.paths.AttachmentsPath())
 	savedCount := 0
+	failed := []string{}
 	usedNames := map[string]bool{}
 
 	for _, att := range regularAtts {
 		content, err := downloader.ExtractAttachmentContentFor(innerBytes, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract encrypted attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 
@@ -651,13 +674,14 @@ func (a *App) SaveAllEncryptedAttachments(messageID string) (string, error) {
 		_, err = downloader.SaveAttachment(att, content, savePath)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save encrypted attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		savedCount++
 	}
 
 	log.Info().Int("count", savedCount).Str("folder", saveDir).Msg("Saved all encrypted attachments")
-	return saveDir, nil
+	return saveDir, saveAllResultError(savedCount, len(regularAtts), failed)
 }
 
 // saveAllAttachmentsViaPortal saves all attachments using the XDG FileChooser portal.
@@ -699,6 +723,7 @@ func (a *App) saveAllAttachmentsViaPortal(messageID string, attachments []*messa
 
 	downloader := email.NewAttachmentDownloader(a.paths.AttachmentsPath())
 	savedCount := 0
+	failed := []string{}
 
 	for i, att := range attachments {
 		if i >= len(savePaths) {
@@ -708,19 +733,21 @@ func (a *App) saveAllAttachmentsViaPortal(messageID string, attachments []*messa
 		content, err := downloader.ExtractAttachmentContentFor(raw, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 
 		_, err = downloader.SaveAttachment(att, content, savePaths[i])
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		savedCount++
 	}
 
 	log.Info().Int("count", savedCount).Msg("Saved all attachments via portal")
-	return filepath.Dir(savePaths[0]), nil
+	return filepath.Dir(savePaths[0]), saveAllResultError(savedCount, len(attachments), failed)
 }
 
 // saveAllEncryptedAttachmentsViaPortal saves all encrypted attachments using the XDG FileChooser portal.
@@ -747,6 +774,7 @@ func (a *App) saveAllEncryptedAttachmentsViaPortal(attachments []*message.Attach
 
 	downloader := email.NewAttachmentDownloader(a.paths.AttachmentsPath())
 	savedCount := 0
+	failed := []string{}
 
 	for i, att := range attachments {
 		if i >= len(savePaths) {
@@ -756,19 +784,21 @@ func (a *App) saveAllEncryptedAttachmentsViaPortal(attachments []*message.Attach
 		content, err := downloader.ExtractAttachmentContentFor(innerBytes, att)
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract encrypted attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 
 		_, err = downloader.SaveAttachment(att, content, savePaths[i])
 		if err != nil {
 			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save encrypted attachment")
+			failed = append(failed, att.Filename)
 			continue
 		}
 		savedCount++
 	}
 
 	log.Info().Int("count", savedCount).Msg("Saved all encrypted attachments via portal")
-	return filepath.Dir(savePaths[0]), nil
+	return filepath.Dir(savePaths[0]), saveAllResultError(savedCount, len(attachments), failed)
 }
 
 // rememberSavePath records a path the user chose in a save dialog so the

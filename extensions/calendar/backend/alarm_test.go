@@ -5,6 +5,7 @@ package backend
 // DATE-TIME, and recurrence override with its own VALARM.
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 	"time"
@@ -23,11 +24,11 @@ DESCRIPTION:Standup soon
 END:VALARM
 END:VEVENT`)
 	ev := Event{
-		ID:           "ev1",
-		Summary:      "Standup",
-		DTStartUnix:  time.Date(2026, 6, 5, 14, 0, 0, 0, time.UTC).Unix(),
-		DTEndUnix:    time.Date(2026, 6, 5, 15, 0, 0, 0, time.UTC).Unix(),
-		ICSBlob:      ics,
+		ID:          "ev1",
+		Summary:     "Standup",
+		DTStartUnix: time.Date(2026, 6, 5, 14, 0, 0, 0, time.UTC).Unix(),
+		DTEndUnix:   time.Date(2026, 6, 5, 15, 0, 0, 0, time.UTC).Unix(),
+		ICSBlob:     ics,
 	}
 	insts := []EventInstance{{Event: ev, InstanceStartUnix: ev.DTStartUnix, InstanceEndUnix: ev.DTEndUnix}}
 
@@ -298,4 +299,118 @@ func wrapICS(body string) string {
 	}
 	b.WriteString("END:VCALENDAR\r\n")
 	return b.String()
+}
+
+// TestExtractAlarms_MovedOverrideUsesRecurrenceID (fourth-audit finding
+// 32): an override that moved its occurrence (new DTSTART 16:00, original
+// RECURRENCE-ID 14:00) must use the override's own VALARM (-PT5M), not
+// the master's (-PT30M). Looking the templates up by the new start
+// missed the override entirely.
+func TestExtractAlarms_MovedOverrideUsesRecurrenceID(t *testing.T) {
+	masterICS := wrapICS(`BEGIN:VEVENT
+UID:e8
+DTSTART:20260605T140000Z
+DTEND:20260605T150000Z
+SUMMARY:Master
+RRULE:FREQ=DAILY;COUNT=3
+BEGIN:VALARM
+ACTION:DISPLAY
+TRIGGER:-PT30M
+END:VALARM
+END:VEVENT`)
+	overrideICS := wrapICS(`BEGIN:VEVENT
+UID:e8
+RECURRENCE-ID:20260606T140000Z
+DTSTART:20260606T160000Z
+DTEND:20260606T170000Z
+SUMMARY:Moved override
+BEGIN:VALARM
+ACTION:DISPLAY
+TRIGGER:-PT5M
+END:VALARM
+END:VEVENT`)
+	base := time.Date(2026, 6, 5, 14, 0, 0, 0, time.UTC)
+	ev := Event{
+		ID:          "ev8",
+		Summary:     "Master",
+		DTStartUnix: base.Unix(),
+		DTEndUnix:   base.Add(time.Hour).Unix(),
+		RRuleText:   "RRULE:FREQ=DAILY;COUNT=3",
+		ICSBlob:     masterICS,
+	}
+	originalStart := time.Date(2026, 6, 6, 14, 0, 0, 0, time.UTC).Unix()
+	movedStart := time.Date(2026, 6, 6, 16, 0, 0, 0, time.UTC).Unix()
+	insts := []EventInstance{{
+		Event:                ev,
+		InstanceStartUnix:    movedStart,
+		InstanceEndUnix:      movedStart + 3600,
+		RecurrenceIDUnix:     originalStart,
+		IsRecurrenceOverride: true,
+	}}
+	overrides := []EventOverride{{
+		EventID:          "ev8",
+		RecurrenceIDUnix: originalStart,
+		ICSBlob:          overrideICS,
+	}}
+
+	alarms, err := ExtractAlarms(ev, overrides, insts)
+	if err != nil {
+		t.Fatalf("ExtractAlarms: %v", err)
+	}
+	if len(alarms) != 1 {
+		t.Fatalf("want 1 alarm, got %d", len(alarms))
+	}
+	// Override's -PT5M relative to the MOVED start (16:00), not the
+	// master's -PT30M relative to the original start.
+	if want := movedStart - 5*60; alarms[0].TriggerUnix != want {
+		t.Errorf("moved override alarm trigger: got %d want %d (master template would give %d)",
+			alarms[0].TriggerUnix, want, originalStart-30*60)
+	}
+}
+
+// TestPruneStaleAlarmsTx (fourth-audit finding 32): after an edit, the
+// fresh extraction replaces the old rows — stale pending rows are
+// deleted, current ones and fired history survive.
+func TestPruneStaleAlarmsTx(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now().Unix()
+	if err := store.WithTx(func(tx *sql.Tx) error {
+		if err := store.CreateSourceTx(tx, Source{ID: "src-1", Type: SourceTypeLocal, Name: "Local", Enabled: true, Writable: true, CreatedAt: now}); err != nil {
+			return err
+		}
+		if err := store.CreateCalendarTx(tx, Calendar{ID: "cal-1", SourceID: "src-1", DisplayName: "Cal", URL: "local", CreatedAt: now}); err != nil {
+			return err
+		}
+		return store.UpsertEventTx(tx, Event{ID: "ev-1", CalendarID: "cal-1", UID: "u1", Summary: "E", DTStartUnix: now, DTEndUnix: now + 3600})
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	current := Alarm{ID: "a-current", EventID: "ev-1", InstanceUnix: now, TriggerUnix: now - 900, Status: "pending", Action: "display"}
+	stale := Alarm{ID: "a-stale", EventID: "ev-1", InstanceUnix: now - 86400, TriggerUnix: now - 86400 - 900, Status: "pending", Action: "display"}
+	fired := Alarm{ID: "a-fired", EventID: "ev-1", InstanceUnix: now - 2*86400, TriggerUnix: now - 2*86400 - 900, Status: "fired", Action: "display"}
+	if err := store.WithTx(func(tx *sql.Tx) error {
+		for _, a := range []Alarm{current, stale, fired} {
+			if err := store.UpsertAlarmTx(tx, a); err != nil {
+				return err
+			}
+		}
+		// The fresh extraction only covers the current alarm; the
+		// stale row (old time) must go, fired history must stay.
+		return store.PruneStaleAlarmsTx(tx, "ev-1", []Alarm{current})
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if a, err := store.GetAlarm("a-current"); err != nil || a == nil {
+		t.Errorf("current alarm pruned or unreadable: %v / %v", a, err)
+	}
+	if a, err := store.GetAlarm("a-stale"); err != nil {
+		t.Fatal(err)
+	} else if a != nil {
+		t.Errorf("stale alarm survived pruning: %+v", a)
+	}
+	if a, err := store.GetAlarm("a-fired"); err != nil || a == nil {
+		t.Errorf("fired alarm history was pruned: %v / %v", a, err)
+	}
 }

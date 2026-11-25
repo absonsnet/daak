@@ -270,7 +270,19 @@ func Enrich(in Input) Result {
 		return res
 	}
 
-	// 2. Hard signals.
+	// 2. A known personal sender wins over the hard signals (fourth-audit
+	// finding 40): a real person's mail carrying a List-Unsubscribe
+	// header (or a bulk Precedence, or an automated-looking local part)
+	// used to be locked into the Automated tab forever — the header
+	// pass filed it Automated and the body pass was forced to keep
+	// that verdict. An explicit sender override (rule 1) still wins
+	// over this: the user said Automated, they mean Automated.
+	if in.KnownPersonalSender {
+		res.Category = CategoryPersonal
+		return res
+	}
+
+	// 3. Hard signals.
 	automated := false
 	if lu != "" {
 		automated = true
@@ -291,12 +303,8 @@ func Enrich(in Input) Result {
 		res.ExtractKind, res.ExtractValue, res.ExtractRule = extract(in, res.SubCategory)
 		return res
 	}
-	if in.KnownPersonalSender {
-		res.Category = CategoryPersonal
-		return res
-	}
 
-	// 3. Domain / keyword tables.
+	// 4. Domain / keyword tables.
 	if sub := classifySubCategory(in); sub != "" {
 		res.Category = CategoryAutomated
 		res.SubCategory = sub
@@ -304,7 +312,7 @@ func Enrich(in Input) Result {
 		return res
 	}
 
-	// 4. Default Personal.
+	// 5. Default Personal.
 	return res
 }
 

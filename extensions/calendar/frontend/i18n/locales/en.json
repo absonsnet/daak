@@ -290,7 +290,7 @@
       "dialogSend": "Send update",
       "dialogDontSend": "Don't send",
       "dialogCancel": "Cancel",
-      "dialogNoteMicrosoft": "Microsoft Graph may send invitations regardless of your choice — its v1.0 API has no documented suppression mechanism.",
+      "dialogNoteMicrosoft": "Microsoft always sends invitations for this calendar — its v1.0 API has no way to suppress them, so there is no \"Don't send\" option.",
       "dialogNoteCalDAVNone": "This CalDAV server doesn't support automatic invitation delivery, so updates won't be sent to attendees.",
       "findATime": "Find a time",
       "findATimeTitle": "Find a time that works",

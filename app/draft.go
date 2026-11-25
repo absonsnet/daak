@@ -329,7 +329,11 @@ func (ops *draftOps) syncToIMAP(ctx context.Context, localDraft *draft.Draft, ms
 	fromEmail := msg.From.Address
 
 	// Sign then encrypt draft for IMAP sync (mirrors send flow)
-	// S/MIME signing
+	// S/MIME signing. Track whether it actually applied: gating PGP
+	// on the SignMessage toggle (fourth-audit finding 44, send path)
+	// would leave the draft signed by neither when S/MIME signing
+	// was requested but failed.
+	smimeSigned := false
 	if localDraft.SignMessage {
 		signedMsg, signErr := ops.smimeSigner.SignMessage(localDraft.AccountID, fromEmail, rawMsg)
 		if signErr != nil {
@@ -337,6 +341,7 @@ func (ops *draftOps) syncToIMAP(ctx context.Context, localDraft *draft.Draft, ms
 		}
 		if signErr == nil {
 			rawMsg = signedMsg
+			smimeSigned = true
 			log.Debug().Str("draftID", localDraft.ID).Msg("Draft S/MIME signed for IMAP sync")
 		}
 	}
@@ -352,8 +357,9 @@ func (ops *draftOps) syncToIMAP(ctx context.Context, localDraft *draft.Draft, ms
 		rawMsg = encryptedMsg
 		log.Debug().Str("draftID", localDraft.ID).Msg("Draft S/MIME encrypted for IMAP sync")
 	}
-	// PGP signing (mutually exclusive with S/MIME)
-	if !localDraft.SignMessage && localDraft.PGPSignMessage {
+	// PGP signing (mutually exclusive with S/MIME — only if S/MIME
+	// signing was not actually applied)
+	if !smimeSigned && localDraft.PGPSignMessage {
 		signedMsg, signErr := ops.pgpSigner.SignMessage(localDraft.AccountID, fromEmail, rawMsg)
 		if signErr != nil {
 			log.Warn().Err(signErr).Msg("Failed to PGP sign draft for IMAP sync, continuing unsigned")

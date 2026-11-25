@@ -205,3 +205,38 @@ func TestAttentionEvaluation(t *testing.T) {
 		t.Errorf("code should win over flight rule, got %+v %v", item, ok)
 	}
 }
+
+// TestEnrich_KnownPersonalSenderBeatsHardSignals (fourth-audit finding
+// 40): a known personal sender's mail stays Personal even with a
+// List-Unsubscribe header, a bulk Precedence, an automated-looking
+// local part, or a forced-Automated verdict from an earlier pass —
+// but an explicit sender override to Automated still wins.
+func TestEnrich_KnownPersonalSenderBeatsHardSignals(t *testing.T) {
+	base := Input{
+		FromEmail:           "sara@example.com",
+		Subject:             "Hello",
+		KnownPersonalSender: true,
+	}
+	cases := []struct {
+		name string
+		in   Input
+	}{
+		{"list-unsubscribe header", Input{FromEmail: base.FromEmail, Subject: base.Subject, ListUnsubscribe: "<https://example.com/unsub>", KnownPersonalSender: true}},
+		{"bulk precedence", Input{FromEmail: base.FromEmail, Subject: base.Subject, Precedence: "bulk", KnownPersonalSender: true}},
+		{"automated local part", Input{FromEmail: "noreply@example.com", Subject: base.Subject, KnownPersonalSender: true}},
+		{"forced automated (earlier pass)", Input{FromEmail: base.FromEmail, Subject: base.Subject, ListUnsubscribe: "<https://example.com/unsub>", ForceAutomated: true, KnownPersonalSender: true}},
+	}
+	for _, c := range cases {
+		if got := Enrich(c.in); got.Category != CategoryPersonal {
+			t.Errorf("%s: category = %q, want Personal", c.name, got.Category)
+		}
+	}
+	// Sanity: without the known-personal flag the same mail is Automated.
+	if got := Enrich(Input{FromEmail: base.FromEmail, Subject: base.Subject, ListUnsubscribe: "<https://example.com/unsub>"}); got.Category != CategoryAutomated {
+		t.Errorf("no known-personal flag: category = %q, want Automated", got.Category)
+	}
+	// Explicit override to Automated still wins over known-personal.
+	if got := Enrich(Input{FromEmail: base.FromEmail, Subject: base.Subject, HasOverride: true, OverrideCategory: CategoryAutomated, KnownPersonalSender: true}); got.Category != CategoryAutomated {
+		t.Errorf("explicit Automated override: category = %q, want Automated", got.Category)
+	}
+}

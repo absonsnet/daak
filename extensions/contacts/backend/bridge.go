@@ -83,6 +83,12 @@ type ContactsBridgeDeps struct {
 	// account-linked ones. Nil-safe (writes to standalone sources then
 	// error with a clear message).
 	GetStandaloneSourceToken func(sourceID string) (string, error)
+
+	// RefreshStandaloneSourceToken force-refreshes a standalone source's
+	// token regardless of expiry. Wired through to the API so the
+	// write-side HTTP client can retry once after a 401 (fourth-audit
+	// finding 35). Nil-safe (401s are then returned unchanged).
+	RefreshStandaloneSourceToken func(sourceID string) (string, error)
 }
 
 // SettingsStore is the narrow interface the bridge needs from the host's
@@ -151,6 +157,7 @@ func (b *ContactsBridge) ensureInit() error {
 		}
 		b.api = NewAPI(contactStore, carddavStore, extStore, b.deps.Core, b.deps.DB.DB)
 		b.api.SetStandaloneSourceTokenGetter(b.deps.GetStandaloneSourceToken)
+		b.api.SetStandaloneSourceTokenRefresher(b.deps.RefreshStandaloneSourceToken)
 	})
 	return b.initErr
 }

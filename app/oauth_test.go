@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/absonsnet/daak/internal/account"
 	"github.com/absonsnet/daak/internal/credentials"
@@ -182,5 +183,81 @@ func TestSavePendingOAuthTokens_RejectsEmailMismatch(t *testing.T) {
 	}
 	if tokens.AccessToken != "access-google" {
 		t.Fatalf("account tokens changed to %+v, want the original google tokens", tokens)
+	}
+}
+
+// TestSavePendingOAuthTokens_PropagatesOnlyToMatchingProvider (fourth-audit
+// finding 31): re-sign-in copies new tokens only into shared mailboxes
+// whose stored provider matches, and a stale custom-provider record is
+// cleared on save.
+func TestSavePendingOAuthTokens_PropagatesOnlyToMatchingProvider(t *testing.T) {
+	a := newOAuthTestApp(t)
+	a.seedPendingOAuth(t, "alice@example.com", "microsoft")
+	parent, err := a.CompleteOAuthAccountSetup("microsoft", "alice@example.com", "Alice", "Alice", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two shared mailboxes under the parent: one Microsoft (matching),
+	// one Google (must NOT receive Microsoft tokens).
+	mkShared := func(email, provider string) string {
+		acc, err := a.accountStore.Create(&account.AccountConfig{
+			Name:                  email,
+			DisplayName:           email,
+			Email:                 email,
+			Username:              email,
+			AuthType:              account.AuthOAuth2,
+			IMAPHost:              "outlook.office365.com",
+			IMAPPort:              993,
+			IMAPSecurity:          account.SecurityTLS,
+			SMTPHost:              "smtp.office365.com",
+			SMTPPort:              587,
+			SMTPSecurity:          account.SecurityStartTLS,
+			SharedMailboxParentID: parent.ID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.credStore.SetOAuthTokens(acc.ID, &credentials.OAuthTokens{
+			Provider:     provider,
+			AccessToken:  "old-" + provider,
+			RefreshToken: "old-refresh-" + provider,
+			ExpiresAt:    time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return acc.ID
+	}
+	msShared := mkShared("shared-ms@example.com", "microsoft")
+	googleShared := mkShared("shared-google@example.com", "google")
+
+	// Stash a stale custom-provider record, as a previous custom flow
+	// would have left behind.
+	a.pendingCustomProvider = &oauth2.ProviderConfig{Name: "custom"}
+
+	a.seedPendingOAuth(t, "alice@example.com", "microsoft")
+	// New tokens for the re-sign-in.
+	a.pendingOAuthTokens.AccessToken = "access-microsoft-new"
+	a.pendingOAuthTokens.RefreshToken = "refresh-microsoft-new"
+	if err := a.SavePendingOAuthTokens(parent.ID); err != nil {
+		t.Fatalf("SavePendingOAuthTokens: %v", err)
+	}
+	if a.pendingCustomProvider != nil {
+		t.Fatal("stale pending custom provider was not cleared on save")
+	}
+
+	msTokens, err := a.credStore.GetOAuthTokens(msShared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msTokens.AccessToken != "access-microsoft-new" {
+		t.Fatalf("matching shared mailbox tokens = %q, want the new Microsoft tokens", msTokens.AccessToken)
+	}
+	googleTokens, err := a.credStore.GetOAuthTokens(googleShared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if googleTokens.AccessToken != "old-google" {
+		t.Fatalf("different-provider shared mailbox tokens = %q, want untouched old-google tokens", googleTokens.AccessToken)
 	}
 }

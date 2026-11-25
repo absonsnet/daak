@@ -40,8 +40,12 @@
     }
   })
 
-  // Provider note: surface real-world limitations so users don't expect
-  // behavior that can't happen.
+  // Microsoft Graph has no way to suppress invitations: it always
+  // sends them (fourth-audit finding 42). Offering "Don't send" for a
+  // Microsoft calendar is a promise the backend cannot keep, so the
+  // choice is hidden and the note states plainly that Microsoft
+  // always sends. Other providers keep both choices.
+  const isMicrosoft = $derived(sourceKind === 'microsoft')
   const providerNote = $derived.by(() => {
     switch (sourceKind) {
       case 'microsoft':
@@ -84,7 +88,9 @@
 
     <div class="mt-4 flex flex-col-reverse gap-2 border-t border-border pt-4 sm:flex-row sm:items-center sm:justify-end">
       <Button variant="ghost" onclick={cancel}>{$_('calendar.attendees.dialogCancel')}</Button>
-      <Button variant="outline" onclick={pickDontSend}>{$_('calendar.attendees.dialogDontSend')}</Button>
+      {#if !isMicrosoft}
+        <Button variant="outline" onclick={pickDontSend}>{$_('calendar.attendees.dialogDontSend')}</Button>
+      {/if}
       <Button onclick={pickSend}>{$_('calendar.attendees.dialogSend')}</Button>
     </div>
   </Dialog.Content>

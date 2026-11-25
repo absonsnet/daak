@@ -301,6 +301,15 @@ func TestIsPermanentError(t *testing.T) {
 		"failed to build message: bad header",
 		"account not found: abc",
 		"OAuth token refresh failed, re-authorization required: unauthorized_client",
+		// Fourth-audit finding 37: any 5xx SMTP reply is permanent,
+		// classified on the reply code — not substring-matched.
+		"failed to send message: 550 5.1.1 User unknown",
+		"failed to send message: 550 no such user",
+		"failed to send message: 551 user not local",
+		"failed to send message: 552 mailbox full",
+		"failed to send message: 553 mailbox name not allowed",
+		"failed to send message: 554 transaction failed",
+		"failed to send message: 500 syntax error",
 	}
 	for _, msg := range permanent {
 		if !IsPermanentError(errString(msg)) {
@@ -312,6 +321,8 @@ func TestIsPermanentError(t *testing.T) {
 		"failed to send message: read tcp: i/o timeout",
 		"server busy, try again later",
 		"451 greylisted, try again",
+		"failed to send message: 450 mailbox busy, try again later",
+		"failed to send message: 421 service not available",
 		"EOF",
 	}
 	for _, msg := range transient {
