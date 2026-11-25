@@ -27,8 +27,6 @@ import (
 	"github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav"
 	"github.com/google/uuid"
-
-	"github.com/absonsnet/daak/internal/kit/davutil"
 )
 
 // composedVCalendar is the output of composeVCalendar. NewSeries is
@@ -400,17 +398,17 @@ func (p caldavProvider) PushInstance(ctx context.Context, src Source, cal Calend
 		return PushInstanceResult{}, err
 	}
 
-	password, err := p.secrets.Get(src.ID)
+	// Route through davClient like the other CalDAV write paths (PushEvent,
+	// DeleteRemote, SyncCalendar): OAuth-linked sources carry no stored
+	// password and authenticate with the linked account's Bearer token;
+	// davClient falls back to Basic auth only when no account is linked.
+	// Building a Basic client from the stored password here used to fail
+	// every single-occurrence edit/delete on OAuth-linked sources with a
+	// misleading "re-add it in settings" error.
+	httpClient, err := p.davClient(src, 30*time.Second)
 	if err != nil {
-		return PushInstanceResult{}, fmt.Errorf("load password: %w", err)
+		return PushInstanceResult{}, err
 	}
-	if password == "" {
-		return PushInstanceResult{}, fmt.Errorf("no password stored for source — re-add it in settings")
-	}
-	// xmlfix-wrapped client — PUT responses may carry unquoted ETags on
-	// some servers; without the fix the new ETag fails to parse and the
-	// next conditional update breaks. Same builder as sync.
-	httpClient := davutil.NewBasicDigestHTTPClient(src.Username, password, 30*time.Second)
 
 	// PUT the new master blob to master.Href.
 	masterHref, err := absoluteHref(src.URL, payload.Master.Href)
