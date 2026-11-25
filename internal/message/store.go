@@ -1516,6 +1516,17 @@ func (s *Store) GetMessageUIDsAndFolder(messageIDs []string) (map[string]UIDInfo
 		if err := rows.Scan(&id, &uidI64, &folderID); err != nil {
 			return nil, fmt.Errorf("failed to scan message UID: %w", err)
 		}
+		// Mirror the singular lookup: a just-moved message carries a
+		// negative placeholder UID (uid = -rowid, written by MoveMessages
+		// until the destination sync fetches the real UID), and uid 0 is
+		// no server UID at all. Converting either unchecked to uint32
+		// would yield a huge bogus UID the server can never return, and
+		// the batch fetch would then charge the ID body_failed. Skip the
+		// row instead: the destination sync resolves the real UID, and
+		// the caller must not pass the ID on as a fetchable request.
+		if uidI64 <= 0 {
+			continue
+		}
 		result[id] = UIDInfo{UID: uint32(uidI64), FolderID: folderID}
 	}
 
