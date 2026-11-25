@@ -854,3 +854,69 @@ func TestGoogleProvider_DeleteRemote_EmptyETag_ChangedIsConflict(t *testing.T) {
 		t.Fatalf("server saw %d DELETEs, want 0; requests=%+v", got, gs.requests)
 	}
 }
+
+// Audit4 finding 17: single-occurrence edits/deletes made elsewhere must
+// show up in Daak — overrides become RECURRENCE-ID rows, cancelled ones
+// become EXDATE on the master.
+func TestPersistEventsPage_GoogleOverrides(t *testing.T) {
+	store := newTestStore(t)
+	_, calID := seedGoogleSource(t, store, "primary")
+	p := googleProvider{store: store}
+	cal := Calendar{ID: calID, URL: "primary"}
+
+	masterStart := time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC) // Monday
+	occ2 := masterStart.AddDate(0, 0, 7)
+	occ3 := masterStart.AddDate(0, 0, 14)
+	items := []googleEvent{
+		// Override listed BEFORE its master: the two-pass persist must
+		// still find the master.
+		{
+			ID: "override-1", ICalUID: "master-uid@google", Status: "confirmed",
+			RecurringEventID: "master-1", Summary: "Project sync (moved)",
+			Start:             &googleTimePoint{DateTime: occ2.Add(time.Hour).Format(time.RFC3339)},
+			End:               &googleTimePoint{DateTime: occ2.Add(2 * time.Hour).Format(time.RFC3339)},
+			OriginalStartTime: &googleTimePoint{DateTime: occ2.Format(time.RFC3339)},
+		},
+		{
+			ID: "override-2", ICalUID: "master-uid@google", Status: "cancelled",
+			RecurringEventID:  "master-1",
+			Start:             &googleTimePoint{DateTime: occ3.Format(time.RFC3339)},
+			End:               &googleTimePoint{DateTime: occ3.Add(time.Hour).Format(time.RFC3339)},
+			OriginalStartTime: &googleTimePoint{DateTime: occ3.Format(time.RFC3339)},
+		},
+		{
+			ID: "master-1", ICalUID: "master-uid@google", Status: "confirmed",
+			Summary:    "Project sync",
+			Start:      &googleTimePoint{DateTime: masterStart.Format(time.RFC3339)},
+			End:        &googleTimePoint{DateTime: masterStart.Add(time.Hour).Format(time.RFC3339)},
+			Recurrence: []string{"RRULE:FREQ=WEEKLY;COUNT=4"},
+		},
+	}
+	if err := p.persistEventsPage(cal, items); err != nil {
+		t.Fatalf("persistEventsPage: %v", err)
+	}
+	masterID, err := p.lookupEventIDByUID(calID, "master-uid@google")
+	if err != nil || masterID == "" {
+		t.Fatalf("master not stored: id=%q err=%v", masterID, err)
+	}
+	overrides, err := store.ListOverrides(masterID)
+	if err != nil {
+		t.Fatalf("ListOverrides: %v", err)
+	}
+	if len(overrides) != 1 {
+		t.Fatalf("overrides = %d, want 1 (the moved occurrence)", len(overrides))
+	}
+	if overrides[0].RecurrenceIDUnix != occ2.Unix() {
+		t.Errorf("override recurrence-id = %d, want %d (original start)", overrides[0].RecurrenceIDUnix, occ2.Unix())
+	}
+	if !strings.Contains(overrides[0].ICSBlob, "Project sync (moved)") {
+		t.Errorf("override blob does not carry the moved summary: %q", overrides[0].ICSBlob)
+	}
+	master, err := store.GetEvent(masterID)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	if !strings.Contains(master.ICSBlob, "EXDATE") {
+		t.Errorf("master blob has no EXDATE for the cancelled occurrence: %q", master.ICSBlob)
+	}
+}

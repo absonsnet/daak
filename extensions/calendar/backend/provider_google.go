@@ -183,15 +183,16 @@ func (p googleProvider) fetchEventsPage(ctx context.Context, client *http.Client
 
 // persistEventsPage upserts the master events in items into the events
 // table. Cancelled masters are deleted. Per-instance override events
-// (those with recurringEventId) are skipped in Chunk 3 — a follow-up
-// adds override handling.
+// (those with recurringEventId) are folded into the master the same way
+// the Microsoft path does: a modified override becomes a RECURRENCE-ID
+// row in event_recurrence_overrides, a cancelled one becomes an EXDATE
+// on the master's blob. Two passes — masters first, overrides second —
+// so an override that shares its page with its master always finds the
+// master row, whatever order Google listed them in.
 func (p googleProvider) persistEventsPage(cal Calendar, items []googleEvent) error {
 	return p.store.WithTx(func(tx *sql.Tx) error {
 		for _, item := range items {
 			if item.RecurringEventID != "" {
-				// Override event. Chunk 3 punts; rrule_expand will still
-				// produce the unmodified occurrence for the master's
-				// RRULE expansion, which is "close enough" for most cases.
 				continue
 			}
 			if item.Status == "cancelled" {
@@ -261,8 +262,85 @@ func (p googleProvider) persistEventsPage(cal Calendar, items []googleEvent) err
 				return err
 			}
 		}
+		// Second pass: overrides. The master row is in place now (this
+		// page's masters were upserted above, earlier pages' masters in
+		// previous calls), so the override can be keyed to it.
+		for _, item := range items {
+			if item.RecurringEventID == "" {
+				continue
+			}
+			if err := p.persistGoogleOverrideTx(tx, cal, item); err != nil {
+				// One bad override must not abort the whole page.
+				continue
+			}
+		}
 		return nil
 	})
+}
+
+// persistGoogleOverrideTx folds one Google override event into its
+// master: a cancelled override becomes an EXDATE on the master's blob
+// (and drops any stored override for that occurrence), a modified one
+// becomes a RECURRENCE-ID override row keyed by the original start.
+// The master is found by ICalUID — Google override events share the
+// master's iCalUID. An override whose master is not in the local store
+// yet (master on a later page) is skipped; the next sync re-delivers
+// it via the sync token.
+func (p googleProvider) persistGoogleOverrideTx(tx *sql.Tx, cal Calendar, item googleEvent) error {
+	if item.ICalUID == "" {
+		return fmt.Errorf("google override missing iCalUID")
+	}
+	// Query through the transaction, not the store: the master was
+	// upserted in this same tx (first pass) and is invisible to a
+	// fresh connection until commit.
+	var masterID, masterBlob string
+	err := tx.QueryRow(
+		`SELECT id, ics_blob FROM events WHERE calendar_id = ? AND uid = ?`,
+		cal.ID, item.ICalUID,
+	).Scan(&masterID, &masterBlob)
+	if err != nil {
+		return fmt.Errorf("google override: master %q not in local store: %w", item.ICalUID, err)
+	}
+	recUnix, ok := googleOverrideRecurrenceUnix(item)
+	if !ok {
+		return fmt.Errorf("google override: no original start time")
+	}
+	if item.Status == "cancelled" {
+		updatedICS, err := addEXDATE(masterBlob, recUnix)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE events SET ics_blob = ? WHERE id = ?`, updatedICS, masterID); err != nil {
+			return err
+		}
+		_, err = tx.Exec(
+			`DELETE FROM event_recurrence_overrides WHERE event_id = ? AND recurrence_id_unix = ?`,
+			masterID, recUnix,
+		)
+		return err
+	}
+	blob, err := translateGoogleEventToICS(item)
+	if err != nil {
+		return err
+	}
+	return p.store.UpsertOverrideTx(tx, masterID, recUnix, blob)
+}
+
+// googleOverrideRecurrenceUnix returns the original occurrence start of
+// a Google override event: OriginalStartTime when present, else the
+// event's own start (unmoved occurrences carry no original start).
+func googleOverrideRecurrenceUnix(item googleEvent) (int64, bool) {
+	if item.OriginalStartTime != nil {
+		if t, err := parseGoogleTime(item.OriginalStartTime); err == nil {
+			return t.Unix(), true
+		}
+	}
+	if item.Start != nil {
+		if t, err := parseGoogleTime(item.Start); err == nil {
+			return t.Unix(), true
+		}
+	}
+	return 0, false
 }
 
 // lookupEventIDByUID returns the existing local row ID for a (calendarID,

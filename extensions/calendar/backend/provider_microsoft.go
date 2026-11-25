@@ -900,6 +900,25 @@ func (p microsoftProvider) pushThis(ctx context.Context, client *http.Client, ca
 		resp.StatusCode, resp.Status, strings.TrimSpace(string(bodyRaw)))
 }
 
+// microsoftSplitEndDate returns the recurrence.range.endDate for a
+// this-and-future split: the calendar date of the day before the split
+// occurrence, in the event's own time zone. The master zone wins; the
+// edit input's zone is the fallback; unresolvable zones (including
+// Windows IDs, resolved via resolveTZID) fall back to UTC.
+func microsoftSplitEndDate(masterTZ, inputTZ string, instanceTimeUnix int64) string {
+	tz := masterTZ
+	if tz == "" {
+		tz = inputTZ
+	}
+	loc := time.UTC
+	if name, ok := resolveTZID(tz); ok {
+		if l, err := time.LoadLocation(name); err == nil {
+			loc = l
+		}
+	}
+	return time.Unix(instanceTimeUnix, 0).In(loc).AddDate(0, 0, -1).Format("2006-01-02")
+}
+
 func (p microsoftProvider) pushThisAndFuture(ctx context.Context, client *http.Client, cal Calendar, payload PushInstancePayload) (PushInstanceResult, error) {
 	var result PushInstanceResult
 
@@ -942,8 +961,11 @@ func (p microsoftProvider) pushThisAndFuture(ctx context.Context, client *http.C
 		}
 	}
 
-	// PATCH master with recurrence.range.endDate clamped.
-	endDate := time.Unix(payload.InstanceTimeUnix-86400, 0).UTC().Format("2006-01-02")
+	// PATCH master with recurrence.range.endDate clamped — the date of
+	// the day before the split occurrence, in the event's own time
+	// zone (audit4 finding 25): computing it in UTC drops an extra
+	// occurrence for events east of UTC and keeps one too many west.
+	endDate := microsoftSplitEndDate(payload.Master.TZName, payload.In.TZName, payload.InstanceTimeUnix)
 	masterPatch := graphEvent{
 		Recurrence: &graphRecurrence{
 			Range: graphRange{
@@ -1035,6 +1057,19 @@ func (p microsoftProvider) findInstanceID(ctx context.Context, client *http.Clie
 		return "", fmt.Errorf("decode instances: %w", derr)
 	}
 	for _, ev := range page.Value {
+		// Match by ORIGINAL start first, as Google does: a moved
+		// occurrence's Start is its new time, so matching on Start
+		// alone can never find it again (audit4 finding 25).
+		// Exceptions carry originalStart; unmodified occurrences do
+		// not, and fall through to the Start match below.
+		if ev.OriginalStart != "" {
+			if t, perr := parseGraphDateTime(ev.OriginalStart); perr == nil {
+				if t.UTC().Unix() == instanceTimeUnix {
+					return ev.ID, nil
+				}
+				continue
+			}
+		}
 		if ev.Start == nil {
 			continue
 		}
