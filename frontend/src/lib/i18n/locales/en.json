@@ -471,6 +471,7 @@
     "syncCompleted": "{name} sync completed",
     "failedToReauthorize": "Failed to re-authorize account.",
     "oauthExpired": "{name}: OAuth token expired. Please re-authorize in account settings.",
+    "oauthTokensSaveFailed": "{name}: Refreshed sign-in tokens could not be saved. Please try again — your sign-in is still valid, re-authorize only if you are asked to sign in again.",
     "failedToDeleteIdentity": "Failed to delete identity.",
     "linkOpened": "Link opened in browser"
   },

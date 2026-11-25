@@ -60,11 +60,16 @@ func (s *Store) SetOAuthTokensForClientConfig(accountID, clientConfigID string, 
 		return fmt.Errorf("failed to store OAuth metadata: %w", err)
 	}
 
-	if err := s.setOAuthAccessTokenForClientConfig(accountID, clientConfigID, tokens.AccessToken); err != nil {
-		return fmt.Errorf("failed to store access token: %w", err)
-	}
+	// Refresh token first (audit finding R12): a refresh rotates the
+	// refresh token on the provider, so the new one is the write whose
+	// loss poisons the next refresh. Persisting it before the access
+	// token means a later partial failure still leaves a valid refresh
+	// token behind and the next refresh recovers.
 	if err := s.setOAuthRefreshTokenForClientConfig(accountID, clientConfigID, tokens.RefreshToken); err != nil {
 		return fmt.Errorf("failed to store refresh token: %w", err)
+	}
+	if err := s.setOAuthAccessTokenForClientConfig(accountID, clientConfigID, tokens.AccessToken); err != nil {
+		return fmt.Errorf("failed to store access token: %w", err)
 	}
 
 	s.log.Debug().
@@ -181,13 +186,17 @@ func (s *Store) UpdateOAuthAccessTokenForClientConfig(accountID, clientConfigID,
 // refresh token (Microsoft, custom OIDC) is not lost — mirrors the rotation
 // handling in app/compose.go's core mail refresh.
 func (s *Store) UpdateOAuthTokensForClientConfig(accountID, clientConfigID, accessToken, refreshToken string, expiresAt time.Time) error {
-	if err := s.UpdateOAuthAccessTokenForClientConfig(accountID, clientConfigID, accessToken, expiresAt); err != nil {
-		return err
-	}
+	// Refresh token first (audit finding R12): if the access-token/expiry
+	// write below fails, the rotated refresh token is already stored and
+	// the next refresh recovers; the reverse order would leave the new
+	// access token stored alongside the revoked refresh token.
 	if refreshToken != "" {
 		if err := s.setOAuthRefreshTokenForClientConfig(accountID, clientConfigID, refreshToken); err != nil {
 			return fmt.Errorf("failed to store rotated refresh token: %w", err)
 		}
+	}
+	if err := s.UpdateOAuthAccessTokenForClientConfig(accountID, clientConfigID, accessToken, expiresAt); err != nil {
+		return err
 	}
 	return nil
 }

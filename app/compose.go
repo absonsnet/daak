@@ -65,6 +65,11 @@ type composeOps struct {
 	rawSendOverride  func(ctx context.Context, from string, recipients []string, raw []byte) error
 	sentSaveOverride func(ctx context.Context, accountID string, raw []byte) error
 
+	// saveRefreshedTokensOverride, when non-nil, replaces the credential
+	// store write in getValidOAuthToken. Nil in production; tests set it
+	// to inject a token-save failure (audit finding R12).
+	saveRefreshedTokensOverride func(accountID string, tokens *credentials.OAuthTokens) error
+
 	// saveRecipientsToAccountContacts support (nil in the detached
 	// composer/viewer, whose sends go through the main process queue —
 	// the provider save silently skips when any of these is nil).
@@ -107,6 +112,39 @@ func (ops *composeOps) oauthRefreshLock(accountID string) *sync.Mutex {
 		ops.oauthRefreshLocks[accountID] = mu
 	}
 	return mu
+}
+
+// saveRefreshedTokensWithRetry persists freshly refreshed tokens, retrying
+// transient keyring/database failures (audit finding R12). A refresh
+// rotates the refresh token on the provider, so the old stored refresh
+// token is already revoked by the time the save runs — a swallowed save
+// failure leaves the revoked token in storage and the next refresh fails
+// invalid_grant, prompting a spurious re-sign-in. Returns the last error
+// after 3 attempts; callers must treat that as a failed refresh, not
+// continue on the in-memory tokens.
+func saveRefreshedTokensWithRetry(save func() error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+		}
+		if err = save(); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+// emitOAuthEvent emits a Wails event only when ctx is a Wails runtime
+// context (one carrying the events bus). Plain contexts (unit tests,
+// background callers) have no bus, and wailsRuntime.EventsEmit fatal-exits
+// on them, so the emit is skipped there — the returned error still
+// surfaces the failure to the caller.
+func emitOAuthEvent(ctx context.Context, name string, data map[string]interface{}) {
+	if ctx == nil || ctx.Value("events") == nil {
+		return
+	}
+	wailsRuntime.EventsEmit(ctx, name, data)
 }
 
 // getValidOAuthToken returns a valid OAuth token, refreshing if needed.
@@ -157,7 +195,7 @@ func (ops *composeOps) getValidOAuthToken(ctx context.Context, accountID string)
 			Msg("OAuth token refresh failed")
 
 		// Emit event for frontend to prompt re-authorization
-		wailsRuntime.EventsEmit(ctx, "oauth:reauth-required", map[string]interface{}{
+		emitOAuthEvent(ctx, "oauth:reauth-required", map[string]interface{}{
 			"accountId": accountID,
 			"provider":  tokens.Provider,
 			"error":     err.Error(),
@@ -176,9 +214,29 @@ func (ops *composeOps) getValidOAuthToken(ctx context.Context, accountID string)
 		tokens.RefreshToken = newTokenResp.RefreshToken
 	}
 
-	if err := ops.credStore.SetOAuthTokens(accountID, tokens); err != nil {
-		log.Warn().Err(err).Msg("Failed to save refreshed OAuth tokens")
-		// Continue anyway - we have valid tokens in memory
+	// Persist the refreshed tokens (audit finding R12). The provider has
+	// already rotated the refresh token, so a failed save must NOT be
+	// swallowed: continuing on the in-memory tokens would leave the
+	// revoked refresh token in storage and the next refresh would fail
+	// invalid_grant. Retry transient failures, then fail loudly with a
+	// distinct event — deliberately NOT oauth:reauth-required, because
+	// the grant is fine and the user must not be misled into
+	// re-authorizing; the fix is to retry, and re-authorize only if
+	// sign-in is actually requested again.
+	saveTokens := func() error { return ops.credStore.SetOAuthTokens(accountID, tokens) }
+	if ops.saveRefreshedTokensOverride != nil {
+		saveTokens = func() error { return ops.saveRefreshedTokensOverride(accountID, tokens) }
+	}
+	if err := saveRefreshedTokensWithRetry(saveTokens); err != nil {
+		log.Error().Err(err).
+			Str("account_id", accountID).
+			Msg("Failed to save refreshed OAuth tokens after retries")
+		emitOAuthEvent(ctx, "oauth:tokens-save-failed", map[string]interface{}{
+			"accountId": accountID,
+			"provider":  tokens.Provider,
+			"error":     err.Error(),
+		})
+		return nil, fmt.Errorf("OAuth tokens refreshed but could not be saved: %w (sign-in is still valid — retry, and re-authorize only if asked)", err)
 	}
 
 	log.Info().

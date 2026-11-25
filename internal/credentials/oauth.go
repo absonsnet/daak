@@ -31,19 +31,31 @@ func (t *OAuthTokens) IsExpiringSoon(within time.Duration) bool {
 }
 
 // SetOAuthTokens stores OAuth tokens for an account
-// Sensitive tokens go to keyring (with DB fallback), metadata goes to DB
+// Sensitive tokens go to keyring (with DB fallback), metadata goes to DB.
+//
+// Write order matters (audit finding R12): the refresh token is written
+// FIRST. A refresh rotates the refresh token on the provider, so the old
+// stored one is already revoked by the time we save — if the new refresh
+// token is the write that fails, the next refresh fails invalid_grant and
+// the user is prompted to re-sign-in for no apparent reason. Persisting
+// the refresh token first means every later partial failure (access token
+// or metadata) still leaves a valid refresh token behind, and the next
+// refresh recovers. A failure to persist the refresh token itself cannot
+// be fixed by ordering — callers must retry and fail loudly instead of
+// continuing on in-memory tokens (see saveRefreshedTokensWithRetry).
 func (s *Store) SetOAuthTokens(accountID string, tokens *OAuthTokens) error {
 	if tokens == nil {
 		return fmt.Errorf("tokens cannot be nil")
 	}
 
-	// Store sensitive tokens in keyring (or encrypted DB fallback)
-	if err := s.setOAuthAccessToken(accountID, tokens.AccessToken); err != nil {
-		return fmt.Errorf("failed to store access token: %w", err)
-	}
-
+	// Store sensitive tokens in keyring (or encrypted DB fallback) —
+	// refresh token first (see comment above).
 	if err := s.setOAuthRefreshToken(accountID, tokens.RefreshToken); err != nil {
 		return fmt.Errorf("failed to store refresh token: %w", err)
+	}
+
+	if err := s.setOAuthAccessToken(accountID, tokens.AccessToken); err != nil {
+		return fmt.Errorf("failed to store access token: %w", err)
 	}
 
 	// Store metadata in database
@@ -363,18 +375,23 @@ func (s *Store) getOAuthRefreshToken(accountID string) (string, error) {
 
 // SetContactSourceOAuthTokens stores OAuth tokens for a standalone contact source
 // Sensitive tokens go to keyring (with DB fallback), metadata goes to contact_source_oauth table
+//
+// Write order mirrors SetOAuthTokens (audit finding R12): refresh token
+// first, so a later partial failure still leaves a valid refresh token
+// behind and the next refresh recovers.
 func (s *Store) SetContactSourceOAuthTokens(sourceID string, tokens *OAuthTokens) error {
 	if tokens == nil {
 		return fmt.Errorf("tokens cannot be nil")
 	}
 
-	// Store sensitive tokens in keyring (or encrypted DB fallback)
-	if err := s.setContactSourceAccessToken(sourceID, tokens.AccessToken); err != nil {
-		return fmt.Errorf("failed to store access token: %w", err)
-	}
-
+	// Store sensitive tokens in keyring (or encrypted DB fallback) —
+	// refresh token first (see SetOAuthTokens).
 	if err := s.setContactSourceRefreshToken(sourceID, tokens.RefreshToken); err != nil {
 		return fmt.Errorf("failed to store refresh token: %w", err)
+	}
+
+	if err := s.setContactSourceAccessToken(sourceID, tokens.AccessToken); err != nil {
+		return fmt.Errorf("failed to store access token: %w", err)
 	}
 
 	// Store metadata in contact_source_oauth table

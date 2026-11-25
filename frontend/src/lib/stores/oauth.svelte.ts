@@ -115,6 +115,33 @@ class OAuthStore {
         duration: 10000, // Show for 10 seconds
       })
     })
+
+    // Listen for refreshed-tokens-save failures (audit finding R12).
+    // Deliberately separate from oauth:reauth-required: the grant is
+    // fine — the new tokens just could not be written to storage — so
+    // the user must be told to retry, not to re-authorize.
+    EventsOn(
+      'oauth:tokens-save-failed',
+      async (data: { accountId?: string; sourceId?: string; provider: string; error: string }) => {
+        let accountName = data.provider
+        try {
+          if (data.accountId) {
+            const account = await GetAccount(data.accountId)
+            if (account?.name) {
+              accountName = account.name
+            }
+          }
+        } catch {
+          // Ignore error, use provider name as fallback
+        }
+
+        addToast({
+          type: 'error',
+          message: get(_)('toast.oauthTokensSaveFailed', { values: { name: accountName } }),
+          duration: 10000, // Show for 10 seconds
+        })
+      },
+    )
   }
 
   /**
@@ -130,6 +157,7 @@ class OAuthStore {
     EventsOff('oauth:error')
     EventsOff('oauth:cancelled')
     EventsOff('oauth:reauth-required')
+    EventsOff('oauth:tokens-save-failed')
   }
 
   /**
