@@ -46,6 +46,31 @@ func FolderPathSet(folders []*folder.Folder) map[string]bool {
 	return set
 }
 
+// shouldDeleteFolders is the folder-sync analogue of reconcileUIDs'
+// deletion guards: never delete when the listing looks empty or
+// partial. Deletion is refused when more than half the local folders
+// are missing at once (a transient partial LIST looks identical to a
+// genuine mass removal), or when any STATUS fetch failed in this pass
+// (the pass is unhealthy, so the listing cannot be trusted). Kept
+// pure so the rule is unit-testable without an IMAP server.
+func shouldDeleteFolders(localCount, deleteCount, statusFailed int) bool {
+	if deleteCount == 0 {
+		return true
+	}
+	if localCount == 0 {
+		return true
+	}
+	// Mass guard mirrors reconcileUIDs: it only bites on larger sets
+	// (a 1–2 folder account must still be able to lose its folder).
+	if localCount > 2 && deleteCount*2 > localCount {
+		return false
+	}
+	if statusFailed > 0 {
+		return false
+	}
+	return true
+}
+
 // SyncFoldersSkipStatus is SyncFolders with a set of mailbox paths whose
 // STATUS round trip is skipped. Callers pass the folders the same pass is
 // about to message-sync: SyncMessages reads the same numbers from SELECT and
@@ -153,6 +178,11 @@ func (e *Engine) SyncFoldersSkipStatus(ctx context.Context, accountID string, sk
 	// Track which paths we've seen and process results
 	seenPaths := make(map[string]bool)
 	processed := 0
+	// statusFailed counts LISTed mailboxes whose STATUS round trip
+	// failed this pass (\Noselect containers and skip-status folders
+	// excluded). Any failure means the pass is unhealthy — see the
+	// folder-deletion guards below.
+	statusFailed := 0
 	// Unread counts that changed on this pass (folder ID → unread), pushed to
 	// the sidebar at the end: a scheduled pass has no tree reload, so without
 	// this a folder read on another machine keeps its stale badge here.
@@ -162,6 +192,9 @@ func (e *Engine) SyncFoldersSkipStatus(ctx context.Context, accountID string, sk
 		mb := result.mailbox
 		seenPaths[mb.Name] = true
 		processed++
+		if result.err != nil && !errors.Is(result.err, errNoSelectMailbox) {
+			statusFailed++
+		}
 
 		// Emit progress
 		e.emitProgress(accountID, "", processed, totalFolders, "folders")
@@ -271,12 +304,34 @@ func (e *Engine) SyncFoldersSkipStatus(ctx context.Context, accountID string, sk
 		}
 	}
 
-	// Delete folders that no longer exist on server
+	// Delete folders that no longer exist on server. Guarded the same
+	// way message sync guards deletions (see reconcileUIDs): a listing
+	// that looks empty or partial must never delete local folders —
+	// a folder the server briefly fails to list would otherwise be
+	// deleted locally with all its messages. Empty listing is already
+	// refused above (totalFolders == 0 returns early); here the
+	// mass-delete guard (more than half the local folders missing at
+	// once) and the unhealthy-pass guard (any STATUS failure in this
+	// pass) both skip deletions for this pass only. A genuine mass
+	// removal lingers locally until a later clean pass confirms it.
+	var deleteCandidates []*folder.Folder
 	for path, f := range localByPath {
 		if !seenPaths[path] {
-			e.log.Debug().Str("path", path).Msg("Deleting removed folder")
+			deleteCandidates = append(deleteCandidates, f)
+		}
+	}
+	if !shouldDeleteFolders(len(localByPath), len(deleteCandidates), statusFailed) {
+		e.log.Warn().
+			Str("account", accountID).
+			Int("localFolders", len(localByPath)).
+			Int("missingFolders", len(deleteCandidates)).
+			Int("statusFailed", statusFailed).
+			Msg("Skipping folder deletions — listing looks empty or partial")
+	} else {
+		for _, f := range deleteCandidates {
+			e.log.Debug().Str("path", f.Path).Msg("Deleting removed folder")
 			if err := e.folderStore.Delete(f.ID); err != nil {
-				e.log.Warn().Err(err).Str("path", path).Msg("Failed to delete folder")
+				e.log.Warn().Err(err).Str("path", f.Path).Msg("Failed to delete folder")
 			}
 		}
 	}
