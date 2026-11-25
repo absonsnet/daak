@@ -58,6 +58,12 @@ func (a *App) GetMessageSource(messageID string) (string, error) {
 // FetchMessageBody fetches the body for a message on-demand.
 // This is called when a message's body hasn't been fetched yet (BodyFetched = false).
 // It fetches the body from IMAP, updates the database, and returns the updated message.
+//
+// A message whose body fetch previously failed (BodyFailed) is NOT
+// returned early: opening it retries the fetch (re-audit finding R10 —
+// previously the BodyFetched early return made a single failed message
+// unretryable except through a whole-folder Force Resync). A successful
+// retry clears the flag via UpdateBody; a failed retry re-flags it.
 func (a *App) FetchMessageBody(messageID string) (*message.Message, error) {
 	log := logging.WithComponent("app")
 	log.Debug().Str("messageID", messageID).Msg("Fetching message body on-demand")
@@ -71,8 +77,10 @@ func (a *App) FetchMessageBody(messageID string) (*message.Message, error) {
 		return nil, fmt.Errorf("message not found: %s", messageID)
 	}
 
-	// If body is already fetched, just return it
-	if msg.BodyFetched {
+	// If body is already fetched and did not fail, just return it.
+	// A failed fetch is retried: the row is body_fetched=1 with no
+	// usable content, and only a fresh fetch can heal it.
+	if msg.BodyFetched && !msg.BodyFailed {
 		return msg, nil
 	}
 

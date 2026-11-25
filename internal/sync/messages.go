@@ -72,6 +72,36 @@ func reconcileUIDs(localUIDs, remoteUIDs []uint32) (newUIDs, deletedUIDs []uint3
 	return newUIDs, deletedUIDs, emptyRemote, massDelete
 }
 
+// filterPeriodDeletableUIDs splits reconcileUIDs' deleted set while a sync
+// period is active. The remote listing for a period sync is UID SEARCH
+// SINCE <sinceDate> — it only covers mail inside the window — so a local
+// row whose stored Date is before the cutoff may still be on the server:
+// old mail opened from server search (stored with received_at = now and
+// an old internal date), or old mail moved into the folder by another
+// client. Its absence from the listing proves nothing, and deleting it
+// starts a delete/re-fetch loop that also discards local read state and
+// enrichment each cycle. Such rows are DeleteOlderThan's job (purged by
+// received_at, not by the reconcile), so they are skipped here and kept
+// locally until the purge ages them out.
+//
+// A zero sinceDate means no period is active: everything is returned
+// unchanged. A missing or zero stored Date cannot prove the message is
+// inside the window, so it is skipped too — the safe side is to keep the
+// local copy. Kept pure so the rule is unit-testable without an IMAP server.
+func filterPeriodDeletableUIDs(deletedUIDs []uint32, dates map[uint32]time.Time, sinceDate time.Time) (keep, skipped []uint32) {
+	if sinceDate.IsZero() {
+		return deletedUIDs, nil
+	}
+	for _, uid := range deletedUIDs {
+		if d, ok := dates[uid]; ok && !d.IsZero() && !d.Before(sinceDate) {
+			keep = append(keep, uid)
+			continue
+		}
+		skipped = append(skipped, uid)
+	}
+	return keep, skipped
+}
+
 // SyncResult reports what one SyncMessages run actually inserted locally.
 // The new-mail notification must count genuinely new messages, not the
 // TotalCount delta: 3 arrivals + 2 deletions in one sync is 3 new mail,
@@ -358,6 +388,33 @@ func (e *Engine) SyncMessages(ctx context.Context, accountID, folderID string, s
 		deletedUIDs = nil
 	}
 
+	// R2 guard: with a sync period the remote listing above is UID SEARCH
+	// SINCE <sinceDate>, so it never contains mail dated before the window
+	// even when the server still holds it. The empty-remote and >50%
+	// guards only cover the 0% and majority cases — a minority of such
+	// old rows would otherwise be deleted as ordinary expunges, then
+	// re-fetched as new on the next sync and deleted again. Skip local
+	// rows dated before the cutoff: DeleteOlderThan (by received_at) owns
+	// their purge, not this reconcile. On a date-lookup error keep every
+	// candidate instead of deleting blind — the next sync retries.
+	periodSkipped := 0
+	if syncPeriodDays > 0 && len(deletedUIDs) > 0 {
+		dates, datesErr := e.messageStore.GetDatesByUID(folderID, deletedUIDs)
+		if datesErr != nil {
+			e.log.Warn().Err(datesErr).Str("folder", f.Path).Int("deletedCount", len(deletedUIDs)).
+				Msg("Could not read local dates for reconcile deletes — keeping local copies")
+			deletedUIDs = nil
+		} else {
+			var skipped []uint32
+			deletedUIDs, skipped = filterPeriodDeletableUIDs(deletedUIDs, dates, sinceDate)
+			periodSkipped = len(skipped)
+			if periodSkipped > 0 {
+				e.log.Info().Str("folder", f.Path).Int("skipped", periodSkipped).
+					Msg("Skipping reconcile deletes for messages dated before the sync window (still on server, purge owns them)")
+			}
+		}
+	}
+
 	// Check if this is a Gmail account — messages hidden by Trash/Spam label
 	// still exist but are invisible in other IMAP mailbox views.
 	isGmail := false
@@ -567,6 +624,7 @@ func (e *Engine) SyncMessages(ctx context.Context, accountID, folderID string, s
 		Str("folder", f.Path).
 		Int("new", len(newUIDs)).
 		Int("deleted", len(deletedUIDs)).
+		Int("periodSkipped", periodSkipped).
 		Int("local", len(localUIDs)).
 		Int("remote", len(remoteUIDs)).
 		Bool("preferIncremental", preferIncremental).

@@ -117,6 +117,12 @@
   let smimeResults = $state<Record<string, SMIMEViewResult>>({})
   let smimeLoading = $state<Set<string>>(new Set())
 
+  // Messages whose body is being (re-)fetched after a failed fetch
+  // (bodyFailed, R10) — disables the retry button while a fetch is in
+  // flight, whether it was started by opening the message or by the
+  // button below.
+  let retryingBodyIds = $state<Set<string>>(new Set())
+
   // PGP on-view processing results per message
   let pgpResults = $state<Record<string, PGPViewResult>>({})
   let pgpLoading = $state<Set<string>>(new Set())
@@ -635,10 +641,21 @@
   }
 
   // Process S/MIME messages on-view (verify/decrypt fresh each time)
-  // Fetch bodies on-demand for messages that don't have them yet
+  // Fetch bodies on-demand for messages that don't have them yet — and
+  // retry messages whose last body fetch failed (bodyFailed, R10). The
+  // backend no longer returns early for failed rows, so opening a failed
+  // message retries it. A failed retry leaves the message in place with
+  // its retry affordance; only a never-fetched message that errors is
+  // removed, on the assumption it was deleted from the server.
   async function fetchUnfetchedBodies(messages: messageModels.Message[]) {
     for (const msg of messages) {
-      if ((msg as any).bodyFetched === false && !msg.bodyHtml && !msg.bodyText) {
+      const needsFetch =
+        !msg.bodyHtml &&
+        !msg.bodyText &&
+        ((msg as any).bodyFetched === false || msg.bodyFailed === true)
+      if (needsFetch) {
+        const wasFailed = msg.bodyFailed === true
+        if (wasFailed) retryingBodyIds = new Set([...retryingBodyIds, msg.id])
         try {
           const updated = await FetchMessageBody(msg.id)
           // Update the message in the conversation if still viewing
@@ -651,13 +668,48 @@
           }
         } catch (err) {
           console.error('Failed to fetch body for message:', msg.id, err)
-          // Message may have been deleted from server — remove from conversation display
-          if (conversation?.messages) {
-            conversation.messages = conversation.messages.filter(m => m.id !== msg.id)
-            conversation = conversation // trigger reactivity
+          if (wasFailed) {
+            // The fetch failed, not the message: keep it displayed so
+            // the user can retry from the banner below.
+          } else {
+            // Message may have been deleted from server — remove from conversation display
+            if (conversation?.messages) {
+              conversation.messages = conversation.messages.filter(m => m.id !== msg.id)
+              conversation = conversation // trigger reactivity
+            }
+          }
+        } finally {
+          if (wasFailed) {
+            const next = new Set(retryingBodyIds)
+            next.delete(msg.id)
+            retryingBodyIds = next
           }
         }
       }
+    }
+  }
+
+  // Manual retry for a message whose body fetch failed (R10): the
+  // backend re-fetches from IMAP and the updated message replaces the
+  // failed one in place. A failed retry leaves the affordance visible.
+  async function retryBodyFetch(msg: messageModels.Message) {
+    if (retryingBodyIds.has(msg.id)) return
+    retryingBodyIds = new Set([...retryingBodyIds, msg.id])
+    try {
+      const updated = await FetchMessageBody(msg.id)
+      if (conversation?.messages) {
+        const idx = conversation.messages.findIndex(m => m.id === msg.id)
+        if (idx >= 0 && updated) {
+          conversation.messages[idx] = updated
+          conversation = conversation // trigger reactivity
+        }
+      }
+    } catch (err) {
+      console.error('Failed to retry body fetch for message:', msg.id, err)
+    } finally {
+      const next = new Set(retryingBodyIds)
+      next.delete(msg.id)
+      retryingBodyIds = next
     }
   }
 
@@ -2113,6 +2165,21 @@
                           <div class="flex items-center gap-2 text-muted-foreground text-sm italic py-4">
                             <Icon icon="mdi:loading" class="w-4 h-4 animate-spin" />
                             {$_('viewer.downloadingContent')}
+                          </div>
+                        {:else if msg.bodyFailed && !msg.bodyHtml && !msg.bodyText}
+                          <!-- Body fetch failed (R10): the fetch produced no usable
+                               content — say so and offer a retry instead of
+                               showing a blank message as if it were complete. -->
+                          <div class="flex items-center gap-2 px-3 py-2 mb-4 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-md text-sm text-amber-700 dark:text-amber-300">
+                            <Icon icon="mdi:alert-outline" class="w-4 h-4 flex-shrink-0" />
+                            <span>{$_('viewer.bodyFailed')}</span>
+                            <button
+                              class="ml-auto shrink-0 rounded-md border border-amber-300 dark:border-amber-700 px-2 py-1 text-xs font-medium hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors disabled:opacity-50"
+                              disabled={retryingBodyIds.has(msg.id)}
+                              onclick={() => retryBodyFetch(msg)}
+                            >
+                              {$_('viewer.retryBody')}
+                            </button>
                           </div>
                         {:else if (msg.hasSMIME && !smimeResults[msg.id] && smimeLoading.has(msg.id)) || (msg.hasPGP && !pgpResults[msg.id] && pgpLoading.has(msg.id))}
                           <!-- Show placeholder while processing -->

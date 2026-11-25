@@ -50,7 +50,7 @@ type Message struct {
 	BodyHTML      string `json:"bodyHtml,omitempty"`
 	BodyFetched   bool   `json:"bodyFetched"`             // Whether full body has been downloaded
 	BodyTruncated bool   `json:"bodyTruncated,omitempty"` // Stored body is only the first part: the message (or a part) hit Daak's 10 MB part / 50 MB message cap, so the rest was never stored. Exposed so the viewer can say so; a re-fetch would hit the same cap.
-	BodyFailed    bool   `json:"-"`                       // Set when fetch+parse produced no usable content; excludes from body-fetch queue (server-internal; not exposed to frontend)
+	BodyFailed    bool   `json:"bodyFailed,omitempty"`    // Set when fetch+parse produced no usable content (re-audit finding R10: including an attachment-only fetch whose text parts failed to read). Excludes the message from the background body-fetch queue; exposed so the viewer can offer a manual retry — previously a body_fetched=1 row could never be retried by opening it, since FetchMessageBody returned early on BodyFetched.
 
 	// Sync-time enrichment (Phase A; see internal/enrich). ExtractValue
 	// holds a one-time code or a booking reference: never log it.
