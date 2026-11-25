@@ -234,7 +234,9 @@ type Outcome struct {
 //   - Send mode: ONE reused SMTP connection; after each send the message
 //     is saved to Sent via SentSaver (best-effort). The cap applies at
 //     SEND time only: once CapLimit rows have been sent, the rest are
-//     recorded "held — over cap" and NOT sent.
+//     recorded "held — over cap" and NOT sent. The counter starts at
+//     req.CapAlreadySent, so a resume/batch execution counts the
+//     lineage's earlier sends against the same per-run cap (finding 27).
 //   - Cancel (ctx) stops after the current message; unprocessed rows are
 //     recorded as skipped ("cancelled before processing").
 //   - Per-row failure never stops the run: the error is recorded and the
@@ -314,7 +316,10 @@ func (s *Service) Execute(ctx context.Context, req RunRequest, onProgress func(R
 			seenTo[norm] = true
 		}
 	}
-	sentAttempted := 0 // successful sends, for the cap
+	sentAttempted := req.CapAlreadySent // successful sends, for the cap
+	if sentAttempted < 0 {
+		sentAttempted = 0
+	}
 	capLimit := req.CapLimit
 	if capLimit <= 0 {
 		capLimit = 100
@@ -507,10 +512,10 @@ func (s *Service) recordSentSaveFailure(ctx context.Context, accountID, subject,
 // batch still uses one connection per account — the same reuse as a
 // normal send run, and the same SentSaver as a normal send.
 type RawSender struct {
-	sender           MailSender
-	saver            SentSaver
-	failureRecorder  SentSaveFailureRecorder
-	accountID        string
+	sender          MailSender
+	saver           SentSaver
+	failureRecorder SentSaveFailureRecorder
+	accountID       string
 }
 
 // OpenRawSender opens the run's single SMTP connection for an account.

@@ -52,27 +52,37 @@ type GlobalAttachment struct {
 // mail with the same identity instead of minting a fresh one. Entries
 // are "" for rows that were never rendered.
 type RunRequest struct {
-	Template      Template            `json:"template"`
-	Rows          []map[string]string `json:"rows"`
-	MessageIDs    []string            `json:"messageIds,omitempty"`
-	SourceKind    string              `json:"sourceKind"`  // "csv" | "json" | "xlsx" | "contacts"
-	DeliverMode   string              `json:"deliverMode"` // "drafts" | "send" | "later"
-	PauseSeconds  int                 `json:"pauseSeconds"`
-	RandomPause   bool                `json:"randomPause"` // pause is random 0–PauseSeconds
-	StartRow      int                 `json:"startRow"`
-	StopRow       int                 `json:"stopRow"`
-	CapEnabled    bool                `json:"capEnabled"`
-	CapLimit      int                 `json:"capLimit"`
-	AccountID     string              `json:"accountId"`
-	AttachmentDir string              `json:"attachmentDir"`
+	Template     Template            `json:"template"`
+	Rows         []map[string]string `json:"rows"`
+	MessageIDs   []string            `json:"messageIds,omitempty"`
+	SourceKind   string              `json:"sourceKind"`  // "csv" | "json" | "xlsx" | "contacts"
+	DeliverMode  string              `json:"deliverMode"` // "drafts" | "send" | "later"
+	PauseSeconds int                 `json:"pauseSeconds"`
+	RandomPause  bool                `json:"randomPause"` // pause is random 0–PauseSeconds
+	StartRow     int                 `json:"startRow"`
+	StopRow      int                 `json:"stopRow"`
+	CapEnabled   bool                `json:"capEnabled"`
+	CapLimit     int                 `json:"capLimit"`
+	// CapAlreadySent seeds the per-run cap counter with sends this
+	// run's lineage already made (audit4 finding 27): a resume or
+	// held batch is the same run's continuation, so its budget is
+	// the cap minus the lineage's sends, not a fresh cap. The bridge
+	// sets it from the stored (inherited) seed plus the run's own
+	// SentCount; it persists with the stored request, so a
+	// resume-of-a-resume keeps the whole lineage's count.
+	CapAlreadySent int    `json:"capAlreadySent,omitempty"`
+	AccountID      string `json:"accountId"`
+	AttachmentDir  string `json:"attachmentDir"`
 	// AlreadySent seeds duplicate suppression when a run is resumed
 	// (or a held batch is sent): the lowercased first-To addresses
 	// the original run already sent / draft-saved — and, for "later"
 	// runs, the addresses still queued. Without the seed, a resumed
 	// run re-sends an address the original run already delivered to
 	// via a different row (the duplicate check only covers the
-	// current run). Not persisted with the stored request; the bridge
-	// fills it in when it builds the resume/batch sub-request.
+	// current run). Persisted with the stored request, so a
+	// resume-of-a-resume keeps the whole lineage's addresses: the
+	// bridge unions the stored seed with the run's own sent rows
+	// when it builds the resume/batch sub-request.
 	AlreadySent []string `json:"alreadySent,omitempty"`
 }
 

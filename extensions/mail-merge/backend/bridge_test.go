@@ -410,25 +410,30 @@ func TestBridgeCapBatches(t *testing.T) {
 	runID, err := env.bridge.MailMerge_StartRun(hostmm.RunRequest{
 		Template: testBridgeTemplate(), Rows: testBridgeRows(),
 		DeliverMode: "send", AccountID: "acc1",
-		CapEnabled: true, CapLimit: 1,
+		CapEnabled: true, CapLimit: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	run := waitForRun(t, env.bridge, runID)
-	if run.Status != hostmm.RunHeld || run.SentCount != 1 || run.HeldCount != 2 {
+	if run.Status != hostmm.RunHeld || run.SentCount != 2 || run.HeldCount != 1 {
 		t.Fatalf("cap run %+v", run)
 	}
-	if len(env.sender.sent) != 1 {
+	if len(env.sender.sent) != 2 {
 		t.Fatalf("sent %v", env.sender.sent)
 	}
-	// Next batch: one more, one still held.
+	// Next batch: the per-run cap is already spent (finding 27), so
+	// the batch sends nothing — the held row stays held. Only an
+	// explicit Send All can exceed the cap.
 	if err := env.bridge.MailMerge_SendNextBatch(runID); err != nil {
 		t.Fatal(err)
 	}
 	run = waitForRun(t, env.bridge, runID)
 	if run.Status != hostmm.RunHeld || run.SentCount != 2 || run.HeldCount != 1 {
 		t.Fatalf("after next batch %+v", run)
+	}
+	if len(env.sender.sent) != 2 {
+		t.Fatalf("sent %v after capped batch, want still 2", env.sender.sent)
 	}
 	// Send all remaining: the last one, run done.
 	if err := env.bridge.MailMerge_SendAllRemaining(runID); err != nil {
@@ -444,6 +449,49 @@ func TestBridgeCapBatches(t *testing.T) {
 	// No held rows left: further batch calls error.
 	if err := env.bridge.MailMerge_SendNextBatch(runID); err == nil {
 		t.Fatal("expected no-held-rows error")
+	}
+}
+
+// TestBridgeResumeRespectsRunCap (audit4 finding 27): a resumed run
+// inherits the original run's remaining per-run cap, not a fresh one.
+func TestBridgeResumeRespectsRunCap(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	env.sender.fail["jane@example.com"] = errors.New("452 too many emails")
+	runID, err := env.bridge.MailMerge_StartRun(hostmm.RunRequest{
+		Template: testBridgeTemplate(), Rows: testBridgeRows(),
+		DeliverMode: "send", AccountID: "acc1",
+		CapEnabled: true, CapLimit: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRun(t, env.bridge, runID)
+	if run.SentCount != 2 || run.FailedCount != 1 || run.HeldCount != 0 {
+		t.Fatalf("cap run %+v", run)
+	}
+	// Fix the failure and resume: the failed row re-runs, but the
+	// per-run cap is already spent (2 sent of 2), so it is held
+	// instead of sent a second time over the cap.
+	delete(env.sender.fail, "jane@example.com")
+	newID, err := env.bridge.MailMerge_ResumeRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRun := waitForRun(t, env.bridge, newID)
+	if newRun.Status != hostmm.RunHeld || newRun.SentCount != 0 || newRun.HeldCount != 1 {
+		t.Fatalf("resumed run %+v, want held with 0 sent (cap spent)", newRun)
+	}
+	if len(env.sender.sent) != 2 {
+		t.Fatalf("sent %v after resume, want still 2 — the cap must not reset", env.sender.sent)
+	}
+	// The resumed run's stored request carries the cap seed, so a
+	// further resume keeps the same budget.
+	req, err := env.bridge.store.GetRunRequest(newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.CapLimit != 2 || req.CapAlreadySent != 2 {
+		t.Fatalf("resumed run stored request: CapLimit = %d, CapAlreadySent = %d, want 2 and 2 (cap 2, lineage sent 2)", req.CapLimit, req.CapAlreadySent)
 	}
 }
 
