@@ -273,6 +273,33 @@ func TestStatsAndCountPending(t *testing.T) {
 	}
 }
 
+// TestStatsCountsFailedAndSentUnsaved (fourth-audit finding 48): the
+// Outbox badge counts failed and sent-but-unsaved rows, so Stats()
+// must expose them as buckets instead of letting them vanish into
+// the total.
+func TestStatsCountsFailedAndSentUnsaved(t *testing.T) {
+	s := NewStore(openTestDB(t))
+	for _, id := range []string{"q1", "q2", "q3"} {
+		if err := s.Enqueue(testItem(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	if err := s.RecordAttempt("q2", 5, StatusFailed, now, "smtp refused"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordAttempt("q3", 1, StatusSentUnsaved, now, "Sent save failed"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Total != 3 || st.Pending != 1 || st.Failed != 1 || st.SentUnsaved != 1 {
+		t.Fatalf("Stats = %+v, want total 3 / pending 1 / failed 1 / sentUnsaved 1", st)
+	}
+}
+
 func TestBackoff(t *testing.T) {
 	cases := []struct {
 		attempts int

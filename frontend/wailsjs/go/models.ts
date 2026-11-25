@@ -3863,6 +3863,7 @@ export namespace sendqueue {
 	    sent: number;
 	    failed: number;
 	    cancelled: number;
+	    sentUnsaved: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new Stats(source);
@@ -3875,6 +3876,7 @@ export namespace sendqueue {
 	        this.sent = source["sent"];
 	        this.failed = source["failed"];
 	        this.cancelled = source["cancelled"];
+	        this.sentUnsaved = source["sentUnsaved"];
 	    }
 	}
 

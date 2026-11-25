@@ -275,7 +275,18 @@
         MailMerge_GetQueueStats(),
         GetSendQueueStats(),
       ])
-      outboxCount = (mmStats?.queued ?? 0) + (sqStats?.pending ?? 0)
+      // The badge counts everything in the Outbox that still needs
+      // attention (fourth-audit finding 48): waiting Mail Merge and
+      // normal sends, failed sends of either kind, and normal sends
+      // that were delivered but never saved to Sent. Counting only
+      // the waiting rows used to drop the badge to zero on the one
+      // thing needing attention — a failed send.
+      outboxCount =
+        (mmStats?.queued ?? 0) +
+        (mmStats?.failed ?? 0) +
+        (sqStats?.pending ?? 0) +
+        (sqStats?.failed ?? 0) +
+        (sqStats?.sentUnsaved ?? 0)
     } catch (err) {
       console.error('Failed to load outbox count:', err)
     }
