@@ -374,6 +374,10 @@ export function DeleteSMIMECertificate(arg1) {
   return window['go']['app']['App']['DeleteSMIMECertificate'](arg1);
 }
 
+export function DeleteSendQueueItem(arg1) {
+  return window['go']['app']['App']['DeleteSendQueueItem'](arg1);
+}
+
 export function DeleteSenderCert(arg1) {
   return window['go']['app']['App']['DeleteSenderCert'](arg1);
 }

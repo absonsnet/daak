@@ -19,7 +19,7 @@
   import { cn } from '$lib/utils'
   import { Button } from '$lib/components/ui/button'
   // @ts-ignore - wailsjs bindings
-  import { GetConversations, GetConversationCount, SyncFolder, ForceSyncFolder, CancelFolderSync, SetMessageListSortOrder, GetUnifiedFolderConversations, GetUnifiedFolderCount, SearchConversations, SearchUnifiedFolder, GetSearchCount, GetSearchCountUnifiedFolder, GetFTSIndexStatus, IsFTSIndexing, Trash, DeletePermanently, EmptyTrash, EmptySpam, Undo, IMAPSearchFolder, FetchServerMessage, MarkAsRead, MarkAsUnread, Archive, Star, Unstar, MarkAsSpam, MarkAsNotSpam, MoveToFolder, GetAccounts, GetCategoryCounts, GetInboxTabDefault, MailMerge_ListQueue, MailMerge_SendUnsent, MailMerge_CancelQueuedItem, ListSendQueue, RetrySendQueueItem } from '../../../../wailsjs/go/app/App'
+  import { GetConversations, GetConversationCount, SyncFolder, ForceSyncFolder, CancelFolderSync, SetMessageListSortOrder, GetUnifiedFolderConversations, GetUnifiedFolderCount, SearchConversations, SearchUnifiedFolder, GetSearchCount, GetSearchCountUnifiedFolder, GetFTSIndexStatus, IsFTSIndexing, Trash, DeletePermanently, EmptyTrash, EmptySpam, Undo, IMAPSearchFolder, FetchServerMessage, MarkAsRead, MarkAsUnread, Archive, Star, Unstar, MarkAsSpam, MarkAsNotSpam, MoveToFolder, GetAccounts, GetCategoryCounts, GetInboxTabDefault, MailMerge_ListQueue, MailMerge_SendUnsent, MailMerge_CancelQueuedItem, ListSendQueue, RetrySendQueueItem, DeleteSendQueueItem } from '../../../../wailsjs/go/app/App'
   import { toasts } from '$lib/stores/toast'
   import { _ } from '$lib/i18n'
   import { ConfirmDialog } from '$lib/components/ui/confirm-dialog'
@@ -397,6 +397,21 @@
       await loadQueue()
     } catch (err) {
       console.error('Retry queued send failed:', err)
+      toasts.error((err as Error)?.message ?? String(err))
+    } finally {
+      queueActionBusy = ''
+    }
+  }
+
+  // Discard a failed normal send: drops the Outbox row so its draft is
+  // no longer blocked and can be edited and re-sent from Drafts.
+  async function deleteSendQueueItem(id: string) {
+    queueActionBusy = `delete-${id}`
+    try {
+      await DeleteSendQueueItem(id)
+      await loadQueue()
+    } catch (err) {
+      console.error('Discard queued send failed:', err)
       toasts.error((err as Error)?.message ?? String(err))
     } finally {
       queueActionBusy = ''
@@ -2737,6 +2752,16 @@
                       >
                         {$_('messageList.outboxRetry')}
                       </Button>
+                      {#if item.kind === 'send'}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={queueActionBusy !== ''}
+                          onclick={() => deleteSendQueueItem(item.id)}
+                        >
+                          {$_('messageList.outboxDiscard')}
+                        </Button>
+                      {/if}
                     </div>
                   {/if}
                   {#if item.status === 'queued'}

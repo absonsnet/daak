@@ -130,6 +130,7 @@
     "outboxCancel": "Cancel",
     "outboxUndo": "Undo send",
     "outboxRetry": "Retry",
+    "outboxDiscard": "Discard",
     "outboxSendAt": "Sending at {time}",
     "outboxHistory": "Sent & cancelled",
     "outboxReaction": "Reaction",

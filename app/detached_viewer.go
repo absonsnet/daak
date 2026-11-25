@@ -2014,6 +2014,7 @@ func (v *ViewerApp) SaveAllAttachments(messageID string) (string, error) {
 
 	downloader := email.NewAttachmentDownloader(v.paths.AttachmentsPath())
 	savedCount := 0
+	usedNames := map[string]bool{}
 	for _, att := range attachments {
 		content, err := downloader.ExtractAttachmentContentFor(raw, att)
 		if err != nil {

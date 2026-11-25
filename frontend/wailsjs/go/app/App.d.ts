@@ -210,6 +210,8 @@ export function DeletePermanently(arg1:Array<string>):Promise<void>;
 
 export function DeleteSMIMECertificate(arg1:string):Promise<void>;
 
+export function DeleteSendQueueItem(arg1:string):Promise<void>;
+
 export function DeleteSenderCert(arg1:string):Promise<void>;
 
 export function DetectMessageLanguage(arg1:string,arg2:string):Promise<app.MessageDetection>;

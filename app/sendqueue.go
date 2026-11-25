@@ -508,8 +508,9 @@ func (s *sendQueueService) enqueueReactionWithConflictRetry(item sendqueue.Item,
 // deletes the queued send and removes the local reaction record
 // (via onUndo), so the pill disappears. Undo restores the queued
 // snapshot into the draft row, so the reopened composer shows the
-// message that was about to send — not edits made to the live draft
-// during the undo window.
+// message that was about to send — unless the live draft was edited
+// during the undo window, in which case the edited draft is kept
+// instead of being overwritten by the snapshot (audit4 finding 19).
 func (s *sendQueueService) UndoSend(queueID string) (UndoSendResult, error) {
 	// GetForSend, not Get: Undo restores the queued MessageJSON
 	// snapshot into the draft row, and Get deliberately omits the
@@ -555,6 +556,14 @@ func (s *sendQueueService) UndoSend(queueID string) (UndoSendResult, error) {
 		var snapshot smtp.ComposeMessage
 		if err := json.Unmarshal([]byte(item.MessageJSON), &snapshot); err != nil {
 			log.Warn().Err(err).Str("queue_id", queueID).Msg("Queued send undone, but the snapshot could not be restored to the draft")
+		} else if s.draftDiffersFromSnapshot(item.DraftID, snapshot) {
+			// The live draft was edited during the undo window (it
+			// stays visible in Drafts while its send counts down).
+			// Restoring the snapshot here would silently destroy
+			// those edits, so keep the edited draft instead: the
+			// composer reopens it as-is, and the queued send is
+			// still cancelled.
+			log.Info().Str("queue_id", queueID).Str("draft_id", draftID).Msg("Queued send undone; draft was edited during the undo window, keeping the edited draft")
 		} else if id, err := s.saveDraft(item.AccountID, snapshot, item.DraftID); err != nil {
 			log.Warn().Err(err).Str("queue_id", queueID).Msg("Queued send undone, but the snapshot could not be restored to the draft")
 		} else if id != "" {
@@ -570,6 +579,48 @@ func (s *sendQueueService) UndoSend(queueID string) (UndoSendResult, error) {
 	return UndoSendResult{QueueID: queueID, AccountID: item.AccountID, DraftID: draftID}, nil
 }
 
+// draftDiffersFromSnapshot reports whether the live draft row no longer
+// matches the message that was queued — i.e. the user edited it during
+// the undo window. Fields compared are the ones saveDraftToDB writes
+// straight from the queued message (recipients, reply-to, subject,
+// in-reply-to); the body is compared only for unencrypted drafts, whose
+// stored body is the message body verbatim. A missing draft (or no
+// draft store) counts as "no difference": there is nothing to protect,
+// and the snapshot restore recreates the draft.
+func (s *sendQueueService) draftDiffersFromSnapshot(draftID string, snapshot smtp.ComposeMessage) bool {
+	if s.draftStore == nil || draftID == "" {
+		return false
+	}
+	live, err := s.draftStore.Get(draftID)
+	if err != nil || live == nil {
+		return false
+	}
+	if live.Subject != snapshot.Subject {
+		return true
+	}
+	if live.ToList != addressListToJSON(snapshot.To) {
+		return true
+	}
+	if live.CcList != addressListToJSON(snapshot.Cc) {
+		return true
+	}
+	if live.BccList != addressListToJSON(snapshot.Bcc) {
+		return true
+	}
+	if live.ReplyTo != replyToToJSON(snapshot.ReplyTo) {
+		return true
+	}
+	if live.InReplyToID != snapshot.InReplyTo {
+		return true
+	}
+	if !live.Encrypted && !live.PGPEncrypted {
+		if live.BodyHTML != snapshot.HTMLBody || live.BodyText != snapshot.TextBody {
+			return true
+		}
+	}
+	return false
+}
+
 // ListSendQueue returns the Outbox rows for normal sends, newest
 // first. (Mail Merge rows come from MailMerge_ListQueue.)
 func (s *sendQueueService) ListSendQueue() ([]sendqueue.Item, error) {
@@ -579,6 +630,46 @@ func (s *sendQueueService) ListSendQueue() ([]sendqueue.Item, error) {
 // GetSendQueueStats returns the Outbox badge counts for normal sends.
 func (s *sendQueueService) GetSendQueueStats() (sendqueue.Stats, error) {
 	return s.store.Stats()
+}
+
+// DeleteSendQueueItem discards a failed normal send from the Outbox
+// (audit4 finding 30). A broken queued message used to trap its draft
+// forever: it could not be rebuilt, retrying failed the same way, the
+// draft could not be re-sent because the failed row blocked it, and
+// there was no delete anywhere. Discarding the row unblocks the draft
+// (HasFailedForDraft no longer finds it), so the user can edit and
+// re-send from Drafts. Only failed rows may be discarded this way:
+// pending rows are undone, not deleted, and a sent-save warning is a
+// record of a delivered mail, not a failure.
+func (s *sendQueueService) DeleteSendQueueItem(queueID string) error {
+	item, err := s.store.Get(queueID)
+	if err != nil {
+		return err
+	}
+	if item == nil {
+		return fmt.Errorf("queued send %q not found", queueID)
+	}
+	if item.Kind != sendqueue.KindMessage {
+		return fmt.Errorf("only failed normal sends can be discarded from the Outbox (kind %q)", item.Kind)
+	}
+	if item.Status != sendqueue.StatusFailed {
+		return fmt.Errorf("queued send cannot be discarded (status %q — only failed sends can be discarded)", item.Status)
+	}
+	ok, err := s.store.Delete(queueID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("queued send %q not found", queueID)
+	}
+	log := logging.WithComponent("sendqueue")
+	log.Info().
+		Str("queue_id", queueID).
+		Str("draft_id", item.DraftID).
+		Str("subject", item.Subject).
+		Msg("Failed queued send discarded from the Outbox; its draft can be sent again")
+	s.emitEvent("sendqueue:updated", nil)
+	return nil
 }
 
 // RetrySendQueueItem returns a failed item to the queue, due
@@ -604,6 +695,13 @@ func (s *sendQueueService) RetrySendQueueItem(queueID string) error {
 	// recipient who already has it, so Retry refuses it outright.
 	if item.Status == sendqueue.StatusSentUnsaved {
 		return fmt.Errorf("message %q was already sent — only its copy in Sent is missing, so there is nothing to retry; check with the recipient", item.Subject)
+	}
+	// An unbuildable queued message (audit4 finding 30): its stored
+	// bytes cannot even be parsed back into a message, so retrying
+	// fails the same way every time. Refuse the retry and point at
+	// Discard instead of letting the row spin forever.
+	if strings.HasPrefix(item.LastError, "corrupt queued message:") {
+		return fmt.Errorf("message %q cannot be rebuilt from the queue (%s) — discard it from the Outbox instead of retrying", item.Subject, item.LastError)
 	}
 	if item.Kind == sendqueue.KindReaction && item.ReactionMessageID != "" {
 		active, err := s.store.ActiveReaction(item.ReactionMessageID)
@@ -1223,6 +1321,12 @@ func (a *App) GetSendQueueStats() (sendqueue.Stats, error) {
 // RetrySendQueueItem retries a failed queued send now.
 func (a *App) RetrySendQueueItem(queueID string) error {
 	return a.sendQueue.RetrySendQueueItem(queueID)
+}
+
+// DeleteSendQueueItem discards a failed normal send from the Outbox,
+// unblocking its draft so it can be sent again.
+func (a *App) DeleteSendQueueItem(queueID string) error {
+	return a.sendQueue.DeleteSendQueueItem(queueID)
 }
 
 // GetUndoSendDelay returns the undo window in seconds (5/10/20/30).
