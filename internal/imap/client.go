@@ -1133,6 +1133,32 @@ func (c *Client) CopyMessages(uids []imap.UID, destMailbox string) ([]imap.UID, 
 	return destUIDs, nil
 }
 
+// SearchUIDsByMessageID returns the UIDs of the messages in the
+// currently selected mailbox whose Message-ID header equals messageID.
+// Used to locate an appended cross-account copy on the server when it
+// has no local rows yet (e.g. rolling back a failed cross-account
+// move). The mailbox must already be selected before calling this
+// method.
+func (c *Client) SearchUIDsByMessageID(messageID string) ([]imap.UID, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	if messageID == "" {
+		return nil, nil
+	}
+	criteria := &imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Message-ID", Value: messageID}},
+	}
+	data, err := c.client.UIDSearch(criteria, nil).Wait()
+	if err != nil {
+		return nil, fmt.Errorf("failed to search by Message-ID: %w", err)
+	}
+	if data == nil {
+		return nil, nil
+	}
+	return data.AllUIDs(), nil
+}
+
 // DeleteMessagesByUID marks multiple messages as deleted and expunges them
 // The mailbox must already be selected before calling this method
 func (c *Client) DeleteMessagesByUID(uids []imap.UID) error {

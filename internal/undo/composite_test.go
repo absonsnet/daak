@@ -78,6 +78,8 @@ func (f *fakeUndoContext) MoveMessagesToFolder(messageIDs []string, destFolderID
 	return nil
 }
 
+func (f *fakeUndoContext) DeleteMessagesFromServer(messageIDs []string) error { return nil }
+
 func (f *fakeUndoContext) ResolveMessageUID(messageID string) (uint32, string, error) {
 	return 0, "trash-folder", nil // temp UID: no server counterpart
 }

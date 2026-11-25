@@ -440,13 +440,49 @@ func (a *App) moveToFolderCmds(messageIDs []string, destFolderID string) ([]undo
 		if err := a.copyMessagesAcrossAccounts(messages, destFolder); err != nil {
 			return nil, destFolder.Name, fmt.Errorf("cross-account move: append failed: %w", err)
 		}
+		// RFC822 IDs of the moved messages — the undo command uses
+		// them to find the destination copy. Messages without one
+		// cannot be tracked to the destination account, so their
+		// undo falls back to the trash leg alone (the old behaviour).
+		var rfc822IDs []string
+		for _, m := range messages {
+			if m.MessageID != "" {
+				rfc822IDs = append(rfc822IDs, m.MessageID)
+			}
+		}
 		_, trashCmds, _, trashErr := a.trashCmds(messageIDs)
+		if trashErr != nil {
+			// The append succeeded but the source cleanup failed:
+			// roll the appended copy back, or the message ends up
+			// in both accounts. The destination sync has not run
+			// yet, so the copy has no local rows — locate it on the
+			// server by Message-ID header and delete it there.
+			rollbackErr := a.rollbackCrossAccountAppend(destFolder, rfc822IDs)
+			if rollbackErr != nil {
+				return trashCmds, destFolder.Name, fmt.Errorf("cross-account move: trash failed: %w (destination copy could not be rolled back: %v)", trashErr, rollbackErr)
+			}
+			return trashCmds, destFolder.Name, fmt.Errorf("cross-account move: trash failed: %w (destination copy rolled back)", trashErr)
+		}
 		// Sync destination so appended messages get correct UIDs locally.
 		go func() {
 			defer recoverPanic("app.actions", "cross-account move dest sync")
 			_ = a.SyncFolder(destFolder.AccountID, destFolder.ID)
 		}()
-		return trashCmds, destFolder.Name, trashErr
+		if len(rfc822IDs) == 0 {
+			return trashCmds, destFolder.Name, nil
+		}
+		// One undo command for the whole cross-account move: it
+		// restores the source via the trash leg AND deletes the
+		// destination copy, so Undo no longer leaves the message in
+		// both accounts.
+		return []undo.Command{undo.NewCrossAccountMoveCommand(
+			a,
+			destFolder.AccountID,
+			destFolder.ID,
+			rfc822IDs,
+			trashCmds,
+			fmt.Sprintf("Move to %s", destFolder.Name),
+		)}, destFolder.Name, nil
 	}
 
 	// Group by source folder
@@ -548,6 +584,36 @@ func (a *App) moveToFolderCmds(messageIDs []string, destFolderID string) ([]undo
 	}
 
 	return cmds, destFolder.Name, nil
+}
+
+// rollbackCrossAccountAppend deletes the destination copies of a
+// cross-account move from the server, locating them by Message-ID
+// header. Only used when the source-side trash step failed after a
+// successful APPEND: the destination sync has not run yet, so the
+// copies have no local rows to resolve UIDs from. A message-ID with
+// no server match is already gone and skipped, not an error.
+func (a *App) rollbackCrossAccountAppend(destFolder *folder.Folder, rfc822IDs []string) error {
+	if len(rfc822IDs) == 0 {
+		return fmt.Errorf("no Message-ID headers to locate the appended copy")
+	}
+	return a.withIMAPRetry(destFolder.AccountID, func(conn *imap.Client) error {
+		if _, err := conn.SelectMailbox(a.ctx, destFolder.Path); err != nil {
+			return fmt.Errorf("failed to select destination mailbox: %w", err)
+		}
+		for _, id := range rfc822IDs {
+			uids, err := conn.SearchUIDsByMessageID(id)
+			if err != nil {
+				return err
+			}
+			if len(uids) == 0 {
+				continue
+			}
+			if err := conn.DeleteMessagesByUID(uids); err != nil {
+				return fmt.Errorf("failed to delete appended copy of %s: %w", id, err)
+			}
+		}
+		return nil
+	})
 }
 
 // isGmailAccount checks if the account uses Gmail's IMAP server.

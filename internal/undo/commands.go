@@ -3,6 +3,7 @@ package undo
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	imapPkg "github.com/absonsnet/daak/internal/imap"
 	"github.com/emersion/go-imap/v2"
@@ -22,6 +23,12 @@ type UndoContext interface {
 	FindLocalMessageIDs(accountID, folderID string, rfc822MessageIDs []string) ([]string, error)
 	// MoveMessagesToFolder moves messages using the full move pipeline (IMAP + local DB)
 	MoveMessagesToFolder(messageIDs []string, destFolderID string) error
+	// DeleteMessagesFromServer deletes messages from the server for
+	// their account, honouring provider quirks (e.g. Gmail's
+	// label-vs-folder behaviour and its copy guard). messageIDs are
+	// current local DB IDs; the implementation resolves each
+	// message's account, folder and UID itself.
+	DeleteMessagesFromServer(messageIDs []string) error
 	// ResolveMessageUID returns the message's CURRENT uid and folder ID
 	// (looked up at undo time, so a move that reassigned the UID is
 	// handled). UIDs <= 0 are temporary local placeholders with no
@@ -172,4 +179,92 @@ func (c *MoveCommand) Undo() error {
 
 	// Reuse the full move pipeline (IMAP + local DB + events)
 	return c.undoCtx.MoveMessagesToFolder(localMsgIDs, c.sourceFolderID)
+}
+
+// CrossAccountMoveCommand undoes a move between two accounts. A
+// cross-account move is copy-then-trash: APPEND the raw bytes to the
+// destination account, then trash the source copy. Undoing only the
+// trash leg (what the old code did) restored the source while leaving
+// the destination copy in place — the message ended up in both
+// accounts. This command records the destination copy and deletes it
+// on Undo, so the move is fully reversed.
+//
+// Order matters: the trash leg is undone FIRST (restoring the source),
+// then the destination copy is deleted. If the destination delete
+// fails, the message survives in both accounts (the original bug,
+// reported as an error) — the alternative order would delete the
+// destination first and risk losing the message entirely when the
+// trash leg then fails.
+//
+// Gmail-source wrinkle: the trash leg may have no undo command for
+// copies that were only label-removed (they were never moved to
+// Trash). Undo still deletes the destination copy; the source copy
+// simply remains in its other folders, which is correct.
+type CrossAccountMoveCommand struct {
+	BaseCommand
+	undoCtx          UndoContext
+	destAccountID    string
+	destFolderID     string
+	rfc822MessageIDs []string // RFC822 Message-ID headers for reliable lookup
+	trashCmds        []Command
+}
+
+// NewCrossAccountMoveCommand creates a new CrossAccountMoveCommand
+func NewCrossAccountMoveCommand(
+	undoCtx UndoContext,
+	destAccountID, destFolderID string,
+	rfc822MessageIDs []string,
+	trashCmds []Command,
+	description string,
+) *CrossAccountMoveCommand {
+	return &CrossAccountMoveCommand{
+		BaseCommand:      NewBaseCommand(description),
+		undoCtx:          undoCtx,
+		destAccountID:    destAccountID,
+		destFolderID:     destFolderID,
+		rfc822MessageIDs: rfc822MessageIDs,
+		trashCmds:        trashCmds,
+	}
+}
+
+// Execute performs the action (already done at creation time)
+func (c *CrossAccountMoveCommand) Execute() error { return nil }
+
+// Undo restores the source copy via the trash leg, then deletes the
+// destination copy (server first, local rows only once the server
+// delete succeeded). Every leg is attempted even when an earlier one
+// fails; the returned error names each failed leg.
+func (c *CrossAccountMoveCommand) Undo() error {
+	var errs []error
+
+	// 1. Restore the source copy.
+	for _, cmd := range c.trashCmds {
+		if err := cmd.Undo(); err != nil {
+			errs = append(errs, fmt.Errorf("trash leg: %w", err))
+		}
+	}
+
+	// 2. Delete the destination copy.
+	localMsgIDs, err := c.undoCtx.FindLocalMessageIDs(c.destAccountID, c.destFolderID, c.rfc822MessageIDs)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("destination copy: failed to find messages: %w", err))
+	} else if len(localMsgIDs) == 0 {
+		errs = append(errs, fmt.Errorf("destination copy: messages not found in destination folder (the destination sync may not have run yet)"))
+	} else {
+		if err := c.undoCtx.DeleteMessagesFromServer(localMsgIDs); err != nil {
+			errs = append(errs, fmt.Errorf("destination copy: failed to delete from server: %w", err))
+		} else if err := c.undoCtx.DeleteLocalMessages(localMsgIDs); err != nil {
+			errs = append(errs, fmt.Errorf("destination copy: failed to delete locally: %w", err))
+		}
+	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+	// The combined message names every failed leg.
+	msgs := make([]string, 0, len(errs))
+	for _, e := range errs {
+		msgs = append(msgs, e.Error())
+	}
+	return fmt.Errorf("cross-account move undo partially failed: %s", strings.Join(msgs, "; "))
 }
