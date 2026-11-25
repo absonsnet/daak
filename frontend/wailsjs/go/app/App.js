@@ -778,10 +778,6 @@ export function GetRunBackground() {
   return window['go']['app']['App']['GetRunBackground']();
 }
 
-export function GetSaveRecipientsToAccountContacts() {
-  return window['go']['app']['App']['GetSaveRecipientsToAccountContacts']();
-}
-
 export function GetSMIMECertificateForEmail(arg1, arg2) {
   return window['go']['app']['App']['GetSMIMECertificateForEmail'](arg1, arg2);
 }
@@ -794,6 +790,10 @@ export function GetSMIMESignPolicy(arg1) {
   return window['go']['app']['App']['GetSMIMESignPolicy'](arg1);
 }
 
+export function GetSaveRecipientsToAccountContacts() {
+  return window['go']['app']['App']['GetSaveRecipientsToAccountContacts']();
+}
+
 export function GetSearchCount(arg1, arg2, arg3, arg4) {
   return window['go']['app']['App']['GetSearchCount'](arg1, arg2, arg3, arg4);
 }
@@ -804,6 +804,10 @@ export function GetSearchCountUnifiedFolder(arg1, arg2, arg3) {
 
 export function GetSearchCountUnifiedInbox(arg1, arg2) {
   return window['go']['app']['App']['GetSearchCountUnifiedInbox'](arg1, arg2);
+}
+
+export function GetSendQueueStats() {
+  return window['go']['app']['App']['GetSendQueueStats']();
 }
 
 export function GetSenderCategoryOverrides() {
@@ -852,10 +856,6 @@ export function GetSpellcheckEnabled() {
 
 export function GetSpellcheckLanguages() {
   return window['go']['app']['App']['GetSpellcheckLanguages']();
-}
-
-export function GetSendQueueStats() {
-  return window['go']['app']['App']['GetSendQueueStats']();
 }
 
 export function GetStartHidden() {
@@ -940,6 +940,10 @@ export function GetWindowControlsLayout() {
 
 export function GetWindowControlsSide() {
   return window['go']['app']['App']['GetWindowControlsSide']();
+}
+
+export function HandleSingleInstanceCommand(arg1) {
+  return window['go']['app']['App']['HandleSingleInstanceCommand'](arg1);
 }
 
 export function HasPGPKey(arg1) {
@@ -1606,16 +1610,16 @@ export function SetRunBackground(arg1) {
   return window['go']['app']['App']['SetRunBackground'](arg1);
 }
 
-export function SetSaveRecipientsToAccountContacts(arg1) {
-  return window['go']['app']['App']['SetSaveRecipientsToAccountContacts'](arg1);
-}
-
 export function SetSMIMEEncryptPolicy(arg1, arg2) {
   return window['go']['app']['App']['SetSMIMEEncryptPolicy'](arg1, arg2);
 }
 
 export function SetSMIMESignPolicy(arg1, arg2) {
   return window['go']['app']['App']['SetSMIMESignPolicy'](arg1, arg2);
+}
+
+export function SetSaveRecipientsToAccountContacts(arg1) {
+  return window['go']['app']['App']['SetSaveRecipientsToAccountContacts'](arg1);
 }
 
 export function SetSenderAutoDelete(arg1, arg2, arg3) {
@@ -1786,12 +1790,12 @@ export function Undo() {
   return window['go']['app']['App']['Undo']();
 }
 
-export function Unstar(arg1) {
-  return window['go']['app']['App']['Unstar'](arg1);
-}
-
 export function UndoSend(arg1) {
   return window['go']['app']['App']['UndoSend'](arg1);
+}
+
+export function Unstar(arg1) {
+  return window['go']['app']['App']['Unstar'](arg1);
 }
 
 export function UnsubscribeFolder(arg1, arg2) {

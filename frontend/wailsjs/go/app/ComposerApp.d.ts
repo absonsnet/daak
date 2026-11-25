@@ -99,7 +99,7 @@ export function LookupWKD(arg1:string):Promise<string>;
 
 export function MailMerge_CancelQueuedItem(arg1:string):Promise<void>;
 
-export function MailMerge_CancelQueuedRun(arg1:string):Promise<void>;
+export function MailMerge_CancelQueuedRun(arg1:string):Promise<backend.CancelQueuedRunResult>;
 
 export function MailMerge_CancelRemaining(arg1:string):Promise<void>;
 

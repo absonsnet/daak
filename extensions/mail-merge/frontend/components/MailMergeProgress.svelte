@@ -6,14 +6,20 @@
   // after every row lands — see extensions/mail-merge/backend/bridge.go
   // emitRunUpdated), refreshing on either signal while the run is
   // active. Cancel stops after the current message. Held rows (cap)
-  // offer Send next N / Send all remaining / Cancel remaining; failed
-  // rows offer Resume (MailMerge_ResumeRun re-runs failed rows only).
+  // offer Send next N / Send all remaining / Cancel remaining; a
+  // failed run offers Resume (MailMerge_ResumeRun re-runs failed rows
+  // only — or the whole stored request when no failed rows were
+  // recorded).
   //
   // With no runId it shows the run history (MailMerge_ListRuns); picking
   // a run loads its detail. A whole-run failure (e.g. SMTP connect
   // fails before any row) marks the run `failed` with the error on
   // the run and every unprocessed row recorded failed — Resume
-  // re-runs them.
+  // re-runs them. If recording those failed rows itself fails, the
+  // run is still `failed` (with the recording failure in its error
+  // text) and Resume re-runs the whole stored request — so the
+  // Resume button is gated on the failed status, not on the failed
+  // row count.
 
   import { onMount, onDestroy } from 'svelte'
   import Icon from '@iconify/svelte'
@@ -273,14 +279,14 @@
             {actionBusy === 'cancel-remaining' ? 'Cancelling…' : 'Cancel remaining'}
           </Button>
         {/if}
-        {#if failedCount > 0 && !isRunning}
+        {#if run.status === 'failed' && !isRunning}
           <Button
             variant="outline"
             size="sm"
             disabled={actionBusy !== ''}
             onclick={() => void handleResume()}
           >
-            {actionBusy === 'resume' ? 'Resuming…' : `Resume (${failedCount} failed)`}
+            {actionBusy === 'resume' ? 'Resuming…' : failedCount > 0 ? `Resume (${failedCount} failed)` : 'Resume'}
           </Button>
         {/if}
       </div>

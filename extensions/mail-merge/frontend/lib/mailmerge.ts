@@ -243,6 +243,11 @@ export interface MailMergeDispatchResult {
   queued: number
 }
 
+export interface MailMergeCancelQueuedRunResult {
+  cancelled: number
+  inFlight: number
+}
+
 export interface MailMergeContactsResult {
   rows: Row[]
   columns: string[]

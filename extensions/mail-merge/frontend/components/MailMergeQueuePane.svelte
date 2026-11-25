@@ -39,6 +39,7 @@
   import {
     normalizeQueueItems,
     normalizeQueueStats,
+    type MailMergeCancelQueuedRunResult,
     type MailMergeDispatchResult,
     type MailMergeQueueConfig,
     type MailMergeQueueStats,
@@ -112,6 +113,33 @@
       await refresh()
     } catch (err) {
       console.error(`mailMerge queue ${label} failed:`, err)
+      toasts.error((err as Error)?.message ?? String(err))
+    } finally {
+      actionBusy = ''
+    }
+  }
+
+  // Cancel a run's queued messages and say what actually happened:
+  // in-flight messages are not cancelled — their send proceeds —
+  // so a bare success would leave the user believing the run was
+  // stopped. The backend errors when nothing was queued at all.
+  async function handleCancelQueuedRun(runId: string): Promise<void> {
+    actionBusy = `cancel-${runId}`
+    try {
+      const res = (await MailMerge_CancelQueuedRun(runId)) as MailMergeCancelQueuedRunResult
+      const cancelled = res.cancelled ?? 0
+      const inFlight = res.inFlight ?? 0
+      const cancelledText = `Cancelled ${cancelled} queued message${cancelled === 1 ? '' : 's'}.`
+      if (inFlight > 0) {
+        toasts.success(
+          `${cancelledText} ${inFlight} ${inFlight === 1 ? 'was' : 'were'} already sending and will still go out.`,
+        )
+      } else {
+        toasts.success(cancelledText)
+      }
+      await refresh()
+    } catch (err) {
+      console.error(`mailMerge queue cancel-${runId} failed:`, err)
       toasts.error((err as Error)?.message ?? String(err))
     } finally {
       actionBusy = ''
@@ -255,7 +283,7 @@
                 </Button>
               {/if}
               {#if runStat.queued > 0}
-                <Button size="sm" variant="outline" disabled={actionBusy !== ''} onclick={() => void runAction(`cancel-${runStat.runId}`, () => MailMerge_CancelQueuedRun(runStat.runId))}>
+                <Button size="sm" variant="outline" disabled={actionBusy !== ''} onclick={() => void handleCancelQueuedRun(runStat.runId)}>
                   Cancel queued
                 </Button>
               {/if}

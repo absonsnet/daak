@@ -614,51 +614,122 @@ func (b *MailMergeBridge) MailMerge_CancelQueuedItem(itemID string) error {
 	if err != nil {
 		return err
 	}
-	if ok {
-		_ = b.store.SaveRowResult(item.RunID, hostmm.RowResult{
-			Index: item.RowIndex, Email: item.Recipient,
-			Status: hostmm.RowSkipped, Error: "cancelled in outbox queue", Timestamp: b.queueNow(),
-		})
-		b.refreshRunCounts(item.RunID)
+	if !ok {
+		// The item left 'queued' between the status check above and
+		// the delete — it was claimed for sending (or failed/gone).
+		// A nil return here would read as a successful cancel while
+		// the mail still goes out (or while nothing was cancelled).
+		return fmt.Errorf("mail-merge: queue item %q is already sending or no longer queued", itemID)
 	}
+	_ = b.store.SaveRowResult(item.RunID, hostmm.RowResult{
+		Index: item.RowIndex, Email: item.Recipient,
+		Status: hostmm.RowSkipped, Error: "cancelled in outbox queue", Timestamp: b.queueNow(),
+	})
+	b.refreshRunCounts(item.RunID)
 	b.emitQueueUpdated()
 	b.emitRunUpdated(item.RunID)
 	return nil
 }
 
-// MailMerge_CancelQueuedRun cancels all queued messages of a run.
-func (b *MailMergeBridge) MailMerge_CancelQueuedRun(runID string) error {
-	if !b.gateEnabled() {
-		return nil
-	}
-	if err := b.ensureInit(); err != nil {
-		return err
-	}
-	if err := b.requireRun(runID); err != nil {
-		return err
-	}
-	// Update the run log for the cancelled rows first (so the counts
-	// recompute correctly), then delete the items.
+// CancelQueuedRunResult is the outcome of cancelling a run's queued
+// messages: how many queued rows were actually cancelled, and how
+// many were already in flight. In-flight rows are NOT cancelled —
+// their send proceeds and the run log records the real outcome — so
+// the caller must tell the user about them instead of reporting a
+// clean cancel.
+type CancelQueuedRunResult struct {
+	Cancelled int `json:"cancelled"`
+	InFlight  int `json:"inFlight"`
+}
+
+// cancelRunQueueItems deletes a run's QUEUED queue rows and logs them
+// skipped. It returns the counts, and an error when the delete found
+// no queued rows: an empty no-op return would read as a successful
+// cancel while in-flight rows keep sending (e.g. every row moved to
+// 'sending' between the list and the delete).
+func (b *MailMergeBridge) cancelRunQueueItems(runID string) (CancelQueuedRunResult, error) {
+	var result CancelQueuedRunResult
 	items, err := b.store.ListQueueItems()
 	if err != nil {
-		return err
+		return result, err
 	}
-	now := b.queueNow()
+	queuedByID := map[string]QueuedItem{}
 	for _, item := range items {
 		if item.RunID == runID && item.Status == QueueStatusQueued {
-			_ = b.store.SaveRowResult(runID, hostmm.RowResult{
-				Index: item.RowIndex, Email: item.Recipient,
-				Status: hostmm.RowSkipped, Error: "cancelled in outbox queue", Timestamp: now,
-			})
+			queuedByID[item.ID] = item
 		}
 	}
-	if _, err := b.store.DeleteRunQueueItems(runID); err != nil {
-		return err
+	deleted, err := b.store.DeleteRunQueueItems(runID)
+	if err != nil {
+		return result, err
+	}
+	// Re-list after the delete: rows still queued were not deleted,
+	// and rows now 'sending' are in flight and will still go out.
+	// A row that vanished entirely was sent by the dispatch path in
+	// the meantime — it is neither cancelled nor in flight.
+	after, err := b.store.ListQueueItems()
+	if err != nil {
+		return result, err
+	}
+	stillQueued := map[string]bool{}
+	inFlight := 0
+	for _, item := range after {
+		if item.RunID != runID {
+			continue
+		}
+		switch item.Status {
+		case QueueStatusQueued:
+			stillQueued[item.ID] = true
+		case QueueStatusSending:
+			inFlight++
+		}
+	}
+	result.Cancelled = deleted
+	result.InFlight = inFlight
+	if deleted == 0 {
+		return result, fmt.Errorf("mail-merge: run %q has no queued messages to cancel (%d already sending and will still go out)", runID, inFlight)
+	}
+	// Log exactly the rows the delete removed. A row claimed between
+	// the list and the delete keeps its real outcome instead of being
+	// logged skipped first and then overwritten (or left queued under
+	// a skipped log row if its send only failed transiently).
+	now := b.queueNow()
+	for id, item := range queuedByID {
+		if stillQueued[id] {
+			continue
+		}
+		_ = b.store.SaveRowResult(runID, hostmm.RowResult{
+			Index: item.RowIndex, Email: item.Recipient,
+			Status: hostmm.RowSkipped, Error: "cancelled in outbox queue", Timestamp: now,
+		})
+	}
+	return result, nil
+}
+
+// MailMerge_CancelQueuedRun cancels all queued messages of a run.
+// It reports how many were actually cancelled and how many were
+// already in flight (those still send — the queue path deletes only
+// queued rows; sending rows are deleted by the dispatch path). It
+// errors when nothing was queued, so the UI never reports a cancel
+// that did not happen.
+func (b *MailMergeBridge) MailMerge_CancelQueuedRun(runID string) (CancelQueuedRunResult, error) {
+	if !b.gateEnabled() {
+		return CancelQueuedRunResult{}, nil
+	}
+	if err := b.ensureInit(); err != nil {
+		return CancelQueuedRunResult{}, err
+	}
+	if err := b.requireRun(runID); err != nil {
+		return CancelQueuedRunResult{}, err
+	}
+	result, err := b.cancelRunQueueItems(runID)
+	if err != nil {
+		return result, err
 	}
 	b.refreshRunCounts(runID)
 	b.emitQueueUpdated()
 	b.emitRunUpdated(runID)
-	return nil
+	return result, nil
 }
 
 // MailMerge_RetryFailedRun returns a run's failed (attempts-exhausted)
