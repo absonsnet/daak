@@ -358,21 +358,35 @@ func (b *MailMergeBridge) sendOneQueuedItem(sender *hostmm.RawSender, item Queue
 		RowIndex: full.RowIndex, Email: full.Recipient, Subject: full.Subject,
 		From: full.FromAddress, To: full.To, Raw: full.RawMessage,
 	}
-	if err := sender.Send(context.Background(), qm); err != nil {
+	// The queue row is cleared the moment SMTP accepts the mail, via
+	// the afterSMTP hook inside sender.Send — BEFORE the Sent save.
+	// The Sent save is slow network work, and the row is the only
+	// thing a crash can re-queue: the old code deleted the row only
+	// after sender.Send returned, so a crash during the Sent save
+	// left a 'sending' row the stale-claim reset re-queued and
+	// re-sent. (The comment here used to claim that window no longer
+	// included the Sent save — it did: the save ran inside
+	// sender.Send, before the delete.) If the delete fails, fall
+	// back to marking it sent — a sent mail must never be re-queued.
+	// The stored bytes were rendered once at queue time, so a
+	// redispatch would re-send the identical bytes with the identical
+	// Message-ID, but that relies on provider dedup and is not a
+	// substitute for clearing the row at SMTP acceptance.
+	clearRow := func() {
+		if _, err := b.store.DeleteSendingQueueItem(item.ID); err != nil {
+			_ = b.store.MarkItemSent(item.ID, now)
+		}
+	}
+	if err := sender.Send(context.Background(), qm, clearRow); err != nil {
 		newlyFailed := b.recordQueueFailure(*full, now, err)
 		return false, newlyFailed
 	}
-	// The queue row is deleted FIRST, before the run log is written:
-	// the row is the only thing a crash can re-queue, and the run
-	// log is post-send bookkeeping. A crash between the SMTP accept
-	// and the delete still leaves a 'sending' row, but that window
-	// no longer includes the run-log write (or the Sent save inside
-	// sender.Send) — and the stored bytes were rendered once at
-	// queue time, so a redispatch re-sends the identical bytes with
-	// the identical Message-ID. If the delete fails, fall back to
-	// marking it sent — a sent mail must never be re-queued. Only
-	// then is the sent outcome recorded in the run log; a crash in
-	// that last step loses a log row, never a duplicate mail.
+	// The afterSMTP hook above already deleted the row the moment
+	// SMTP accepted the mail; this is the fallback for a hook that
+	// could not delete it. Either way the row must not survive as
+	// 'sending' — the stale-claim reset would re-queue and re-send
+	// it. Only then is the sent outcome recorded in the run log; a
+	// crash in that last step loses a log row, never a duplicate mail.
 	if _, err := b.store.DeleteSendingQueueItem(item.ID); err != nil {
 		_ = b.store.MarkItemSent(item.ID, now)
 	}

@@ -75,10 +75,18 @@ func (f *fakeSenderFactory) NewSender(_ context.Context, _ string) (hostmm.MailS
 	return f.sender, nil
 }
 
-type fakeSentSaver struct{ saved int }
+type fakeSentSaver struct {
+	saved int
+	// onSave, when set, runs inside SaveToSent — a test observes
+	// state at the exact moment the Sent save runs.
+	onSave func()
+}
 
 func (f *fakeSentSaver) SaveToSent(_ context.Context, _ string, _ []byte) error {
 	f.saved++
+	if f.onSave != nil {
+		f.onSave()
+	}
 	return nil
 }
 
@@ -502,6 +510,52 @@ func TestBridgeResumeFailedOnly(t *testing.T) {
 	// Resuming a run with no failed rows errors.
 	if _, err := env.bridge.MailMerge_ResumeRun(newID); err == nil {
 		t.Fatal("expected no-failed-rows error")
+	}
+}
+
+// TestBridgeResumeReusesMessageID is the re-audit R3 end-to-end
+// test: a direct-send row whose SMTP acknowledgement is lost is
+// recorded failed with the Message-ID assigned at render time
+// (persisted in the run log), and ResumeRun rebuilds the same mail
+// with that same Message-ID — the server sees one identity for both
+// transmissions, not two different mails.
+func TestBridgeResumeReusesMessageID(t *testing.T) {
+	env := newBridgeTestEnv(t)
+	env.sender.failAfterSend["john@example.com"] = errors.New("read tcp: i/o timeout")
+	runID, err := env.bridge.MailMerge_StartRun(hostmm.RunRequest{
+		Template: testBridgeTemplate(), Rows: testBridgeRows()[:1],
+		DeliverMode: "send", AccountID: "acc1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRun(t, env.bridge, runID)
+	if run.FailedCount != 1 || len(run.Rows) != 1 || run.Rows[0].Status != hostmm.RowFailed {
+		t.Fatalf("run %+v, want 1 failed row", run)
+	}
+	firstID := run.Rows[0].MessageID
+	if firstID == "" {
+		t.Fatal("failed row must persist the Message-ID assigned at render time")
+	}
+	if len(env.sender.sentRaw) != 1 || queueMessageID(env.sender.sentRaw[0]) != firstID {
+		t.Fatalf("first transmission must carry %q: %q", firstID, env.sender.sentRaw)
+	}
+
+	// Fix the connection and resume: the retry must reuse the ID.
+	delete(env.sender.failAfterSend, "john@example.com")
+	newID, err := env.bridge.MailMerge_ResumeRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRun := waitForRun(t, env.bridge, newID)
+	if newRun.Status != hostmm.RunDone || newRun.SentCount != 1 {
+		t.Fatalf("resumed run %+v, want done with 1 sent", newRun)
+	}
+	if len(env.sender.sentRaw) != 2 || queueMessageID(env.sender.sentRaw[1]) != firstID {
+		t.Fatalf("resumed transmission must carry %q: %q", firstID, env.sender.sentRaw)
+	}
+	if len(newRun.Rows) != 1 || newRun.Rows[0].MessageID != firstID {
+		t.Fatalf("resumed run row %+v, want the same Message-ID %q", newRun.Rows, firstID)
 	}
 }
 

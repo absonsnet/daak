@@ -28,10 +28,18 @@ func (f *fakeDraftSaver) SaveDraft(_ string, msg smtp.ComposeMessage) error {
 
 type fakeSender struct {
 	sent []sentMail
-	fail map[string]error // fail sends to this address
+	// sentRaw records the exact bytes of every transmission that
+	// reached the (fake) server, including ones the client then
+	// treats as failed — the lost-acknowledgement case.
+	sentRaw []string
+	fail    map[string]error // fail sends to this address
 	// failOnce fails the next send to this address only, then
 	// succeeds: a transient mid-send failure for one row.
 	failOnce map[string]error
+	// failAfterSend, when set for a recipient, records the bytes and
+	// then returns the error: the server accepted DATA but the ack
+	// was lost, so the worker must retry with identical bytes.
+	failAfterSend map[string]error
 }
 
 type sentMail struct {
@@ -51,6 +59,12 @@ func (f *fakeSender) SendMail(from string, to []string, msg []byte) error {
 		}
 	}
 	f.sent = append(f.sent, sentMail{from: from, to: to, raw: msg})
+	f.sentRaw = append(f.sentRaw, string(msg))
+	for _, rcpt := range to {
+		if err, ok := f.failAfterSend[rcpt]; ok {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -374,6 +388,103 @@ func TestServiceFailedRowDoesNotPoisonDuplicateSuppression(t *testing.T) {
 	}
 	if len(saver.saved) != 2 {
 		t.Fatalf("drafts saved %d, want 2", len(saver.saved))
+	}
+}
+
+// messageIDOf extracts the Message-ID header value from raw RFC822
+// bytes ("" when absent).
+func messageIDOf(raw string) string {
+	for _, line := range strings.Split(raw, "\r\n") {
+		if strings.HasPrefix(line, "Message-ID:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "Message-ID:"))
+		}
+	}
+	return ""
+}
+
+// TestServiceSendRetryReusesMessageID is the re-audit R3 regression
+// test: a direct-send row whose SMTP acknowledgement is lost (the
+// server accepted DATA, the client sees an error) is recorded failed
+// with the Message-ID assigned at render time — and a retry that
+// carries that ID rebuilds the same mail with the same Message-ID,
+// so the server can recognise the duplicate instead of delivering
+// two copies.
+func TestServiceSendRetryReusesMessageID(t *testing.T) {
+	sender := &fakeSender{failAfterSend: map[string]error{"john@example.com": errors.New("read tcp: i/o timeout")}}
+	svc := NewService(ServiceDeps{
+		SenderFactory: &fakeSenderFactory{sender: sender},
+		SentSaver:     &fakeSentSaver{},
+	})
+	rows := testRows()[:1]
+	var results []RowResult
+	out, err := svc.Execute(context.Background(), RunRequest{
+		Template: testTemplate(), Rows: rows,
+		DeliverMode: "send", AccountID: "acc1",
+	}, func(r RowResult) { results = append(results, r) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.FailedCount != 1 || len(results) != 1 || results[0].Status != RowFailed {
+		t.Fatalf("first attempt must fail the row: %+v %+v", out, results)
+	}
+	firstID := results[0].MessageID
+	if firstID == "" {
+		t.Fatal("failed row must carry the Message-ID assigned at render time")
+	}
+	if len(sender.sentRaw) != 1 || messageIDOf(sender.sentRaw[0]) != firstID {
+		t.Fatalf("first transmission must carry %q: %q", firstID, sender.sentRaw)
+	}
+
+	// Retry with the ID the failed row recorded: the rebuilt mail
+	// must carry the same Message-ID.
+	delete(sender.failAfterSend, "john@example.com")
+	results = nil
+	out, err = svc.Execute(context.Background(), RunRequest{
+		Template: testTemplate(), Rows: rows, MessageIDs: []string{firstID},
+		DeliverMode: "send", AccountID: "acc1",
+	}, func(r RowResult) { results = append(results, r) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.SentCount != 1 || len(results) != 1 || results[0].Status != RowSent {
+		t.Fatalf("retry must send the row: %+v %+v", out, results)
+	}
+	if results[0].MessageID != firstID {
+		t.Fatalf("retry row Message-ID %q, want %q", results[0].MessageID, firstID)
+	}
+	if len(sender.sentRaw) != 2 || messageIDOf(sender.sentRaw[1]) != firstID {
+		t.Fatalf("retry transmission must carry %q: %q", firstID, sender.sentRaw)
+	}
+
+	// Control: a fresh run with no carried ID mints a new one — the
+	// reuse above comes from the carried ID, not determinism.
+	results = nil
+	out, err = svc.Execute(context.Background(), RunRequest{
+		Template: testTemplate(), Rows: rows,
+		DeliverMode: "send", AccountID: "acc1",
+	}, func(r RowResult) { results = append(results, r) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.sentRaw) != 3 || messageIDOf(sender.sentRaw[2]) == firstID {
+		t.Fatalf("fresh render must mint a new Message-ID: %q", sender.sentRaw)
+	}
+
+	// And two rows in one run get distinct IDs.
+	sender2 := &fakeSender{}
+	svc2 := NewService(ServiceDeps{
+		SenderFactory: &fakeSenderFactory{sender: sender2},
+		SentSaver:     &fakeSentSaver{},
+	})
+	results = nil
+	if _, err := svc2.Execute(context.Background(), RunRequest{
+		Template: testTemplate(), Rows: testRows()[:2],
+		DeliverMode: "send", AccountID: "acc1",
+	}, func(r RowResult) { results = append(results, r) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].MessageID == "" || results[0].MessageID == results[1].MessageID {
+		t.Fatalf("rows must get distinct Message-IDs: %+v", results)
 	}
 }
 
@@ -729,10 +840,17 @@ func TestRawSenderSendsAndSavesToSent(t *testing.T) {
 		Email: "john@example.com", From: "sender@example.com",
 		To: []string{"john@example.com"}, Raw: []byte("Subject: hi\r\n\r\nbody"),
 	}
-	if err := rs.Send(context.Background(), msg); err != nil {
+	// The hook runs the moment SMTP accepts, before the Sent save:
+	// at hook time nothing has been saved to Sent yet.
+	var hookSavedCount = -1
+	hook := func() { hookSavedCount = len(saved.saved) }
+	if err := rs.Send(context.Background(), msg, hook); err != nil {
 		t.Fatal(err)
 	}
-	if err := rs.Send(context.Background(), msg); err != nil {
+	if hookSavedCount != 0 {
+		t.Fatalf("afterSMTP hook ran after %d Sent saves, want 0 (hook must precede the Sent save)", hookSavedCount)
+	}
+	if err := rs.Send(context.Background(), msg, hook); err != nil {
 		t.Fatal(err)
 	}
 	if err := rs.Close(); err != nil {
@@ -763,8 +881,12 @@ func TestRawSenderSendFailureDoesNotSaveToSent(t *testing.T) {
 		Email: "jane@example.com", From: "sender@example.com",
 		To: []string{"jane@example.com"}, Raw: []byte("Subject: hi\r\n\r\nbody"),
 	}
-	if err := rs.Send(context.Background(), msg); err == nil {
+	hookCalled := false
+	if err := rs.Send(context.Background(), msg, func() { hookCalled = true }); err == nil {
 		t.Fatal("expected send error")
+	}
+	if hookCalled {
+		t.Fatal("afterSMTP hook must not run when SMTP rejects the mail")
 	}
 	if len(saved.saved) != 0 {
 		t.Fatalf("failed send must not save to Sent: %d", len(saved.saved))
@@ -775,7 +897,7 @@ func TestRawSenderSendFailureDoesNotSaveToSent(t *testing.T) {
 	if err := rs.Send(context.Background(), QueuedMessage{
 		Email: "john@example.com", From: "sender@example.com",
 		To: []string{"john@example.com"}, Raw: []byte("x"),
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("Sent-save failure must not fail the send: %v", err)
 	}
 	if len(sender.sent) != 1 {
