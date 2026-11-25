@@ -64,6 +64,13 @@ func (a *App) GetMessageReactions(messageID string) ([]MessageReaction, error) {
 // their mailbox — removing it only hides it here. A reaction still
 // queued (inside the undo window) is cancelled as well, so it does not
 // go out anyway and reappear on the next Sent sync.
+//
+// Order matters (fourth-audit finding 41): the queued send is cancelled
+// FIRST, and only once that is confirmed does the local record go.
+// Cancelling after the local delete — and ignoring the cancel error —
+// used to report success while the mail still went out. A cancel
+// failure now returns an error and the visible reaction stays, so the
+// user can retry instead of believing the reaction was removed.
 func (a *App) RemoveOwnReaction(messageID string) error {
 	msg, err := a.messageStore.Get(messageID)
 	if err != nil {
@@ -73,6 +80,14 @@ func (a *App) RemoveOwnReaction(messageID string) error {
 		return fmt.Errorf("message not found: %s", messageID)
 	}
 
+	// Cancel any queued send first; a failure here leaves the local
+	// record in place and is reported, never swallowed.
+	if n, err := a.ensureSendQueueService().store.DeletePendingReaction(messageID); err != nil {
+		return fmt.Errorf("failed to cancel queued reaction send: %w", err)
+	} else if n > 0 {
+		a.ensureSendQueueService().emitEvent("sendqueue:updated", nil)
+	}
+
 	own := a.ownEmailsForAccount(msg.AccountID)
 	emails := make([]string, 0, len(own))
 	for email := range own {
@@ -80,9 +95,6 @@ func (a *App) RemoveOwnReaction(messageID string) error {
 	}
 	if _, err := a.reactionStore.RemoveReaction(messageID, emails); err != nil {
 		return fmt.Errorf("failed to remove reaction: %w", err)
-	}
-	if n, err := a.ensureSendQueueService().store.DeletePendingReaction(messageID); err == nil && n > 0 {
-		a.ensureSendQueueService().emitEvent("sendqueue:updated", nil)
 	}
 	return nil
 }

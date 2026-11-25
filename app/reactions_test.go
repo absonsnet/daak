@@ -420,3 +420,50 @@ func TestRemoveOwnReactionNotFound(t *testing.T) {
 		t.Error("RemoveOwnReaction() error = nil, want an error for an unknown message")
 	}
 }
+
+// TestRemoveOwnReaction_CancelFailureSurfaced (fourth-audit finding 41):
+// when cancelling the queued reaction send fails, RemoveOwnReaction
+// must report the failure and keep the visible reaction — it must not
+// delete the local record and claim success while the mail still goes
+// out.
+func TestRemoveOwnReaction_CancelFailureSurfaced(t *testing.T) {
+	rta := newReactionTestApp(t)
+	rta.seedMessage(t, "msg-1", "<orig@example.com>", "Alice", "alice@example.com",
+		addrListJSON(t, "me@example.com"), "", "",
+		`UPDATE messages SET body_text = 'hello', body_html = '<p>hello</p>' WHERE id = 'msg-1'`)
+
+	if err := rta.app.SendReaction("msg-1", "👍"); err != nil {
+		t.Fatalf("SendReaction() error = %v", err)
+	}
+	if rta.queuedReaction(t) == nil {
+		t.Fatal("no queued reaction row, want 1")
+	}
+
+	// Break the queue store so the cancel fails: drop send_queue.
+	if _, err := rta.db.Exec(`DROP TABLE send_queue`); err != nil {
+		t.Fatalf("drop send_queue: %v", err)
+	}
+
+	err := rta.app.RemoveOwnReaction("msg-1")
+	if err == nil {
+		t.Fatal("RemoveOwnReaction() error = nil, want a cancel failure")
+	}
+	if !strings.Contains(err.Error(), "cancel") {
+		t.Errorf("RemoveOwnReaction() error = %q, want it to name the cancel failure", err.Error())
+	}
+	// The visible reaction must survive: the mail may still go out,
+	// so the pill must stay until the cancel is confirmed.
+	listed, lerr := rta.app.GetMessageReactions("msg-1")
+	if lerr != nil {
+		t.Fatalf("GetMessageReactions() error = %v", lerr)
+	}
+	own := false
+	for _, r := range listed {
+		if r.IsOwn {
+			own = true
+		}
+	}
+	if !own {
+		t.Errorf("own reaction was removed despite the failed cancel: %+v", listed)
+	}
+}
