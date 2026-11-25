@@ -111,6 +111,20 @@ type sendQueueService struct {
 	workerRunning bool
 	workerStop    chan struct{}
 
+	// freshDispatchHeld is the restart gate (re-audit finding R14):
+	// while held, dispatchDue skips rows with no dispatch attempt
+	// yet (attempts == 0) — rows still inside, or just past, their
+	// undo window. It is armed by App.Startup before StartWorker
+	// and released by ReemitPendingCountdowns, so no fresh row can
+	// dispatch before the frontend has had its chance to show the
+	// Undo toast. Retry-backoff rows (attempts > 0) are never held:
+	// they are not in an undo window. Zero value is unheld, so
+	// services built by tests or the detached composer (which never
+	// starts a worker) behave exactly as before.
+	gateMu            sync.Mutex
+	freshDispatchHeld bool
+	gateArmedAt       time.Time
+
 	// onUndo runs after a queued item is undone, with the deleted
 	// row. The App sets it so undoing a reaction also removes the
 	// local reaction record (the pill); a normal send has no
@@ -545,6 +559,13 @@ const sendQueueStaleClaimAge = 10 * time.Minute
 // with a large backlog still drains within a few ticks).
 const sendQueueDispatchBatch = 50
 
+// sendQueueStartupGateMaxHold bounds the restart gate: the window it
+// protects (worker start to NotifyStartupComplete) is seconds, so if
+// the frontend never calls back — it never mounts — the gate releases
+// itself after a minute rather than stranding fresh mail forever.
+// The toast is lost in that pathological case, but the mail sends.
+const sendQueueStartupGateMaxHold = time.Minute
+
 // ReemitPendingCountdowns re-emits sendqueue:queued for every queued
 // send still inside its undo window, with the seconds remaining.
 // Restart recovery: a message queued seconds before a quit would
@@ -560,7 +581,16 @@ const sendQueueDispatchBatch = 50
 // delay mail the user expected sent. A row in retry backoff
 // (attempts > 0, due_at pushed out) is not in an undo window at all,
 // so no toast is faked for it.
+//
+// Re-emitting also releases the startup dispatch gate (re-audit
+// finding R14): by the time this runs, the frontend is mounted and
+// listening, so every row still inside its window has its toast,
+// and rows whose window already elapsed may dispatch on the next
+// tick. The release happens even when listing fails — holding fresh
+// dispatch forever would strand mail, and a listing failure means
+// dispatch will surface its own error anyway.
 func (s *sendQueueService) ReemitPendingCountdowns() {
+	defer s.releaseFreshDispatchGate()
 	items, err := s.store.List()
 	if err != nil {
 		log := logging.WithComponent("sendqueue")
@@ -591,6 +621,51 @@ func (s *sendQueueService) ReemitPendingCountdowns() {
 			"delaySeconds": delay,
 		})
 	}
+}
+
+// HoldFreshDispatchUntilCountdownsReemitted arms the restart gate:
+// until ReemitPendingCountdowns runs, dispatchDue skips rows with no
+// dispatch attempt yet. Called by App.Startup before StartWorker —
+// the worker's first tick is immediate, and without the gate it
+// would dispatch a row due in the first seconds after launch before
+// NotifyStartupComplete has re-emitted its Undo toast (re-audit
+// finding R14). Rows whose undo window already elapsed while the app
+// was down are held only until the re-emit runs (seconds), then
+// dispatch as before; retry-backoff rows are never held.
+func (s *sendQueueService) HoldFreshDispatchUntilCountdownsReemitted() {
+	s.gateMu.Lock()
+	defer s.gateMu.Unlock()
+	s.freshDispatchHeld = true
+	s.gateArmedAt = time.Now()
+}
+
+// releaseFreshDispatchGate releases the restart gate. Called by
+// ReemitPendingCountdowns (via defer) once the countdowns have been
+// re-emitted — including when the frontend mounts while starting
+// hidden, since NotifyStartupComplete re-emits there too.
+func (s *sendQueueService) releaseFreshDispatchGate() {
+	s.gateMu.Lock()
+	defer s.gateMu.Unlock()
+	s.freshDispatchHeld = false
+}
+
+// freshDispatchBlocked reports whether fresh (never-attempted) rows
+// must still be held back. It also enforces the safety valve: if
+// the frontend never calls back, the gate releases itself after
+// sendQueueStartupGateMaxHold rather than stranding mail forever.
+func (s *sendQueueService) freshDispatchBlocked() bool {
+	s.gateMu.Lock()
+	defer s.gateMu.Unlock()
+	if !s.freshDispatchHeld {
+		return false
+	}
+	if time.Since(s.gateArmedAt) > sendQueueStartupGateMaxHold {
+		s.freshDispatchHeld = false
+		log := logging.WithComponent("sendqueue")
+		log.Warn().Msg("Startup countdown gate released by timeout: NotifyStartupComplete never re-emitted countdowns")
+		return false
+	}
+	return true
 }
 
 // StartWorker starts the background dispatch goroutine. Safe to
@@ -661,8 +736,19 @@ func (s *sendQueueService) dispatchDue(now time.Time) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Restart gate (re-audit finding R14): while the gate is held,
+	// fresh rows (no dispatch attempt yet) must not send — their
+	// Undo toast has not been shown yet, because
+	// ReemitPendingCountdowns has not run. They stay pending and
+	// dispatch on the first tick after the gate releases. Retry
+	// rows (attempts > 0) are not in an undo window, so they
+	// dispatch as normal.
+	held := s.freshDispatchBlocked()
 	sent := 0
 	for _, item := range due {
+		if held && item.Attempts == 0 {
+			continue
+		}
 		if s.sendOne(item, now) {
 			sent++
 		}
