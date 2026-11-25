@@ -317,8 +317,19 @@ func (b *MailMergeBridge) dispatchDue(now time.Time, runID string, manual bool) 
 		if err != nil {
 			// SMTP unreachable for this account: record a failed
 			// attempt on every due item (bounded retry, not a crash)
-			// and move on to the next account.
+			// and move on to the next account. Claim each item
+			// first (fourth-audit finding 53): without the claim
+			// a background tick and a manual "Send unsent" running
+			// together both record the same failure, double-
+			// counting the attempt. An item another dispatcher
+			// already claimed is skipped — it owns the failure.
+			// UpdateItemAttempt clears claimed_at, so a claimed
+			// item never strands in 'sending' on this path.
 			for _, item := range items {
+				claimed, claimErr := b.store.ClaimItem(item.ID, now)
+				if claimErr != nil || !claimed {
+					continue
+				}
 				if b.recordQueueFailure(item, now, err) {
 					result.Failed++
 				}
