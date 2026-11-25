@@ -128,7 +128,6 @@ func TestExtractAttachmentContent_QuotedPrintableNotDoubleDecoded(t *testing.T) 
 	}
 }
 
-
 // Audit4 finding 29: two attachments with the same filename must be
 // distinguished by size (and content-ID when present), not by name alone.
 func TestExtractAttachmentContentFor_SameFilenameDisambiguatedBySize(t *testing.T) {
