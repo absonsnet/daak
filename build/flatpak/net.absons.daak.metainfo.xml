@@ -375,6 +375,13 @@
   </provides>
 
   <releases>
+    <release version="0.8.2" date="2026-11-26">
+      <description>
+        <ul>
+          <li>Fixes the macOS build failure (an iOS-only notification status the macOS SDK marks unavailable) and adds per-account contacts: linked Google/Microsoft accounts appear under Accounts in the sidebar, accounts can be linked as contact sources from settings or the sidebar, and adding a contact to an account without write access yet offers the enable action in the dialog</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.1" date="2026-11-26">
       <description>
         <ul>

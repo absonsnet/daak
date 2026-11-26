@@ -1,5 +1,13 @@
 # CHANGELOG
 
+**v0.8.2 - 26-11-2026**
+---
+
+- Fixed the macOS build: the notification code referenced an iOS-only authorisation status that the macOS SDK marks unavailable, which failed the macOS release job for v8.0.0 and v0.8.1 — that status can never occur on macOS, so dropping it changes no behaviour
+- Contacts now has a per-account view: linked Google/Microsoft accounts appear under Accounts in the Contacts sidebar, and clicking one shows only that account's contacts; CardDAV sources stay under Sources
+- Mail accounts can now be linked as contact sources from Contacts settings or from the sidebar, so dismissing the setup step after adding an account is no longer a dead end
+- Adding a contact to a Google/Microsoft account that hasn't had write access enabled yet now offers the enable action right in the dialog instead of silently hiding that account from the picker
+
 **v0.8.1 - 26-11-2026**
 ---
 

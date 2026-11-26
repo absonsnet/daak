@@ -60,15 +60,14 @@
       </div>
 
       <div class="space-y-4 max-h-[60vh] overflow-y-auto text-sm">
-        <p>🚀 Welcome to {APP_NAME} v0.8.1!</p>
+        <p>🚀 Welcome to {APP_NAME} v0.8.2!</p>
 
-        <p>v0.8.1 is the fourth audit, all sixty fixes:</p>
+        <p>v0.8.2 fixes the macOS build and adds per-account contacts:</p>
 
         <ul class="list-disc pl-6 space-y-1">
-          <li>📧 Deletes and moves stop losing mail: Gmail deletes from popup windows check for copies elsewhere first, cross-account move Undo restores both legs, and a folder the server briefly fails to list is no longer wiped locally</li>
-          <li>📅 Calendar edits and deletes now target the occurrence you picked, whole-series edits keep your single-occurrence customisations, offline edits queue for retry, and Mail Merge resumes stop double-sending with the safety cap surviving a resume</li>
-          <li>📤 The Outbox is now honest: the badge counts failed mail, failed rows get a Discard button, "Send unsent now" retries failed normal sends too, and true totals are shown past 500/1000 rows</li>
-          <li>🔒 Sign-in can no longer mix tokens between accounts, a failed settings load can no longer reset everything to factory defaults, and encrypted attachments open while same-name attachments stop overwriting each other</li>
+          <li>🔧 The macOS build is fixed — the notification code no longer references an iOS-only status the macOS SDK marks unavailable</li>
+          <li>👥 Contacts now has an Accounts section in the sidebar: click a linked Google or Microsoft account to see only that account's contacts</li>
+          <li>➕ Mail accounts can now be linked as contact sources from Contacts settings or the sidebar, and adding a contact to an account without write access yet offers the enable action right in the dialog</li>
         </ul>
 
         <p>🏷 See the full change log here:</p>
