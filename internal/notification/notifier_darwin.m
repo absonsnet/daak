@@ -13,13 +13,14 @@ static const int kNotifStatusNotDetermined = 2;
 static const int kNotifStatusUnknown = 3;
 
 // Maps a UNNotificationSettings snapshot to a status code. Provisional
-// and ephemeral authorization still deliver notifications, so they
-// count as authorized.
+// authorization still delivers notifications, so it counts as authorized.
+// Note: one authorization status value is iOS-only and the Xcode SDK marks
+// it explicitly unavailable on macOS — it must never be referenced here,
+// and the OS can never return it on macOS anyway.
 static int statusFromSettings(UNNotificationSettings *settings) {
     switch (settings.authorizationStatus) {
         case UNAuthorizationStatusAuthorized:
         case UNAuthorizationStatusProvisional:
-        case UNAuthorizationStatusEphemeral:
             return kNotifStatusAuthorized;
         case UNAuthorizationStatusDenied:
             return kNotifStatusDenied;
