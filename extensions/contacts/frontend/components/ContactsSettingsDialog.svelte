@@ -13,6 +13,8 @@
   import { Button } from '$lib/components/ui/button'
   import OAuthCredsSlotEditor from '$lib/components/kit/OAuthCredsSlotEditor.svelte'
   import WriteAccessAccountPicker from '$lib/components/oauth/WriteAccessAccountPicker.svelte'
+  import LinkAccountSourceDialog, { unlinkedMailAccounts } from './LinkAccountSourceDialog.svelte'
+  import { accountStore } from '$lib/stores/accounts.svelte'
   import { contactSourcesStore } from '$extensions/contacts/frontend/stores/contactSources.svelte'
   import { toasts } from '$lib/stores/toast'
   // @ts-ignore - wailsjs bindings
@@ -39,12 +41,36 @@
   let pickerSourceID = $state('')
   let pickerSourceName = $state('')
 
+  // Link-account dialog state. Opened from a Linked Accounts row's Link
+  // button, pre-selected to that account.
+  let linkOpen = $state(false)
+  let linkPreselectedAccountId = $state('')
+
+  // Mail accounts that can still be linked as contact sources: Google /
+  // Microsoft OAuth accounts with no source linked yet. Hidden section
+  // when empty — everything is already linked. This is the way back in
+  // for accounts whose post-add "Set up contacts" step was dismissed.
+  const unlinkedAccounts = $derived(
+    unlinkedMailAccounts(
+      accountStore.accounts.map((w) => w.account),
+      contactSourcesStore.sources,
+    ),
+  )
+
+  function openLinkAccount(accountId: string) {
+    linkPreselectedAccountId = accountId
+    linkOpen = true
+  }
+
   // Refresh the source list whenever the dialog opens — the user may have
   // added/removed sources since last open, or the write-access picker may
   // have flipped writable. Cheap (single Wails call returning a small array).
   $effect(() => {
     if (open) {
       void contactSourcesStore.load()
+      if (accountStore.accounts.length === 0) {
+        void accountStore.load()
+      }
     }
   })
 
@@ -162,6 +188,37 @@
         </div>
       </section>
 
+      {#if unlinkedAccounts.length > 0}
+        <section>
+          <h3 class="text-sm font-semibold text-foreground mb-2">{$_('contacts.settings.linkAccountsHeading')}</h3>
+          <p class="text-xs text-muted-foreground mb-3">
+            {$_('contacts.settings.linkAccountsDescription')}
+          </p>
+
+          <div class="space-y-2">
+            {#each unlinkedAccounts as account (account.id)}
+              <div class="flex items-center justify-between gap-3 rounded-md border border-border p-3">
+                <div class="flex items-center gap-3 min-w-0">
+                  <Icon
+                    icon="mdi:email-outline"
+                    class="w-5 h-5 text-muted-foreground flex-shrink-0"
+                  />
+                  <div class="min-w-0">
+                    <div class="text-sm font-medium text-foreground truncate">{account.email}</div>
+                    {#if account.name && account.name !== account.email}
+                      <div class="text-xs text-muted-foreground truncate">{account.name}</div>
+                    {/if}
+                  </div>
+                </div>
+                <Button size="sm" onclick={() => openLinkAccount(account.id)}>
+                  {$_('contacts.settings.linkAccountButton')}
+                </Button>
+              </div>
+            {/each}
+          </div>
+        </section>
+      {/if}
+
       {#if writeAccessRows.length > 0}
         <section>
           <h3 class="text-sm font-semibold text-foreground mb-2">{$_('contacts.settings.writeAccessHeading')}</h3>
@@ -242,4 +299,9 @@
   sourceID={pickerSourceID}
   sourceName={pickerSourceName}
   onCompleted={onPickerCompleted}
+/>
+
+<LinkAccountSourceDialog
+  bind:open={linkOpen}
+  preselectedAccountId={linkPreselectedAccountId}
 />

@@ -22,6 +22,7 @@
   import Icon from '@iconify/svelte'
   import { contactsView, createContact, listAddressbooks } from '$extensions/contacts/frontend/stores/contactsView.svelte'
   import { contactSourcesStore } from '$extensions/contacts/frontend/stores/contactSources.svelte'
+  import WriteAccessAccountPicker from '$lib/components/oauth/WriteAccessAccountPicker.svelte'
   import { toasts } from '$lib/stores/toast'
   import { dialogGuardOpen, dialogGuardClose } from '$lib/stores/dialogGuard'
   import ContactFieldsForm, { slotConstraintsFor } from './fields/ContactFieldsForm.svelte'
@@ -79,19 +80,75 @@
   // Picker options. Any writable external source qualifies — CardDAV,
   // Google, or Microsoft. The backend's CreateContact dispatches by
   // source.Type to the matching provider create handler.
+  //
+  // Linked Google/Microsoft accounts that are not yet writable are ALSO
+  // listed (marked read-only) instead of being silently hidden: picking
+  // one surfaces the enable-write-access action inline below the picker,
+  // so the user can grant access and then save into that account without
+  // leaving the dialog. Non-writable CardDAV sources stay hidden — their
+  // toggle lives in settings / the write-access banner.
   type PickerOption = { value: string; label: string }
   const sourceOptions: PickerOption[] = $derived.by(() => {
     const opts: PickerOption[] = [
       { value: LOCAL_VALUE, label: $_('contacts.add.localOption') },
     ]
     for (const s of contactSourcesStore.sources) {
-      if (!s.writable) continue
-      if (s.type === 'carddav' || s.type === 'google' || s.type === 'microsoft') {
-        opts.push({ value: s.id, label: s.name })
+      if (s.type === 'carddav') {
+        if (s.writable) opts.push({ value: s.id, label: s.name })
+      } else if (s.type === 'google' || s.type === 'microsoft') {
+        opts.push({
+          value: s.id,
+          label: s.writable ? s.name : `${s.name} (${$_('contacts.add.readOnly')})`,
+        })
       }
     }
     return opts
   })
+
+  // The picked external source, if any. Drives the write-access box + the
+  // Save guard below.
+  const pickedSource = $derived(
+    contactSourcesStore.sources.find((s) => s.id === sourceValue),
+  )
+
+  // True when the picked source is a linked Google/Microsoft account whose
+  // write access hasn't been enabled yet.
+  const needsWriteAccess = $derived(
+    pickedSource != null &&
+      (pickedSource.type === 'google' || pickedSource.type === 'microsoft') &&
+      !pickedSource.writable,
+  )
+
+  // Save is blocked while the picked source isn't writable — the backend
+  // refuses the create anyway ("source is not writable"), so disable
+  // instead of letting the user fill the form and fail on save. Local and
+  // unknown (not-yet-loaded) sources don't block.
+  const pickedWritable = $derived(!pickedSource || pickedSource.writable)
+
+  // Write-access picker state — same OAuth consent flow the banner and
+  // settings use (WriteAccessAccountPicker → Contacts_EnableWriteAccess).
+  // After granting, the sources store reloads so this account flips to a
+  // normal pickable target with Save enabled.
+  let writePickerOpen = $state(false)
+  let writePickerProvider = $state<'google' | 'microsoft'>('google')
+  let writePickerSourceID = $state('')
+  let writePickerSourceName = $state('')
+
+  function openWriteAccessPicker() {
+    if (!pickedSource) return
+    if (pickedSource.type !== 'google' && pickedSource.type !== 'microsoft') return
+    writePickerProvider = pickedSource.type
+    writePickerSourceID = pickedSource.id
+    writePickerSourceName = pickedSource.name
+    writePickerOpen = true
+  }
+
+  async function onWritePickerCompleted() {
+    await contactSourcesStore.load()
+    toasts.success(
+      $_('contacts.settings.writeAccessEnabled', { values: { name: writePickerSourceName } }),
+    )
+  }
 
   function findOption(value: string): PickerOption | undefined {
     return sourceOptions.find(o => o.value === value)
@@ -292,6 +349,9 @@
 
   async function save() {
     if (!validate()) return
+    // Belt-and-braces with the disabled Save button: a non-writable
+    // Google/Microsoft source refuses the create backend-side anyway.
+    if (!pickedWritable) return
     saving = true
     try {
       const input = buildCreateInput()
@@ -337,6 +397,22 @@
           </Select.Content>
         </Select.Root>
       </div>
+
+      <!-- Inline enable-write-access for a picked Google/Microsoft account
+           that is linked but not yet writable. Same picker flow as the
+           banner/settings; after granting, this account becomes a normal
+           save target (sources store reloads, Save enables). -->
+      {#if needsWriteAccess && pickedSource}
+        <div class="flex items-center gap-3 rounded-md border border-border bg-muted/40 p-3">
+          <Icon icon="mdi:lock-outline" class="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <p class="flex-1 min-w-0 text-xs text-foreground">
+            {$_('contacts.add.writeAccessRequired', { values: { name: pickedSource.name } })}
+          </p>
+          <Button size="sm" variant="outline" onclick={openWriteAccessPicker} disabled={saving}>
+            {$_('contacts.settings.enableWriteAccess')}
+          </Button>
+        </div>
+      {/if}
 
       <!-- Addressbook sub-picker -->
       {#if showAddressbookPicker}
@@ -384,7 +460,7 @@
 
     <div class="flex items-center justify-end gap-2 pt-4 border-t border-border mt-4 sticky bottom-0 bg-background">
       <Button variant="ghost" onclick={close} disabled={saving}>{$_('contacts.common.cancel')}</Button>
-      <Button onclick={save} disabled={saving}>
+      <Button onclick={save} disabled={saving || !pickedWritable}>
         {#if saving}
           <Icon icon="mdi:loading" class="w-4 h-4 mr-1 animate-spin" />
         {/if}
@@ -393,3 +469,11 @@
     </div>
   </Dialog.Content>
 </Dialog.Root>
+
+<WriteAccessAccountPicker
+  bind:open={writePickerOpen}
+  provider={writePickerProvider}
+  sourceID={writePickerSourceID}
+  sourceName={writePickerSourceName}
+  onCompleted={onWritePickerCompleted}
+/>

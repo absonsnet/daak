@@ -17,6 +17,9 @@
   import { setFocusedPane, getFocusedPane, isPaneFlashing, registerPaneNav, type FocusablePane } from '$lib/stores/keyboard.svelte'
 
   type SourceSection<U extends { id: string }> = {
+    /** Optional stable key so consumers can tell sections apart in the
+     *  sectionEmpty snippet (e.g. different empty-state copy per section). */
+    id?: string
     heading?: string
     items: U[]
   }
@@ -30,6 +33,11 @@
     item: Snippet<[T, { active: boolean }]>
     header?: Snippet
     sectionEmpty?: Snippet<[SourceSection<T>]>
+    /** Optional content rendered after all sections, inside the scrollable
+     *  body — e.g. an "Add account" row. Kept outside `sections` on purpose
+     *  so it stays out of keyboard navigation (it is an action, not a
+     *  selectable source). */
+    afterSections?: Snippet
     /** Optional sticky bottom strip — forwarded to SidebarFrame's footer
      *  slot. Consumers typically render kit `SidebarFooter` here for the
      *  shared sync/settings chrome. */
@@ -46,6 +54,7 @@
     item,
     header,
     sectionEmpty,
+    afterSections,
     footerContent,
     onSelect,
   }: Props = $props()
@@ -158,6 +167,10 @@
         {/each}
       {/if}
     {/each}
+
+    {#if afterSections}
+      {@render afterSections()}
+    {/if}
   {/snippet}
 
   {#snippet footer()}
