@@ -1,5 +1,19 @@
 # CHANGELOG
 
+**v0.8.1 - 26-11-2026**
+---
+
+- Deleting, trashing or marking spam from a popup window on Gmail no longer destroys the message in every folder: the popup now checks for copies elsewhere first, and a folder the server briefly fails to list is no longer deleted locally with all its messages
+- Editing or deleting one day of a repeating event now targets the day you picked: whole-series edits keep your single-occurrence customisations, "this and future" splits create the new series before clamping the old one with a rollback if it fails, and time changes use the original time as the event's identity
+- Google edits and deletes made elsewhere now show up in Daak, and offline edits to a single occurrence are queued for retry instead of being lost; exhausted offline writes now surface with retry and discard, and reminders for local-calendar events are armed by a periodic check
+- Mail Merge resumes no longer send the same person the same mail twice, and resuming a "Send later" run reuses the old queued copy instead of creating a second one; one bad recipient no longer poisons the run's shared connection, and the safety cap and duplicate check now survive a resume
+- Mail Merge mail that is delivered but not saved to Sent now leaves a lasting "Sent — not saved" warning in the Outbox instead of vanishing, and a failed dispatch no longer double-counts when "Send unsent now" is pressed at the same moment
+- The Outbox is now honest: the badge counts failed mail and mail sent but not saved, failed rows get a Discard button that frees their draft, "Send unsent now" also retries failed normal sends and reports both counts, and the true totals are shown past 500/1000 rows
+- Sign-in can no longer save one account's tokens under another account's name, shared-mailbox tokens only propagate to mailboxes with the same provider, and contacts sign-in refresh now has the same lock and re-sign-in signal as mail, with standalone contacts writes retrying once on a 401
+- A failed settings load no longer shows factory defaults that Save could write back over your real settings, and paired settings (background mode with start-hidden, composer mode) now save in one transaction instead of half-applying
+- Opening an attachment from an encrypted message now works, two attachments with the same filename no longer download or save over each other, and "Save all attachments" now reports failures instead of claiming success
+- Read and star changes no longer flip back silently when the server update fails, Undo no longer destroys edits made to the draft during the undo window, and the sidebar remembers which accounts you expanded across launches
+
 **v8.0.0 - 25-11-2026**
 ---
 

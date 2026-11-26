@@ -375,6 +375,13 @@
   </provides>
 
   <releases>
+    <release version="0.8.1" date="2026-11-26">
+      <description>
+        <ul>
+          <li>Sixty audit fixes: Gmail deletes and moves from popup windows no longer destroy messages in every folder, calendar edits and deletes now target the occurrence you picked and offline edits queue for retry, Mail Merge resumes stop double-sending and the safety cap survives a resume, the Outbox badge and totals are honest with a Discard button for failed rows, sign-in can no longer save one account's tokens under another's name, a failed settings load can no longer reset everything to factory defaults, encrypted attachments open, same-name attachments no longer overwrite each other, and the sidebar remembers which accounts you expanded</li>
+        </ul>
+      </description>
+    </release>
     <release version="8.0.0" date="2026-11-25">
       <description>
         <ul>

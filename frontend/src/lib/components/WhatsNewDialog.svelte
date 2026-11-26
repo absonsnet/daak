@@ -60,15 +60,15 @@
       </div>
 
       <div class="space-y-4 max-h-[60vh] overflow-y-auto text-sm">
-        <p>🚀 Welcome to {APP_NAME} v8.0.0!</p>
+        <p>🚀 Welcome to {APP_NAME} v0.8.1!</p>
 
-        <p>v8.0.0 finishes the re-audit: the last eight issues found in the re-audit:</p>
+        <p>v0.8.1 is the fourth audit, all sixty fixes:</p>
 
         <ul class="list-disc pl-6 space-y-1">
-          <li>✉️ Mail Merge is clearer: cancelling a run now reports how many were cancelled and how many were already sending, a failed run always offers Resume, and a failed Sent save leaves a lasting "Sent — not saved" warning in the Outbox</li>
-          <li>👥 New contacts now reach the cloud even when the first address book is read-only, and the hourly cap gains an opt-in to count ordinary emails too</li>
-          <li>👍 Reactions from non-English Outlook are now detected, and a blocked notification permission on macOS is now shown in Settings with a way to turn it back on</li>
-          <li>⚙️ When saving settings fails part-way, the message now names the setting that failed and the dialog shows the settings as actually saved</li>
+          <li>📧 Deletes and moves stop losing mail: Gmail deletes from popup windows check for copies elsewhere first, cross-account move Undo restores both legs, and a folder the server briefly fails to list is no longer wiped locally</li>
+          <li>📅 Calendar edits and deletes now target the occurrence you picked, whole-series edits keep your single-occurrence customisations, offline edits queue for retry, and Mail Merge resumes stop double-sending with the safety cap surviving a resume</li>
+          <li>📤 The Outbox is now honest: the badge counts failed mail, failed rows get a Discard button, "Send unsent now" retries failed normal sends too, and true totals are shown past 500/1000 rows</li>
+          <li>🔒 Sign-in can no longer mix tokens between accounts, a failed settings load can no longer reset everything to factory defaults, and encrypted attachments open while same-name attachments stop overwriting each other</li>
         </ul>
 
         <p>🏷 See the full change log here:</p>
