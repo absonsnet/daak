@@ -48,7 +48,6 @@
       "copyTooltip": "Klicken zum Kopieren",
       "readonlyHint": "Schreibgeschützt",
       "cardDAVReadOnlyNote": "Diese Quelle ist schreibgeschützt. Um die Bearbeitung zu aktivieren, öffne Einstellungen → Kontaktquellen, bearbeite diese Quelle und aktiviere „Schreibzugriff aktivieren“.",
-      "oauthReadOnlyNote": "Schreibgeschützt — die Funktion zum Bearbeiten und Erstellen von Google-/Microsoft-Kontakten folgt in einer zukünftigen Version.",
       "labels": {
         "email": "E-Mail",
         "phone": "Telefon",

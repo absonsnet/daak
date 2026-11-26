@@ -70,7 +70,7 @@
     if (!contact) return
     // Open for any writable source — local (always writable) or a CardDAV
     // source that has its writable flag enabled. Google/Microsoft sources
-    // are gated to read-only until 2b.3 ships their write paths.
+    // are writable once write access is enabled for the account.
     const writable =
       contact.sourceId === 'daak' || contactSourcesStore.isSourceWritable(contact.sourceId)
     if (!writable) return

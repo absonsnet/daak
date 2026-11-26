@@ -48,7 +48,6 @@
       "copyTooltip": "Clicca per copiare",
       "readonlyHint": "Sola lettura",
       "cardDAVReadOnlyNote": "Questa fonte è di sola lettura. Per abilitare la modifica, apri Impostazioni → Fonti contatti, modifica questa fonte e attiva l'opzione \"Abilita accesso in scrittura\".",
-      "oauthReadOnlyNote": "Solo lettura — la possibilità di modificare i contatti di Google/Microsoft sarà disponibile in una versione futura.",
       "labels": {
         "email": "Posta elettronica",
         "phone": "Telefono",

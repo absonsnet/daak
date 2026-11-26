@@ -48,7 +48,6 @@
       "copyTooltip": "Kliknutím zkopírujete",
       "readonlyHint": "Pouze pro čtení",
       "cardDAVReadOnlyNote": "Tento zdroj je pouze pro čtení. Chcete-li povolit úpravy, otevřete Nastavení → Zdroje kontaktů, upravte tento zdroj a zapněte možnost „Povolit zápis“.",
-      "oauthReadOnlyNote": "Pouze pro čtení — podpora zápisu pro kontakty Google/Microsoft bude přidána v některé z příštích verzí.",
       "labels": {
         "email": "E-mail",
         "phone": "Telefon",

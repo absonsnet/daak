@@ -48,7 +48,6 @@
       "copyTooltip": "Cliquer pour copier",
       "readonlyHint": "Lecture seule",
       "cardDAVReadOnlyNote": "Cette source est en lecture seule. Pour activer l'édition, ouvrez Paramètres → Sources de contacts, modifiez cette source et activez « Activer l'accès en écriture ».",
-      "oauthReadOnlyNote": "Lecture seule — la capacité d'écriture pour les contacts Google/Microsoft sera disponible dans une prochaine version.",
       "labels": {
         "email": "E-mail",
         "phone": "Téléphone",
