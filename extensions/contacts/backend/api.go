@@ -256,7 +256,10 @@ func (a *API) ListContacts(filter coreapi.ContactFilter) ([]coreapi.Contact, err
 //   - <CardDAV source UUID>        → PUTs a new vCard to the source's addressbook
 //     identified by input.AddressbookID (or the source's first enabled+writable
 //     addressbook when AddressbookID is ""). Returns the new record UUID.
-//   - Google / Microsoft           → returns ErrUnimplemented. 2b.3.
+//   - Google / Microsoft           → createGoogleContact /
+//     createMicrosoftContact (Phase 2b.3 provider write paths). Refuses
+//     with a "not writable" error when write access hasn't been enabled on
+//     the source.
 //
 // Email is normalized (trim + lowercase) before storage. For local contacts
 // the returned id is the normalized email; for CardDAV contacts it's the
@@ -411,8 +414,9 @@ func (a *API) createCardDAVContact(input coreapi.ContactCreateInput, email strin
 //     CardDAV server gated on the source's writable flag, then mirrors the
 //     server's accepted state locally. 412 conflicts surface as
 //     *coreapi.ErrConflict after refreshing the local cache.
-//   - Google / Microsoft (other source values): returns ErrUnimplemented;
-//     filled in by Phase 2b.3 via the Auth Broker.
+//   - Google / Microsoft (other source values): updateGoogleContact /
+//     updateMicrosoftContact (Phase 2b.3 provider write paths). Unknown
+//     source types still return ErrUnimplemented.
 //
 // Phase 2b.2.b.1 ships only the Name field in ContactPatch; other patch
 // fields land in 2b.2.b.2 alongside the multi-field Edit dialog. The CardDAV
@@ -464,7 +468,7 @@ func (a *API) UpdateContact(id string, patch coreapi.ContactPatch) error {
 	// External-source records (rec.Source == "carddav" in contact_records for
 	// CardDAV, Google, AND Microsoft — they all share that row's source tag).
 	// Distinguish by the carddav.Source.Type one level up via the addressbook
-	// linkage. Phase 2b.3 splits this into per-provider write paths.
+	// linkage. Phase 2b.3 split this into per-provider write paths.
 	if rec.Source == "carddav" {
 		sourceType, err := a.sourceTypeForRecord(rec)
 		if err != nil {
@@ -697,7 +701,9 @@ func hasRichFields(input coreapi.ContactCreateInput) bool {
 //   - CardDAV: DELETEs the resource from the server (gated on the source's
 //     writable flag), then cascade-deletes locally. 412 conflicts surface as
 //     *coreapi.ErrConflict after refreshing the local cache.
-//   - Google / Microsoft: returns ErrUnimplemented until Phase 2b.3.
+//   - Google / Microsoft: deleteGoogleContact / deleteMicrosoftContact
+//     (Phase 2b.3 provider write paths). Unknown source types still return
+//     ErrUnimplemented.
 //
 // Idempotent on the local + 404 paths (deleting a non-existent contact
 // succeeds).

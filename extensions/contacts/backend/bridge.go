@@ -233,7 +233,9 @@ func (b *ContactsBridge) Contacts_GetContactDetail(emailOrID string) (*coreapi.C
 //     addressbook (input.AddressbookID, or the source's first enabled
 //     addressbook if empty). Returns the new record UUID.
 //   - "local:collected"            → rejected.
-//   - Google / Microsoft sources   → ErrUnimplemented (2b.3).
+//   - Google / Microsoft source UUID → the matching provider create path
+//     (People API / Graph, Phase 2b.3). Refuses with a "not writable" error
+//     when write access hasn't been enabled on the source.
 //
 // The historical `Contacts_CreateLocalContact(email, name)` shape was renamed
 // here in Track B because the backend already dispatched by source; the bridge

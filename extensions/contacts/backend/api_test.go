@@ -640,9 +640,10 @@ func TestAPI_CreateContact_Conflict(t *testing.T) {
 
 func TestAPI_CreateContact_UnknownSourceErrors(t *testing.T) {
 	// Post-Track-B: unknown CardDAV-shaped source UUIDs surface a "not found"
-	// error rather than ErrUnimplemented. ErrUnimplemented is reserved for
-	// known sources of types Daak hasn't wired write paths for (Google /
-	// Microsoft); see TestAPI_CreateContact_OAuthSourceUnimplemented.
+	// error rather than ErrUnimplemented. Google/Microsoft sources dispatch
+	// to their provider write paths (see the
+	// TestAPI_CreateContact_*SourceNotWritable tests below);
+	// ErrUnimplemented is only for known-but-unwired source types.
 	api, _, _ := setupAPI(t)
 	_, err := api.CreateContact(coreapi.ContactCreateInput{
 		SourceID: "some-carddav-uuid",
@@ -653,6 +654,114 @@ func TestAPI_CreateContact_UnknownSourceErrors(t *testing.T) {
 	}
 	if err == coreapi.ErrUnimplemented {
 		t.Fatalf("expected a real error for unknown source, got ErrUnimplemented")
+	}
+}
+
+// setupAPIWithExtStore mirrors setupAPIWithCreds but also opens the
+// per-extension store, so the Google/Microsoft create paths can run past
+// their wiring guards and reach the writable check.
+func setupAPIWithExtStore(t *testing.T) (*API, *carddav.Store) {
+	t.Helper()
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "test.db")
+	db, err := database.Open(path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	localStore := contact.NewStore(db.DB)
+	carddavStore := carddav.NewStore(db.DB)
+	credStore, err := credentials.NewStore(db.DB, tmp)
+	if err != nil {
+		t.Fatalf("credentials.NewStore: %v", err)
+	}
+	extStore, err := NewStore(tmp)
+	if err != nil {
+		t.Fatalf("contacts.NewStore: %v", err)
+	}
+	return NewAPI(localStore, carddavStore, extStore, fakeCore{creds: credStore}, db.DB), carddavStore
+}
+
+func mustCreateTestSource(t *testing.T, store *carddav.Store, typ carddav.SourceType, writable bool) *carddav.Source {
+	t.Helper()
+	src, err := store.CreateSource(&carddav.SourceConfig{
+		Name:         "Test " + string(typ),
+		Type:         typ,
+		Enabled:      true,
+		Writable:     writable,
+		SyncInterval: 60,
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	return src
+}
+
+// CreateContact must dispatch Google sources to the provider write path,
+// not ErrUnimplemented: a linked-but-not-writable Google source is refused
+// with the write-access error the Add dialog surfaces inline.
+func TestAPI_CreateContact_GoogleSourceNotWritable(t *testing.T) {
+	api, store := setupAPIWithExtStore(t)
+	src := mustCreateTestSource(t, store, carddav.SourceTypeGoogle, false)
+	_, err := api.CreateContact(coreapi.ContactCreateInput{
+		SourceID: src.ID,
+		Email:    "x@y.com",
+		Name:     "X Y",
+	})
+	if err == nil {
+		t.Fatal("expected error for non-writable Google source, got nil")
+	}
+	if err == coreapi.ErrUnimplemented {
+		t.Fatalf("Google create must not return ErrUnimplemented, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "not writable") {
+		t.Fatalf("expected not-writable error, got %v", err)
+	}
+}
+
+// Same dispatch pin for the Microsoft provider path.
+func TestAPI_CreateContact_MicrosoftSourceNotWritable(t *testing.T) {
+	api, store := setupAPIWithExtStore(t)
+	src := mustCreateTestSource(t, store, carddav.SourceTypeMicrosoft, false)
+	_, err := api.CreateContact(coreapi.ContactCreateInput{
+		SourceID: src.ID,
+		Email:    "x@y.com",
+		Name:     "X Y",
+	})
+	if err == nil {
+		t.Fatal("expected error for non-writable Microsoft source, got nil")
+	}
+	if err == coreapi.ErrUnimplemented {
+		t.Fatalf("Microsoft create must not return ErrUnimplemented, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "not writable") {
+		t.Fatalf("expected not-writable error, got %v", err)
+	}
+}
+
+// A writable Google source with core unwired must reach the Google path
+// ("core not wired") rather than falling through to unknown-source or
+// ErrUnimplemented — the dispatch is by source type, not by writability.
+func TestAPI_CreateContact_GoogleSourceDispatches(t *testing.T) {
+	api, _, store := setupAPI(t)
+	src := mustCreateTestSource(t, store, carddav.SourceTypeGoogle, true)
+	_, err := api.CreateContact(coreapi.ContactCreateInput{
+		SourceID: src.ID,
+		Email:    "x@y.com",
+		Name:     "X Y",
+	})
+	if err == nil {
+		t.Fatal("expected error for unwired core, got nil")
+	}
+	if err == coreapi.ErrUnimplemented {
+		t.Fatalf("Google create must not return ErrUnimplemented, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "core not wired") {
+		t.Fatalf("expected core-not-wired error, got %v", err)
 	}
 }
 

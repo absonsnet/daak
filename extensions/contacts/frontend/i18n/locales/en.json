@@ -16,7 +16,10 @@
       "localManual": "Local - Contacts",
       "localCollected": "Local - Collected",
       "sourcesHeading": "Sources",
+      "accountsHeading": "Accounts",
       "noSources": "No CardDAV sources configured.",
+      "noAccounts": "No accounts linked for contacts.",
+      "addAccount": "Add account",
       "syncing": "Syncing contacts…",
       "idle": "Contacts",
       "settings": "Contact settings"
@@ -71,6 +74,8 @@
       "sourceLabel": "Save to",
       "sourcePlaceholder": "Select a source",
       "localOption": "Local contacts",
+      "readOnly": "read-only",
+      "writeAccessRequired": "{name} is read-only. Enable write access to save new contacts to this account.",
       "addressbookLabel": "Address book",
       "addressbookPlaceholder": "Select an address book",
       "errorEmailRequired": "Email is required.",
@@ -140,7 +145,18 @@
       "writeAccessDisabled": "Write access disabled for {name}",
       "writeAccessDisableFailed": "Failed to disable write access",
       "writeAccessCanceled": "Write access not enabled",
+      "linkAccountsHeading": "Linked Accounts",
+      "linkAccountsDescription": "Link a mail account to sync its Google or Microsoft contacts here. Only Google and Microsoft accounts can be linked.",
+      "linkAccountButton": "Link",
       "close": "Close"
+    },
+    "linkAccount": {
+      "title": "Link account for contacts",
+      "description": "Choose a mail account to sync its contacts. Only Google and Microsoft accounts can be linked.",
+      "linkButton": "Link account",
+      "success": "Contacts sync set up for {name}",
+      "emptyHeading": "No accounts available to link",
+      "emptyHint": "All of your Google and Microsoft mail accounts are already linked, or no Google or Microsoft account has been added yet."
     },
     "hook": {
       "skip": "Skip",
